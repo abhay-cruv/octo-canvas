@@ -460,14 +460,49 @@ Endpoints are parameterized by `{sandbox_id}` from day one (multi-sandbox forwar
 
 ## 10. WebSocket protocol (slice 5+)
 
-Single endpoint per role:
+### 10.1 Transport choice — WS, multiple connections per concern
 
-- `/ws/web/tasks/{task_id}` — web client subscribes to a task. Auth via session cookie (FastAPI `Depends` on the WS handshake).
-- `/ws/bridge/sandboxes/{sandbox_id}` — the bridge in a Sprite dials this **once per sandbox lifetime**. Auth via a long-lived **bridge token** issued at sandbox spawn (rotatable; not per-run).
+**Both legs of the system speak WebSocket.** Web↔orchestrator and orchestrator↔bridge share one transport so the codebase has one wire-protocol mental model, one set of reconnect/heartbeat code, and one type-bridge system (Pydantic discriminated unions → TS via codegen).
 
-All messages are Pydantic discriminated unions in `python_packages/shared_models/wire_protocol/`. Discriminator field: `type`. Most event messages now carry `run_id` since the bridge multiplexes runs over one connection.
+We **do not** use gRPC, even though HTTP/2 stream multiplexing would give per-channel back-pressure for free. Reasons:
 
-### Bridge → orchestrator
+- Browsers don't speak gRPC natively. FE↔BE stays WS regardless. If BE↔bridge were gRPC, the orchestrator would become a transport translator and we'd maintain two type-bridge systems (`.proto`→Python on the bridge link, Pydantic→TS on the web link).
+- AGENTS.md §2.6 locks the stack. Adding `protoc` + `grpcio` is a heavier ask than the back-pressure win justifies for v1.
+- Multi-WS-connections gets ~90% of gRPC's per-channel isolation with infra we already have.
+
+Revisit the decision **only** if production telemetry shows we're routinely running 8+ concurrent streaming channels per sandbox.
+
+### 10.2 The four channels
+
+We split the wire into **four logical channels**, each on its own WS connection. They have very different latency/throughput/durability needs and would clobber each other if multiplexed onto one socket.
+
+| Channel | Endpoint | Direction | Wire | Replay-able | Latency budget | Lifetime |
+|---|---|---|---|---|---|---|
+| **Control + events** | `/ws/web/tasks/{task_id}` (web side) and `/ws/bridge/sandboxes/{sandbox_id}` (bridge side) | bidi | JSON (Pydantic union) | yes — `seq`-replay from Mongo | ms | long-lived (sandbox lifetime on bridge side; task page lifetime on web side) |
+| **PTY** | `/ws/web/sandboxes/{sandbox_id}/pty/{terminal_id}` (web) and `/ws/bridge/sandboxes/{sandbox_id}/pty/{terminal_id}` (bridge) | bidi | binary (xterm.js bytes) | no | <50 ms (keystroke→pixel) | terminal session lifetime, opened on demand |
+| **File ops** | REST: `GET/PUT /api/sandboxes/{id}/fs?path=...` | req/resp | HTTP (binary or text body) | n/a | seconds OK for big files | per-request |
+| **HTTP preview** | proxy at `https://sandbox-{id}.preview.<domain>/...` | bidi | HTTP/HTTPS | n/a | normal HTTP | per-request |
+
+Why split:
+
+- A 10 MB `pnpm install` log multiplexed onto the same WS as keystrokes induces head-of-line blocking — terminal feels janky. PTY needs its own socket.
+- Big file reads/writes don't fight terminal traffic when they go REST.
+- HTTP preview is its own concern (forwarding arbitrary localhost:N traffic to the user's browser); shoving it into a WS would force us to build a full HTTP-over-WS proxy.
+
+PTY connections are **opened on demand** (when the user clicks "Open terminal") and closed when the tab/terminal closes — most active sandboxes have zero PTYs open at any moment. Average wire footprint per active sandbox: ~2 WS connections (one control on web, one control on bridge), ~3 if the user has a terminal open.
+
+### 10.3 Endpoints + authentication
+
+| Endpoint | Who connects | Auth |
+|---|---|---|
+| `/ws/web/tasks/{task_id}` | web client subscribes to a task's event stream | session cookie via FastAPI `Depends` on the WS handshake |
+| `/ws/web/sandboxes/{sandbox_id}/pty/{terminal_id}` | web client opens a terminal | session cookie |
+| `/ws/bridge/sandboxes/{sandbox_id}` | the bridge in a Sprite dials **once per sandbox boot** | long-lived **bridge token** (rotatable; re-issued on every wake) |
+| `/ws/bridge/sandboxes/{sandbox_id}/pty/{terminal_id}` | bridge opens its end of a PTY when the orchestrator instructs it | bridge token |
+
+All messages are Pydantic discriminated unions in `python_packages/shared_models/wire_protocol/`. Discriminator field: `type`.
+
+### 10.4 Bridge → orchestrator (control + events channel)
 
 ```
 ClientHello              { type, sandbox_id, bridge_version, cloned_repos: [{full_name, head_sha, last_synced_at}] }
@@ -482,7 +517,10 @@ StatusChangeEvent        { type, run_id, seq, new_status }
 ErrorEvent               { type, run_id?, seq, kind, message }     # run_id absent for sandbox-level errors
 TokenUsageEvent          { type, run_id, seq, input_delta, output_delta }
 RepoCloneStatus          { type, full_name, status, error? }       # ack for EnsureRepoCloned / RemoveRepo
+PtyOpened                { type, terminal_id }                     # bridge ack of OpenPty
+PtyClosed                { type, terminal_id, exit_code? }
 Heartbeat                { type, last_active_at }
+Pong                     { type, nonce }
 ```
 
 Orchestrator responsibilities on receive:
@@ -492,27 +530,123 @@ Orchestrator responsibilities on receive:
 3. Update parent `AgentRun.status` / `Task.status` on terminal events.
 4. Update `Repo.clone_status` and `Sandbox.last_active_at` on `RepoCloneStatus` / `Heartbeat`.
 
-### Orchestrator → bridge
+### 10.5 Orchestrator → bridge (control channel)
 
 ```
-ServerHello              { type, tool_allowlist, agent_defaults }
+ServerHello              { type, tool_allowlist, agent_defaults, resume_after_seq? }
 EnsureRepoCloned         { type, full_name, base_branch, user_token }
 RemoveRepo               { type, full_name }
 StartRun                 { type, run_id, task_id, repo_full_name, base_branch, prompt, follow_up, user_token }
 UserFollowUpMessage      { type, run_id, content }
 AbortRun                 { type, run_id, reason }
+OpenPty                  { type, terminal_id, cwd?, cols, rows }
+ResizePty                { type, terminal_id, cols, rows }
+ClosePty                 { type, terminal_id }
 HibernateSandbox         { type }                                  # bridge flushes, exits cleanly
+Ping                     { type, nonce }
 ```
 
-### Web → orchestrator → web
+### 10.6 Web → orchestrator (control channel)
 
-The orchestrator transcodes `AgentEvent`s into a UI-friendly schema (`TaskEventForUI`) and pushes them down. Web clients send only `SendFollowUp` and `CancelTask` over WS; everything else is HTTP.
+The orchestrator transcodes `AgentEvent`s into a UI-friendly schema (`TaskEventForUI`) and pushes them down. Web clients send:
 
-### Reliability
+```
+Resume                   { type, after_seq }                       # on (re)connect, request replay
+SendFollowUp             { type, run_id, content }
+CancelTask               { type, task_id }
+RequestOpenPty           { type, terminal_id, cwd?, cols, rows }
+RequestClosePty          { type, terminal_id }
+ResizePty                { type, terminal_id, cols, rows }
+Pong                     { type, nonce }
+```
 
-- Both sides hold a **monotonic seq**. After reconnect, web sends `Resume{after_seq}` and the orchestrator replays from Mongo.
-- 60s ping/pong; either side closes after 2 missed pings.
-- Backpressure: orchestrator buffers up to 1000 events per (run, web subscriber); slow consumers get dropped with a warning.
+Everything else is HTTP.
+
+### 10.7 PTY channel (binary)
+
+Frames are raw bytes — what xterm.js sends/receives. No JSON envelope, no `seq`. Both directions are pure byte streams; the channel dies if either end disconnects, and the user reconnects via `RequestOpenPty` to start fresh (PTY history is *not* replay-able by design — the user got the bytes the first time, and the bridge already wrote them to the terminal subprocess).
+
+PTY frames carry only one out-of-band signal: a **terminal close** (sent as a zero-length WS Close frame with status code `1000`). Resize is on the control channel, not inline.
+
+### 10.8 Reliability — disconnects must be graceful and robust
+
+The wire is the most-tested surface in production. **Every channel on every leg must survive**: orchestrator restarts, bridge restarts, network blips, NAT timeouts, Fly Sprite hibernate/resume, browser tab sleep, mobile-network handoffs. Rules:
+
+#### Heartbeat
+
+- Application-level `Ping`/`Pong` with `nonce`, every **30 seconds** in both directions.
+- **Two missed pongs (~90 s)** → declare the peer dead and close with code `1011`.
+- WS-protocol-level frames (`websockets` lib does these) run at TCP keepalive frequency; they detect dead TCP, not dead apps.
+
+#### Sequence numbers + replay (control + events only)
+
+- Server-side: every event the orchestrator persists into `agent_events` gets a monotonic `seq` per `run_id`.
+- Client-side (web + bridge): track `last_seen_seq` per `run_id`; persist in memory only — survives short reconnects but not browser refresh (server replays from Mongo on reconnect anyway).
+- On reconnect: client sends `Resume{after_seq}` as the first message; orchestrator streams missed events from Mongo, then resumes live.
+- Mongo retains the last **24 hours** of events per run hot; older fetches go through the slice 8 S3 archive transparently.
+
+#### Idempotency
+
+- All bridge-bound directives (`EnsureRepoCloned`, `RemoveRepo`, `StartRun`, `OpenPty`, `HibernateSandbox`) are **idempotent**. The bridge re-applying the same directive after a reconnect must be safe.
+  - `EnsureRepoCloned` re-checks disk; `git fetch` if already cloned.
+  - `StartRun` checks `AgentRun.status` in Mongo before re-running; if `completed`, replays the terminal events instead.
+  - `OpenPty` checks if `terminal_id` already exists; reuses if so.
+- Each directive carries a server-issued **`directive_id`**. The bridge tracks the last 100 it acted on; duplicates within that window are ignored (returns the cached ack).
+
+#### Reconnect flow — bridge side
+
+1. WS closes. Bridge enters **reconnect loop**: exponential backoff `1, 2, 4, 8, 16, 30, 30, 30…` seconds with ±25% jitter, no cap on total retries.
+2. On reconnect: send `ClientHello` with current `cloned_repos` and the bridge's last `seq` per known run.
+3. Orchestrator replies `ServerHello{resume_after_seq}` and re-issues any directives the bridge hadn't acked. Reconciliation runs.
+4. Active runs continue if the bridge still has the agent process alive; if the bridge **process** died and respawned, in-flight runs are marked `failed` with `ErrorEvent{kind: "bridge_restart"}` and the user can retry.
+
+#### Reconnect flow — web side
+
+1. WS closes. Web app shows a small "Reconnecting…" indicator (do not unmount the task page — keep all state).
+2. Reconnect with **exponential backoff `0.5, 1, 2, 4, 8, 16, 30, 30…` seconds with ±25% jitter**. First retry is fast (likely network blip).
+3. On reconnect, send `Resume{after_seq: last_seen_seq}`. Orchestrator replays from Mongo.
+4. If the user is mid-PTY: that connection was binary and stateless, so the web app re-issues `RequestOpenPty` for each terminal that was open. The orchestrator recreates the PTY pair. **Terminal scrollback is the user's view; bridge does not replay PTY bytes.**
+
+#### Backpressure
+
+- Orchestrator buffers up to **1000 events per (run, web subscriber)**. If a slow web client overflows: drop intermediate events with a `BackpressureWarning` event, advance `seq`. Client will catch up via `Resume` on next reconnect. Never grow buffers unbounded.
+- Bridge → orchestrator: bridge buffers up to **5 MB** of pending events; if it overflows (typically because the orchestrator side dropped its WS), the bridge **drops the oldest non-terminal events first**, keeping `StatusChangeEvent` and `ErrorEvent`. These are reconstruction-critical.
+- PTY channel: **drop frames** under back-pressure (slow client). Terminal output may briefly garble; better than freezing keystrokes. Coalesce contiguous output frames bridge-side at ≤100 Hz.
+- File-watch (`FileEditEvent` stream while the agent edits): **coalesce by `path`** — one event per path per ~250 ms window.
+
+#### Fail-fast vs. fail-soft
+
+- Auth failure on (re)connect: **fail fast** (close `4001`, no retry without manual reauth). Bridge token expired or invalid → orchestrator closes `4002`, bridge stops retrying and exits; the next `wake` will issue a fresh token.
+- Schema mismatch (Pydantic validation fails): **fail soft** for the offending message (drop, log, increment metric); do **not** kill the connection. Schemas evolve.
+- Orchestrator restart mid-task: bridge sees TCP close, reconnects via the exponential-backoff loop; web sees the same. Both replay via `seq`. **No data is lost** because every event was persisted to Mongo before the orchestrator acknowledged it.
+
+### 10.9 Horizontal scale — sticky routing + Redis pub/sub fallback
+
+The orchestrator is stateless (per [§4](#4-system-architecture)). Multiple instances run behind Fly's load balancer. WS connections need to land on the **right instance** so directives don't cross-talk.
+
+#### Sticky-by-sandbox
+
+- Both the bridge for sandbox X and the web client(s) watching sandbox X get pinned to the same orchestrator instance, keyed by `sandbox_id` hash.
+- Mechanism: Fly `fly-replay` headers. On the WS upgrade request, the LB hashes `sandbox_id` (path param) and routes to a chosen instance; that instance's `instance_id` is recorded in Redis at `sandbox:{id}:owner` with a 60s TTL, refreshed on heartbeat.
+- The web `/ws/web/tasks/{task_id}` handshake reads `task → sandbox_id` and replays the same hash so the web client lands on the same instance as the bridge.
+
+#### Redis pub/sub — slow path fallback
+
+- Channel: `sandbox:{id}`. Any orchestrator instance that receives a message for a sandbox it does **not** currently own (e.g., during a deploy when ownership flips) republishes the message via Redis pub/sub.
+- The owning instance subscribes to `sandbox:{owned_id}` for each sandbox it owns; it picks up the republished message and forwards to the correct connected peer.
+- Pub/sub is the fallback, not the primary path. Hot path stays in-process for ~99% of messages.
+
+#### Capacity caps + shedding
+
+- Each orchestrator instance advertises its current `(connections, sandboxes_owned)` to a Redis hash `orchestrator_capacity:{instance_id}`. Fly's LB checks before routing new sandboxes.
+- Per-instance soft cap: **5000 WS connections** (control + PTY combined). Hot-shed beyond that — return 503 on new sandbox spawns until an instance with headroom is available. Don't degrade existing connections.
+
+### 10.10 What we deliberately don't do (yet)
+
+- **No FE↔bridge direct connection.** All web traffic to the sandbox goes through the orchestrator. Costs ~10–20 ms per hop, buys auth + audit + rate-limit + transparent reconnect when an orchestrator dies. Direct-to-bridge (e.g., WebRTC data channels) is a v2 latency optimization if PTY genuinely bites.
+- **No multiplexing all four channels onto one WS.** See §10.2 — head-of-line blocking on PTY is the failure mode.
+- **No SSE / long-poll fallback.** WS works on every supported browser and through every supported proxy; one transport is enough.
+- **No protocol versioning beyond Pydantic schema evolution.** When we need a v2, add `version` to `ClientHello`/handshake and branch at the handler. Don't pre-build a versioning system before we need one.
 
 ---
 
@@ -823,18 +957,33 @@ Sign-in flow + `User`/`Session` collections + protected route convention. Accept
 **Risk:** filename heuristics miss frameworks that need real file contents (e.g., test command in `package.json` `scripts.test`). Start with tree-based detection; fall back to fetching the manifest blob when the tree match is ambiguous.
 **Acceptance:** connecting a known TS repo populates `primary_language="TypeScript"`, `package_manager="pnpm"`, `test_command="pnpm test"`. Re-introspection updates the row.
 
-### Slice 4 — Sandbox provider (Sprites) — **per-user, multi-repo**
+### Slice 4 — Sandbox provisioning (the box exists)
 
-**Adds:** `FlySpritesProvider` implementing the `SandboxProvider` Protocol; `Sandbox` Mongo collection (one per user enforced at orchestrator routing layer, NOT at the index — see §4 forward-compat note); Redis-backed hot state; `/api/sandboxes/{id}/{wake,hibernate,destroy}` + `GET /api/sandboxes` + `POST /api/sandboxes` endpoints (parameterized by id from day one); idle-hibernation job; per-sandbox reconciliation step on bridge `ClientHello` that diffs `Repo` rows where `sandbox_id == this.sandbox_id` against `cloned_repos` reported by the bridge and issues `EnsureRepoCloned`/`RemoveRepo`. Per-repo connection (slice 2) gains a clone enqueue when the sandbox is up; the connect endpoint sets `Repo.sandbox_id` to the user's singleton sandbox id.
+**Scope-narrow rewrite.** This slice ends at "the box exists, REST endpoints work, idle-hibernation works." It does **not** include WS, bridge runtime, cloning, or reconciliation — those need WS, which lands in slice 5.
+
+**Adds:** `FlySpritesProvider` implementing the `SandboxProvider` Protocol; `Sandbox` Mongo collection (one per user enforced at the orchestrator routing layer, NOT at the index — see §4 forward-compat note); Redis hash for hot state (`sandbox:{id} → {sprite_id, status, last_active_at}` — no queue yet, no active_run); REST endpoints `POST /api/sandboxes`, `GET /api/sandboxes`, `POST /api/sandboxes/{id}/wake`, `POST /api/sandboxes/{id}/hibernate`, `POST /api/sandboxes/{id}/destroy` (all parameterized by id from day one); idle-hibernation job (no active-run check yet — purely time-based for now); deterministic naming `vibe-sbx-{sandbox_id}` with the destroy/respawn collision strategy resolved (see §19 #14).
 **Files:** `python_packages/sandbox_provider/src/sandbox_provider/sprites.py`; orchestrator `services/sandbox_manager.py`; `routes/sandbox.py`; `jobs/hibernate_idle.py`.
-**Risks:** Sprites SDK churn; Redis schema must survive orchestrator restarts (Mongo is the source of truth); ensuring the deterministic `vibe-sbx-{user_id}` Sprite name doesn't collide if a user is fully destroyed and re-created. Cap Sprite size early (CPU/RAM/disk) to keep cost predictable.
-**Acceptance:** for a fresh user with zero repos, `POST /api/sandboxes` creates the singleton, `POST /api/sandboxes/{id}/wake` spawns a Sprite, the bridge dials WS, `Sandbox.status` becomes `"running"`. Connecting two repos sets their `sandbox_id` to the singleton and triggers two `EnsureRepoCloned` directives; each becomes `clone_status="ready"` with a path under `/work/`. `POST /api/sandboxes/{id}/hibernate` flips status to `"hibernated"`. `POST /api/sandboxes/{id}/wake` resumes; `cloned_repos` in the next `ClientHello` lists both.
+**Risks:** Sprites SDK churn (pin version explicitly — see §19 #9); Sprite naming collisions; per-Sprite cost (cap CPU/RAM/disk early — see §16); Sandbox doc creation timing (lazy on first `POST /api/sandboxes`, not eager at signup, to avoid orphaned docs).
+**Acceptance:** for a fresh user with zero repos, `POST /api/sandboxes` creates a `Sandbox` doc with `status="none"` (or spawns immediately, depending on the brief's call). `POST /api/sandboxes/{id}/wake` calls `provider.spawn`, the Sprite enters `running` in Fly, `Sandbox.status="running"` in Mongo. `POST /api/sandboxes/{id}/hibernate` flips `Sandbox.status="hibernated"`. Idle-hibernation job hibernates a `running` sandbox after 10 minutes of no `last_active_at` updates. `POST /api/sandboxes/{id}/destroy` removes the Sprite and flips status to `destroyed`; existing `Repo` rows for the user are untouched.
+**Out of scope:** any WS endpoint, any bridge runtime work, any cloning, any reconciliation, `Repo.sandbox_id` binding logic. Connect endpoint (slice 2) is unchanged — `clone_status` stays `pending`.
 
-### Slice 5 — WebSocket transport (orchestrator ↔ bridge ↔ web)
-**Adds:** WS server in orchestrator with two endpoints (`/ws/web/tasks/{task_id}`, `/ws/bridge/sandboxes/{sandbox_id}`), Pydantic discriminated unions for messages in `python_packages/shared_models/wire_protocol/`, replay-on-reconnect via `seq`, bridge token issuance and verification, ping/pong heartbeat. Bridge's `__main__.py` becomes a real WS client: long-lived, `ClientHello`-with-cloned-repos, ack of `EnsureRepoCloned`/`RemoveRepo` directives, dummy `StartRun` echo for the smoke test.
-**Files:** `apps/orchestrator/src/orchestrator/ws/`; `apps/bridge/src/bridge/lifecycle/`; expanded `shared_models/wire_protocol/`.
-**Risk:** keeping wire schemas in sync between Pydantic and TS — solve by codegen step running on schema change. Document the codegen exactly like for HTTP types. Bridge token rotation strategy needs to be settled (re-issue on every wake; bridge re-auths after every hibernate/resume cycle).
-**Acceptance:** spawning a Sprite + connecting a repo + sending an internal-only `StartRun` to that sandbox shows the placeholder events streaming to a web subscriber on the matching task page; reconnect replays from `seq`.
+### Slice 5 — WebSocket transport + bridge runtime + reconciliation (the wire works, clones land)
+
+This slice carries the load. It lands the entire wire protocol from §10, the long-lived bridge runtime from §14, and per-sandbox clone reconciliation. Big slice but cohesive: after slice 5, repos are warm-cloned in `/work/`.
+
+#### Slice 5a — Control + events WS
+
+**Adds:** WS server in orchestrator: `/ws/web/tasks/{task_id}` and `/ws/bridge/sandboxes/{sandbox_id}` (control + events channel only — see §10.2). Pydantic discriminated unions in `python_packages/shared_models/wire_protocol/` covering the §10.4–§10.6 message types. Bridge token issuance + verification (rotated on every wake; see §19 #10). Bridge `__main__.py` becomes a real long-lived WS client: dial-home, `ClientHello`, `Heartbeat`, replay-on-reconnect via `seq`, exponential-backoff reconnect loop (§10.8). Sticky-by-sandbox routing via `fly-replay` headers + Redis pub/sub fallback for cross-instance (§10.9). Backpressure rules from §10.8.
+**Files:** `apps/orchestrator/src/orchestrator/ws/` (handlers, registry, sticky routing helpers); `apps/bridge/src/bridge/lifecycle/` (boot, dial-home, reconnect loop); `python_packages/shared_models/wire_protocol/` (message types + codegen for TS).
+**Risks:** keeping wire schemas in sync between Pydantic and TS — codegen step on schema change. Sticky routing is the load-bearing operational invariant — a regression here means cross-talk, not just slowness; integration test it explicitly with two orchestrator instances behind a fake LB.
+**Acceptance:** spawned Sprite dials home; `Sandbox.bridge_version` populates; `Heartbeat` updates `last_active_at` every 30s; `ClientHello` is acked with `ServerHello`; killing the bridge process triggers the reconnect loop and a fresh `ClientHello` arrives. Killing the orchestrator instance routing a sandbox triggers `fly-replay` to land the bridge on a new instance, replay catches the web subscriber up via `seq`.
+
+#### Slice 5b — Reconciliation + clone
+
+**Adds:** `EnsureRepoCloned` / `RemoveRepo` directives + bridge handlers that clone into `/work/<full_name>/` using a per-repo install token minted at directive time (see §19 #12). Reconciliation logic on `ClientHello`: orchestrator diffs `Repo` rows where `sandbox_id == this.sandbox_id` against the bridge's reported `cloned_repos`, issues directives until convergent. Connect endpoint (slice 2) gains a clone enqueue when the user's sandbox is up; sets `Repo.sandbox_id` to the user's singleton sandbox id; `clone_status` flips `pending → cloning → ready`. Disconnect endpoint issues `RemoveRepo`. Disk-cap + eviction job (§16, §19 #15).
+**Files:** `apps/bridge/src/bridge/clones/` (clone helpers, all path-scoped to `/work/<full_name>/`); `apps/orchestrator/src/orchestrator/services/reconciliation.py`; `apps/orchestrator/src/orchestrator/jobs/disk_eviction.py`.
+**Risks:** reconciliation correctness — test the four-quadrant matrix explicitly (see §19 #13). Token leakage in `.git/config` — extraheader at command time, never persist (§19 #12). Race between connect and bridge boot — `EnsureRepoCloned` queued in Mongo until next `ClientHello`.
+**Acceptance:** connect three repos against a running sandbox; all three end up cloned to `/work/<full_name>/`, `clone_status="ready"`, `Repo.sandbox_id` populated. Disconnect one → directory removed, row deleted. Force-restart the bridge → `ClientHello` reports two cloned repos, no directives issued (already convergent). Manually `rm -rf /work/<full_name>/` inside the Sprite + restart bridge → reconciliation issues `EnsureRepoCloned`, repo re-clones.
 
 ### Slice 6 — Tasks + Agent SDK invocation
 **Adds:** `Task` + `AgentRun` + `AgentEvent` collections; task creation (against any connected repo) + follow-up endpoints; orchestrator queues runs into the user's sandbox (one active at a time per sandbox, queue depth surfaced in UI); bridge's real agent loop (`cd /work/<full_name>`, branch, Agent SDK with tool allowlist, stream events); web task page (chat, event stream, status, repo picker).
@@ -848,7 +997,24 @@ Sign-in flow + `User`/`Session` collections + protected route convention. Accept
 **Risk:** auth token leakage in `.git/config` — set extraheader at command time, never persist. Different repos in the same sandbox can have different installation tokens (different orgs); the orchestrator must mint per-repo tokens at `StartRun` time and pass them in the `StartRun` message, not at sandbox spawn.
 **Acceptance:** the slice 6 task ends with a real PR opened against the connected repo, linked from the task page. A follow-up message produces a second commit on the same PR.
 
-### Slice 8 — Event log persistence (S3)
+### Slice 8 — Interactive coding surface (PTY + file ops)
+
+**New slice — splits "interactive user actions" out of the agent-run loop.** After slice 7 the agent can ship PRs; this slice gives the user the direct-interaction surface that makes the product feel like an editor: open a terminal, edit a file, see live agent edits as they happen.
+
+**Adds:** PTY WS endpoints `/ws/web/sandboxes/{id}/pty/{terminal_id}` + `/ws/bridge/sandboxes/{id}/pty/{terminal_id}` (binary, separate connections per §10.2). Bridge-side PTY spawn (`pty.openpty()` + subprocess in the relevant repo subdir). Web-side xterm.js terminal component. File ops REST endpoints (`GET/PUT /api/sandboxes/{id}/fs?path=...`) with bridge-side handlers. Live `FileEditEvent` stream from the agent's edits, surfaced in a diff view in the web task page (coalesced ≤4 Hz per path per §10.8).
+**Files:** `apps/orchestrator/src/orchestrator/ws/pty.py`, `routes/sandbox_fs.py`; `apps/bridge/src/bridge/pty/`; `apps/web/src/components/Terminal.tsx`, `FileEditor.tsx`.
+**Risks:** PTY back-pressure under bursty logs (drop frames per §10.8); path-traversal in file-ops (validate all paths under `/work/<full_name>/`); large file uploads (cap at 10 MB per request, stream); terminal scrollback expectations (we don't replay PTY history — document this).
+**Acceptance:** open a terminal on a connected repo's subdir; type `pnpm test`, see streaming output at sub-100ms latency; close the tab and reopen — terminal is fresh (no scrollback). Open a file, edit it in the web editor, save → roundtrip works and is reflected on disk in the Sprite. Run an agent task that edits a file → live diff streams to the open file editor.
+
+### Slice 9 — HTTP preview proxy
+
+**Adds:** subdomain-based HTTP forwarder so a dev server running inside a Sprite at `localhost:3000` is reachable at `https://sandbox-{id}.preview.<domain>/...` from the user's browser. Auth-gated (only the sandbox's owner can reach the preview). Falls back to the orchestrator on demand for sandboxes whose Sprites aren't directly reachable from the public internet.
+**Files:** `apps/orchestrator/src/orchestrator/routes/preview.py` (proxy handler); a small DNS / Fly route shim.
+**Risks:** secrets in dev-server output; CSP/iframe issues if we want to embed the preview in our UI; cookie-domain leakage. Probably ship preview-in-new-tab first, embed later.
+**Acceptance:** user runs `pnpm dev` in a sandbox terminal; clicks "Open preview" in the UI; new tab loads the dev server on the preview subdomain.
+
+### Slice 10 — Event log persistence (S3)
+
 **Adds:** archival job that, on `AgentRun` completion, writes the run's events to `s3://{S3_BUCKET}/runs/{run_id}.ndjson` and prunes from Mongo (keeping the last N for active UI hydration). `GET /api/tasks/{task_id}/events` paginates Mongo + S3 transparently.
 **Files:** `apps/orchestrator/src/orchestrator/jobs/archive_run.py`; `services/event_store.py`.
 **Risk:** S3 vs MinIO config drift — keep the client behind an interface.
@@ -878,22 +1044,41 @@ Sign-in flow + `User`/`Session` collections + protected route convention. Accept
 7. **`pytest` event loop** — DB-touching tests must use the `httpx.AsyncClient + ASGITransport` fixture, not FastAPI's `TestClient`. ([TESTING.md:165](TESTING.md#L165))
 8. **Webhook delivery in local dev** — slice 2 needs a public URL for GitHub webhooks. Use smee.io or ngrok. Document in the slice 2 brief.
 9. **Sprites SDK pinning** — slice 4 should pin the Sprites SDK version explicitly; SDK churn is a known supply-chain risk on early-stage providers.
-10. **Bridge token (slice 5)** — long-lived per sandbox, not per run. Rotate on every wake; bridge re-auths after every hibernate/resume. Treat as signed JWTs with TTL ≤ sandbox idle window.
+10. **Bridge token (slice 5a)** — long-lived per sandbox, not per run. Rotate on every wake; bridge re-auths after every hibernate/resume. Treat as signed JWTs with TTL ≤ sandbox idle window.
 11. **Per-user sandbox = noisy-neighbor surface** — all of one user's tasks share one Sprite. v1 limits this to one active run at a time per sandbox (queue the rest). Hard cap Sprite CPU/RAM/disk early so a single user can't cost-spiral.
 12. **Multi-repo install token scoping** — different repos in the same sandbox can be on different GitHub App installations (different orgs). Mint **per-repo, per-run** install tokens at `StartRun` time; never share a token across repos or persist it on the sandbox disk.
 13. **Reconciliation correctness on `ClientHello`** — the diff between `Repo` rows where `sandbox_id == this.sandbox_id` and `cloned_repos` reported by the bridge must converge: missing on disk → `EnsureRepoCloned`; on disk but not bound to this sandbox → `RemoveRepo`. Reconciliation is per-sandbox, never per-user. Test the four-quadrant matrix explicitly in slice 4.
 14. **Sandbox name collisions** — `vibe-sbx-{user_id}` is deterministic; if `/api/sandbox/destroy` is called and a new spawn happens immediately, Sprites may still hold the old name. Either wait for full destroy or include a salt suffix; decide in slice 4.
-15. **`/work` quota and warm-cache bloat** — `node_modules` per repo plus `.venv` plus pip cache will grow. Slice 4 sets a per-sandbox disk cap and a `du`-based eviction job; don't ship without it or the first heavy user wedges their own sandbox.
+15. **`/work` quota and warm-cache bloat** — `node_modules` per repo plus `.venv` plus pip cache will grow. Slice 5b sets a per-sandbox disk cap and a `du`-based eviction job; don't ship without it or the first heavy user wedges their own sandbox.
+
+16. **Transport choice — WS, not gRPC** — locked in §10.1. Don't reach for gRPC unless production telemetry shows ≥8 concurrent streaming channels per sandbox. The "obvious" gRPC win (HTTP/2 stream multiplexing) is dwarfed by the cost of running two type-bridge systems.
+
+17. **One transport, multiple connections per concern** — control + events on a single WS; PTY on its own WS per terminal; file ops via REST. **Don't** multiplex PTY onto the control WS — head-of-line blocking on a 10 MB log will freeze keystrokes. See §10.2.
+
+18. **Heartbeat is application-level, not TCP-level** — 30s `Ping`/`Pong` with `nonce` on every WS, 90s timeout. TCP keepalive only detects dead TCP, not dead app event loops. See §10.8.
+
+19. **Idempotent directives or pain** — every bridge-bound directive (`EnsureRepoCloned`, `RemoveRepo`, `StartRun`, `OpenPty`, `HibernateSandbox`) carries a `directive_id` and is safe to re-deliver after reconnect. The bridge tracks the last 100 it processed and returns the cached ack on duplicates. See §10.8.
+
+20. **Sticky-by-sandbox routing is load-bearing** — at multi-instance scale, both the bridge for sandbox X and the web client(s) watching X must land on the same orchestrator instance. Use Fly `fly-replay` keyed on `sandbox_id` hash; Redis pub/sub on `sandbox:{id}` is the slow-path fallback only. Test with two orchestrator instances behind a fake LB. See §10.9.
+
+21. **Backpressure has explicit caps and an explicit drop policy** — orchestrator buffers ≤1000 events per (run, web subscriber); bridge buffers ≤5 MB pending events; PTY drops frames under back-pressure (terminals can drop, agent events can't because of `seq`-replay). Never grow buffers unbounded; alert on drops. See §10.8.
+
+22. **Reconnect backoff has jitter** — bridge: `1, 2, 4, 8, 16, 30, 30…` seconds with ±25%; web: `0.5, 1, 2, 4, 8, 16, 30…` with ±25%. Without jitter, an orchestrator restart causes a thundering-herd reconnect spike. See §10.8.
+
+23. **Capacity caps + hot-shedding** — each orchestrator instance soft-caps at 5000 WS connections. New sandbox spawns get 503 if no instance has headroom; existing connections aren't degraded. See §10.9.
 
 ---
 
 ## 20. Status snapshot (as of 2026-05-01)
 
 - **Slice 0** ✅ scaffolding shipped
-- **Slice 1** ✅ code shipped, ⬜ verification + first real `gen:api-types` pending
-- **Slices 2–8** ⬜ not started; briefs to be authored slice-by-slice
+- **Slice 1** ✅ shipped (GitHub OAuth + user persistence)
+- **Slice 2** ✅ shipped (OAuth `repo` scope + repo connection)
+- **Slice 3** ✅ shipped (repo introspection — Trees + Contents detection, dev_command, per-field user overrides)
+- **Slice 4** ⬜ next — sandbox provisioning (the box exists; no WS yet)
+- **Slices 5a / 5b / 6 – 10** ⬜ not started; briefs to be authored slice-by-slice. Note the new split: §18 was rewritten on 2026-05-01 to peel transport+clone (slice 5a/5b) apart from provisioning (slice 4) and to add slice 8 (PTY + file ops) and slice 9 (HTTP preview proxy). The old slice 8 (event-log persistence) is now slice 10.
 
-Repo metrics (from latest `/graphify` run): 217 nodes, 200 edges, 64 communities. The graph confirmed the planned package layout is in place and slice 1's code crosses every boundary the architecture predicts (web routes ↔ FastAPI routes ↔ Beanie models ↔ Mongo).
+Repo metrics (from latest [`/graphify`](../graphify-out/GRAPH_REPORT.md) run, 2026-05-01): **107 files (~75k words) · 443 nodes · 633 edges · 89 communities**. Extraction quality: 76% EXTRACTED · 24% INFERRED (avg confidence 0.71) · 0% AMBIGUOUS. Top community hubs reflect the shipped slices 0–3: *Repo Introspection Architecture / Tests*, *Command Detection*, *Package Manager Detection*, *Primary Language Detection*, *FastAPI App & Health*, *GitHub OAuth Wrapper*, *Mongo Lifecycle & Collections*, *Repo Models & Sandbox API*, *Type Bridges (Pydantic→TS)*, *Frontend Repo API Client / Query Hooks*, *Project Docs & Slice Discipline*, *Risks & Gotchas*. Use `/graphify --update` (incremental, cheap) after every shipped slice; full rebuild only when the user asks. See [AGENTS.md §2.7](../AGENTS.md) for query workflow and verification rules.
 
 ---
 

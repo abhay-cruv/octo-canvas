@@ -14,11 +14,14 @@ Sibling docs: [agent_context.md](agent_context.md) (quick-start) · [engineering
 | 1 | GitHub OAuth + user persistence | ✅ shipped | `User` + `Session` collections, `/login` → `/dashboard` flow, `require_user` dependency. UI redesigned to profile view. |
 | 2 | OAuth `repo` scope + repo connection | ✅ shipped | OAuth scope expanded to include `repo`; access token persisted on `User`; `Repo` collection; list/connect/disconnect endpoints; **401 → clear token + 403 `github_reauth_required`**; UI Reconnect flow. **No GitHub App, no smee, no webhooks** (rejected design). **No clone, no introspection, no sandbox** (slices 3 + 4). [slice2.md](slice/slice2.md) is now frozen — corrections live below. |
 | 3 | Repo introspection | ✅ shipped | GitHub Trees + Contents detection, no clone. Five fields incl. `dev_command`. Per-field user overrides via `PATCH /api/repos/{id}/introspection`. [slice3.md](slice/slice3.md) is now frozen — corrections live below. |
-| 4 | Sandbox provider (Sprites) — per-user, multi-repo | ⬜ not started | |
-| 5 | WebSocket transport | ⬜ not started | |
+| 4 | Sandbox provisioning (the box exists) | ⬜ next — brief to be authored | Scope-narrow rewrite (no WS, no clone). Plan.md §18 rewritten 2026-05-01. |
+| 5a | WebSocket transport — control + events | ⬜ not started | Plan.md §10 rewritten with multi-WS architecture, disconnect handling, sticky routing. |
+| 5b | Reconciliation + clone | ⬜ not started | `EnsureRepoCloned` / `RemoveRepo` directives; clone reconciliation on `ClientHello`. |
 | 6 | Tasks + Agent SDK invocation | ⬜ not started | |
 | 7 | Git ops + PR creation | ⬜ not started | |
-| 8 | Event log persistence (S3) | ⬜ not started | |
+| 8 | Interactive coding surface — PTY + file ops | ⬜ not started | New slice. PTY WS per terminal (binary, on-demand); file ops via REST. |
+| 9 | HTTP preview proxy | ⬜ not started | New slice. `https://sandbox-{id}.preview.<domain>` forwards to dev server in Sprite. |
+| 10 | Event log persistence (S3) | ⬜ not started | Was slice 8 in the previous plan. |
 
 ---
 
@@ -48,6 +51,14 @@ Next: slice 4 (sandbox provider — Sprites, per-user, multi-repo). **Brief must
 ---
 
 ## Recent changes (newest first)
+
+### 2026-05-01 (Plan.md rewrite — transport architecture + slice resplit)
+
+- **Plan.md §10 fully rewritten** — single-endpoint WS protocol replaced with the multi-WS architecture: WS for both legs (web↔orchestrator and orchestrator↔bridge), four logical channels split across separate WS connections (control+events, PTY, file ops, HTTP preview). gRPC explicitly considered and rejected with the reasoning recorded inline. New §10.8 Reliability subsection covers disconnects in detail: 30s/90s heartbeat with `Ping`/`Pong` nonces; `seq`-replay via `Resume{after_seq}` against Mongo; idempotent directives with `directive_id` + 100-entry dedup window on the bridge; bridge reconnect loop with exponential backoff `1, 2, 4, 8, 16, 30` (±25% jitter), web with `0.5, 1, 2, 4, 8, 16, 30` (±25%); explicit backpressure caps (≤1000 events per (run, web subscriber); ≤5 MB pending bridge-side; PTY drops frames; file-watch coalesces by path at ≤4 Hz); fail-fast on auth, fail-soft on schema mismatch. New §10.9 Horizontal scale: sticky-by-sandbox routing via Fly `fly-replay`, Redis pub/sub on `sandbox:{id}` as the slow-path fallback, per-instance soft cap of 5000 WS with hot-shedding via `orchestrator_capacity` Redis hash. New §10.10 explicit non-goals (no FE↔bridge direct, no muxing all four channels, no SSE fallback, no protocol versioning beyond Pydantic schema evolution).
+- **§18 slice plan resplit**: slice 4 narrowed to *provisioning only* (Sprite spawn/destroy/hibernate via REST + idle-hibernation; no WS, no clone, no reconciliation). Old slice 5 expanded into 5a (control+events WS, bridge runtime, sticky routing) + 5b (clone + reconciliation + disk-cap eviction). New slice 8 = interactive coding surface (PTY WS per terminal + file ops REST + live diff stream). New slice 9 = HTTP preview proxy. Old slice 8 (event-log S3) renumbered to slice 10. Slices 6 (tasks + Agent SDK) and 7 (git ops + PR creation) keep their numbers and scope.
+- **§19 risks** gained 8 new entries (#16–23) tied to the new transport design: WS-not-gRPC lock-in, multi-connection per concern rule, application-level heartbeat, idempotent directives, sticky-by-sandbox routing as load-bearing, explicit backpressure policy, jittered reconnect backoff, per-instance capacity cap with hot-shedding. Existing #10 (bridge token) and #15 (`/work` quota) retagged from slice 5/4 to slice 5a/5b respectively.
+- **§20 status snapshot** updated for the new slice numbering; flagged the rewrite date.
+- This is the first edit to Plan.md since slice 0 — done with explicit user direction per [AGENTS.md §3.3](../AGENTS.md). Authoring of the slice 4 brief is the next step; six open decisions still need user input before that brief can be written (Sprites SDK pin, Fly region, naming-collision strategy, `/work` disk cap value, Redis schema confirmation, eager-vs-lazy sandbox doc creation).
 
 ### 2026-05-01 (slice 3 — repo introspection, code shipped + scope amendment)
 

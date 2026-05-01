@@ -40,6 +40,14 @@ For *what changed structurally*, read [progress.md](progress.md). For *who and w
 
 ## Log
 
+### 2026-05-01 — Claude Opus 4.7 via Claude Code (Plan.md rewrite — transport architecture + slice resplit)
+
+- Rewrote [Plan.md §10](Plan.md) end-to-end with explicit user authorization. New architecture: WS for both legs, four logical channels on separate WS connections (control+events, PTY, file ops, HTTP preview), sticky-by-sandbox routing via Fly `fly-replay` with Redis pub/sub fallback, per-instance soft cap of 5000 WS connections with hot-shedding. gRPC considered and rejected; reasoning recorded in §10.1.
+- Added §10.8 Reliability subsection covering disconnects: 30s/90s heartbeat with `Ping`/`Pong` nonces, `seq`-replay via `Resume{after_seq}`, idempotent directives with `directive_id` dedup, jittered exponential-backoff reconnect on bridge and web, explicit backpressure caps and drop policies, fail-fast on auth, fail-soft on schema mismatch.
+- Resplit [Plan.md §18](Plan.md): slice 4 narrowed to provisioning-only (no WS, no clone); slice 5 split into 5a (control+events WS + bridge runtime + sticky routing) and 5b (clone + reconciliation + disk-cap eviction); new slice 8 (PTY + file ops) and slice 9 (HTTP preview proxy); old slice 8 (event-log S3) renumbered to 10.
+- Updated [Plan.md §19](Plan.md) with 8 new transport-design risks (#16–23) and retagged #10 / #15 to the new slice numbers. Updated §20 snapshot.
+- First edit to Plan.md since slice 0; permitted by explicit user direction per [AGENTS.md §3.3](../AGENTS.md).
+
 ### 2026-05-01 — Claude Opus 4.7 via Claude Code (slice 3 sign-off + CORS fix)
 
 - **User signed off slice 3.** [slice/slice3.md](slice/slice3.md) is frozen per AGENTS.md §3.2/§5; corrections move to [progress.md](progress.md). Slice status table flipped 3 → ✅ shipped, 4 → ⬜ awaiting brief.
