@@ -167,14 +167,6 @@ function ProfilePanel({
             </a>
             <button
               type="button"
-              onClick={startGithubLogin}
-              className="w-full px-3 py-1.5 text-sm rounded-lg text-gray-700 hover:bg-gray-100 hover:text-gray-900 transition text-left"
-              title="Re-run OAuth to refresh your access token"
-            >
-              Reconnect GitHub
-            </button>
-            <button
-              type="button"
               onClick={() => void onSignOut()}
               className="w-full px-3 py-1.5 text-sm rounded-lg text-gray-700 hover:bg-gray-100 hover:text-gray-900 transition text-left"
             >

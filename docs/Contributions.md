@@ -40,6 +40,19 @@ For *what changed structurally*, read [progress.md](progress.md). For *who and w
 
 ## Log
 
+### 2026-05-01 — Claude Opus 4.7 via Claude Code (slice 2 polish — pagination, server-side search, scope toggle, manage-orgs)
+
+- **Fix: `/repos/connect` was unreachable.** Parent `_authed/repos.tsx` was a TanStack Router parent route to `_authed/repos/connect.tsx` but didn't render `<Outlet />`, so clicking "Browse repositories" navigated to `/repos/connect` while the parent's UI stayed put. Moved `repos.tsx` → [_authed/repos/index.tsx](../apps/web/src/routes/_authed/repos/index.tsx) so they're siblings; route id changed from `/_authed/repos` → `/_authed/repos/`.
+- **Server-side pagination on `/api/repos/available`** — added `page`, `per_page` (1–100, default 30) query params; backend now hits a single GitHub page directly instead of aggregating all pages. Response is now an envelope `AvailableReposPage { repos, page, per_page, has_more }` with `is_connected: bool` per repo so already-connected ones can be marked instead of filtered out. Returned repos are sorted `pushed:desc`.
+- **Server-side search via `/search/repositories`** — added `q` query param; backend switches from `/user/repos` to GitHub's `/search/repositories` when present. Web FE replaced the client-side current-page filter with a debounced (350ms) search box that hits the backend and resets to page 1 on query change.
+- **Search-scope toggle** — `/search/repositories` doesn't have a "my access" filter, so by default the backend appends `user:<me>` + `org:<o>` qualifiers (fetched from `/user/orgs`) to scope to the user's repos and orgs. Added `scope_mine: bool = True` query param so the FE can opt out — checkbox under the search input ("Limit to my repos and orgs"). Always visible regardless of search state.
+- **"Manage GitHub org access" button** in the profile panel + new orchestrator endpoint `GET /api/auth/github/manage` that 302s to `https://github.com/settings/connections/applications/<client_id>`. Solves the "I want to authorize an org I previously denied" case — GitHub OAuth has no `prompt=consent` so re-running OAuth alone can't grant new org access; the user has to manage it on GitHub directly. New `manageGithubAccessUrl()` helper in `apps/web/src/lib/auth.ts`.
+- **"Reconnect GitHub" button** also visible in the profile panel (re-runs `startGithubLogin()` to refresh the token).
+- **Scroll-to-top on page change** — `useRef` + `useEffect` watching `page` calls `scrollIntoView({behavior:'smooth'})` so users land back at the page header when paginating.
+- **Pagination test added** — `test_available_returns_paginated_with_is_connected` exercises page/per_page query params and verifies `is_connected` flag mapping. Total: 21 pytest tests, all green.
+- **API types regenerated** to reflect `AvailableReposPage`, `is_connected`, `q`, `scope_mine`, and `/api/auth/github/manage`.
+- **Dashboard redesign** ([apps/web/src/routes/_authed/dashboard.tsx](../apps/web/src/routes/_authed/dashboard.tsx)) — 2-column layout: left collapsible profile panel (avatar, username, email, account fields, manage-orgs link, Reconnect, Sign out — open state persisted via `localStorage`); center area shows connected repos with disconnect actions and a "Browse repositories" CTA, or a Reconnect card when `needs_github_reauth`. Adheres to AGENTS.md §2.8 light theme.
+
 ### 2026-05-01 — Claude Opus 4.7 via Claude Code (slice 2 redesign — OAuth `repo` scope)
 
 - **Slice 2 architecture flipped** from "GitHub App + installation tokens + smee webhook" to "OAuth App with `repo` scope + persisted user access token + 401-driven re-auth flow." User-driven decision; full rewrite.

@@ -11,7 +11,8 @@ Distilled context for any AI coding agent picking up work in this repo. Read thi
 - **Product**: a tool where a user connects GitHub repos, files chat-driven coding tasks, and a Claude Agent SDK process running in a Fly Sprite makes the changes and opens a PR.
 - **Sandbox model**: **one persistent Sprite per user**, holding *all* of that user's connected repos under `/work/<full_name>/`. One active agent run at a time per sandbox; rest queue.
 - **Stack**: Python 3.12 + FastAPI + Beanie (Mongo) on the backend; Vite + React 18 + TanStack on the frontend; Turborepo across uv (Python) and pnpm (TS) workspaces.
-- **Status**: Slices 0 + 1 (scaffolding + GitHub OAuth) shipped. Slice 2 (GitHub App + repo connection) is next; brief not yet written.
+- **Status**: Slices 0 + 1 (scaffolding + GitHub OAuth) and Slice 2 (OAuth `repo` scope + repo connection) shipped. Slice 3 (repo introspection) is next; brief not yet written.
+- **Repo access uses the user's OAuth token, not a GitHub App.** The slice 2 brief was redesigned mid-build to drop the App/installation/webhook path in favor of expanding the slice 1 OAuth scope to `read:user user:email repo` and persisting the token on `User.github_access_token`. See [slice/slice2.md](slice/slice2.md), [Plan.md §12](Plan.md), and the redesign block in [Contributions.md](Contributions.md) for the rationale.
 
 ---
 
@@ -29,7 +30,7 @@ python_packages/        Reusable Python imported by both apps
   shared_models/        Pydantic models = wire-shape source of truth (HTTP + WS)
   db/                   Beanie models + connect/disconnect
   sandbox_provider/     Sprites Protocol + impl (slice 4)
-  github_integration/   githubkit + GitHub App helpers (slice 2)
+  github_integration/   githubkit OAuth-token helpers + GithubReauthRequired (slice 2)
   repo_introspection/   Detect language/framework (slice 3)
   agent_config/         System prompts, tool allowlists (slice 6)
 docs/
@@ -113,13 +114,15 @@ pnpm --filter @vibe-platform/api-types gen:api-types   # terminal 2
 
 1. **`uv sync` flags** — bare `uv sync` only installs the root. Always `uv sync --all-packages --all-extras`.
 2. **Vite envDir** — `.env` lives at repo root, not in `apps/web/`. `apps/web/vite.config.ts` sets `envDir: '../..'`. Without it, `import.meta.env.VITE_*` is undefined and the SPA renders blank because [../apps/web/src/lib/api.ts](../apps/web/src/lib/api.ts) throws at module load.
-3. **OAuth App ≠ GitHub App** — slice 1 uses an OAuth App for sign-in. Slice 2 introduces a GitHub App for repo access. Both live in GitHub → Settings → Developer settings, both are needed eventually, they are different artifacts.
+3. **One GitHub OAuth App, scope `read:user user:email repo`** — slice 1 + 2 both ride the same OAuth App. The token is persisted on `User.github_access_token` and used directly for `git clone`/`push` and all GitHub API calls. **There is no separate GitHub App, no installation token cache, no webhook server, no smee tunnel.** Anything you read in older docs about a GitHub App is a redesigned-out artifact — see [Plan.md §12](Plan.md).
 4. **Beanie `init_beanie` registration** — adding a `Document` class without registering it in [../python_packages/db/src/db/connect.py](../python_packages/db/src/db/connect.py)'s `document_models` list silently fails to query.
 5. **`datetime.utcnow()` is forbidden** — deprecated in 3.12, fails Pyright strict. Use `datetime.now(UTC)` via a `_now()` helper. See [engineering.md](engineering.md).
 6. **DB shape vs API shape** — never reuse a Beanie `Document` as a FastAPI `response_model`.
 7. **Pytest event loop** — DB-touching tests must use the `httpx.AsyncClient + ASGITransport` fixture. Don't add `TestClient`-based tests for DB-touching code; the event-loop wiring breaks.
 8. **No hand-editing `packages/api-types/generated/schema.d.ts`** — regenerate via the codegen step in [engineering.md](engineering.md).
-9. **GitHub installations vary across repos** — different connected repos in the same sandbox can be on different GitHub App installations (different orgs). Mint per-repo install tokens at run-start time; never share or persist.
+9. **OAuth token re-auth is a typed flow, not an exception** — every GitHub call from the orchestrator goes through `github_integration.call_with_reauth(fn)` (or catches `RequestFailed.status_code == 401` for paginators). On 401: clear `User.github_access_token`, return `403 {"detail": "github_reauth_required"}`. The web app turns that into a "Reconnect GitHub" CTA via `meQueryOptions.data.needs_github_reauth` + the `availableReposQueryOptions` reauth sentinel. Never let a 401 bubble as a 500.
+10. **GitHub OAuth has no `prompt=consent`** — re-running OAuth refreshes the token but cannot force GitHub to re-show the consent screen for org-access changes. Direct users to the OAuth-app settings page via `GET /api/auth/github/manage` (302s to `https://github.com/settings/connections/applications/<client_id>`) so they can grant/request per-org access. The "Manage GitHub org access" button in the dashboard panel uses this.
+11. **`/search/repositories` is unscoped by default** — without `user:`/`org:` qualifiers it searches all of public GitHub. The repos available endpoint scopes via `q="<query> in:name,full_name fork:true user:<me> org:<o1> org:<o2> ..."` after fetching `/user/orgs`. The web FE sends `scope_mine=true` by default but can flip it off.
 
 ---
 

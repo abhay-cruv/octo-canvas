@@ -26,19 +26,21 @@ Sibling docs: [agent_context.md](agent_context.md) (quick-start) · [engineering
 
 ### Punch list
 
-1. ✅ `pnpm typecheck && pnpm lint && pnpm test && pnpm build` all green (28 pytest tests)
+1. ✅ `pnpm typecheck && pnpm lint && pnpm test && pnpm build` all green (21 pytest tests)
 2. ✅ `pnpm --filter @vibe-platform/api-types gen:api-types` regenerated against live orchestrator
-3. ⬜ Update GitHub OAuth App on github.com to advertise the **`repo` scope** (no other config change — same Client ID/Secret, same callback URL)
-4. ⬜ Sign out + sign in again so the new token (with `repo` scope) lands in `users.github_access_token`
-5. ⬜ Walk: dashboard (now shows repos in center, profile in left collapsible panel) → "Browse repositories" → `/repos/connect` → connect 3 → disconnect 1. The standalone `/repos` route now redirects to `/dashboard`.
-6. ⬜ Mongo: confirm `repos` rows have `clone_status="pending"`, `clone_path=null`, **no `installation_id`**; `users` doc has `github_access_token` populated
-7. ⬜ Token-revocation walk: revoke the OAuth grant on github.com → refresh `/repos` → sees Reconnect prompt; `users.github_access_token=null`. Click Reconnect → through OAuth → token restored, prior `Repo` rows still present
+3. ✅ Sign-in walk verified end-to-end (OAuth scope `read:user user:email repo`, token persisted to `users.github_access_token`)
+4. ✅ Browse + connect + disconnect verified manually (with the route-pattern fix moving `repos.tsx` → `repos/index.tsx`)
+5. ✅ `/api/repos/available` paginates server-side (`page`, `per_page`); search switched from client-side filter to GitHub `/search/repositories` server-side; `scope_mine` toggle (default true) scopes via `user:`/`org:` qualifiers
+6. ✅ Token-revocation walk: revoke OAuth grant on github.com → Reconnect banner appears + `users.github_access_token=null` → Reconnect via in-page CTA → token restored, prior `Repo` rows preserved
+7. ✅ Manage-orgs walk: "Manage GitHub org access" panel link → grant a previously-restricted org → org repos appear in `/repos/connect`. (The always-visible "Reconnect GitHub" button in the panel was removed — redundant given that the contextual ReconnectCard appears when actually needed and the panel link covers org-grant.)
 8. ⬜ User reviews and approves slice 2; *only then* author `slice3.md`
 
 ### Known issues / blockers
 
 - v1.1 followup: encrypt `User.github_access_token` at rest (currently plaintext in Mongo for dev simplicity)
-- Org SSO requires per-org "Authorize" click on github.com before personal OAuth tokens can list/clone org repos — surfaced as 404s on individual repos, no auto-detection in the UI yet
+- Org SSO requires per-org "Authorize" click on github.com before personal OAuth tokens can list/clone org repos. Mitigation: "Manage GitHub org access" button in the dashboard panel deep-links to the OAuth-app settings page; no auto-detection yet
+- Server-side search via `/search/repositories` doesn't include repos the user has *only* collaborator access to on someone else's personal account (we can't enumerate "who you collaborate with"). The non-search browse path covers them via `/user/repos?affiliation=collaborator`. Acceptable for v1; flag if it bites
+- `apps/web/` has no Vitest tests yet (still `--passWithNoTests`); UI verification is manual
 
 ---
 
