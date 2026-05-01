@@ -13,7 +13,7 @@ Sibling docs: [agent_context.md](agent_context.md) (quick-start) · [engineering
 | 0 | Scaffolding | ✅ shipped | Skeleton repo, placeholders, build/dev/test plumbing across both langs |
 | 1 | GitHub OAuth + user persistence | ✅ shipped | `User` + `Session` collections, `/login` → `/dashboard` flow, `require_user` dependency. UI redesigned to profile view. |
 | 2 | OAuth `repo` scope + repo connection | ✅ shipped | OAuth scope expanded to include `repo`; access token persisted on `User`; `Repo` collection; list/connect/disconnect endpoints; **401 → clear token + 403 `github_reauth_required`**; UI Reconnect flow. **No GitHub App, no smee, no webhooks** (rejected design). **No clone, no introspection, no sandbox** (slices 3 + 4). [slice2.md](slice/slice2.md) is now frozen — corrections live below. |
-| 3 | Repo introspection | 🟡 active — code shipped (incl. scope amendment), awaiting sign-off | Brief at [slice3.md](slice/slice3.md). Trees + Contents API, no clone. Five fields incl. `dev_command`. Per-field user overrides via `PATCH /api/repos/{id}/introspection`. |
+| 3 | Repo introspection | ✅ shipped | GitHub Trees + Contents detection, no clone. Five fields incl. `dev_command`. Per-field user overrides via `PATCH /api/repos/{id}/introspection`. [slice3.md](slice/slice3.md) is now frozen — corrections live below. |
 | 4 | Sandbox provider (Sprites) — per-user, multi-repo | ⬜ not started | |
 | 5 | WebSocket transport | ⬜ not started | |
 | 6 | Tasks + Agent SDK invocation | ⬜ not started | |
@@ -24,12 +24,17 @@ Sibling docs: [agent_context.md](agent_context.md) (quick-start) · [engineering
 
 ## Active slice — none
 
-Slice 2 signed off **2026-05-01**. [slice2.md](slice/slice2.md) is frozen. Corrections / followups live in this file from now on.
+Slice 3 signed off **2026-05-01**. [slice3.md](slice/slice3.md) is frozen. Corrections / followups live in this file from now on.
 
-Next: slice 3 (repo introspection). **Brief must be authored before any code** ([AGENTS.md §3.2](../AGENTS.md), [CLAUDE.md](../CLAUDE.md)).
+Next: slice 4 (sandbox provider — Sprites, per-user, multi-repo). **Brief must be authored before any code** ([AGENTS.md §3.2](../AGENTS.md), [CLAUDE.md](../CLAUDE.md)).
 
-### Open followups (not blockers; flag at slice-3 kickoff)
+### Slice-3 corrections (post-freeze)
 
+- **CORS allowlist must include PATCH (and PUT)** — initial slice 3 ship missed this; the new `PATCH /api/repos/{id}/introspection` failed CORS preflight on the web client. Fixed in [../apps/orchestrator/src/orchestrator/app.py](../apps/orchestrator/src/orchestrator/app.py) `allow_methods` list. Lesson: when adding a new HTTP verb to any route, check `app.add_middleware(CORSMiddleware, ...)` first.
+
+### Open followups (not blockers; flag at slice-4 kickoff)
+
+- **v1.1 introspection followups**: framework detection (React/Vue/Django/Flask), monorepo workspace splits, periodic re-introspection refresh, "force-clear detected → null" toggle (current `IntrospectionOverrides` design can't actively suppress a non-null detected value), Trees-API truncation handling for repos >100k entries / >7MB.
 - **Dev Mongo has a stale `github_repo_id_1` unique index** from the pre-fix schema — drop it once with `docker exec vibe-mongo mongosh vibe_platform --eval 'db.repos.dropIndex("github_repo_id_1")'` so cross-user repo connects work. Test DB rebuilds indexes per run (see conftest), so tests are unaffected.
 - v1.1 followup: encrypt `User.github_access_token` at rest (currently plaintext in Mongo for dev simplicity).
 - Org SSO requires per-org "Authorize" click on github.com before personal OAuth tokens can list/clone org repos. Mitigation: "Manage GitHub org access" button in the dashboard panel deep-links to the OAuth-app settings page; no auto-detection yet.

@@ -40,6 +40,11 @@ For *what changed structurally*, read [progress.md](progress.md). For *who and w
 
 ## Log
 
+### 2026-05-01 — Claude Opus 4.7 via Claude Code (slice 3 sign-off + CORS fix)
+
+- **User signed off slice 3.** [slice/slice3.md](slice/slice3.md) is frozen per AGENTS.md §3.2/§5; corrections move to [progress.md](progress.md). Slice status table flipped 3 → ✅ shipped, 4 → ⬜ awaiting brief.
+- **CORS slice-3 correction**: added `PATCH` (and `PUT`) to the `CORSMiddleware` `allow_methods` allowlist in [../apps/orchestrator/src/orchestrator/app.py](../apps/orchestrator/src/orchestrator/app.py). The new `PATCH /api/repos/{id}/introspection` failed preflight on the web client without it — caught only after the user tested Save in the override panel. Recorded as a slice-3 post-freeze correction in progress.md.
+
 ### 2026-05-01 — Claude Opus 4.7 via Claude Code (slice 3 — scope amendment: dev_command + overrides)
 
 - Added `dev_command` field to `RepoIntrospection`; detected per-pm in [../python_packages/repo_introspection/src/repo_introspection/commands.py](../python_packages/repo_introspection/src/repo_introspection/commands.py) (JS: `scripts.dev` → `scripts.start`; cargo run; go run; gradle run).
