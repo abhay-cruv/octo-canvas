@@ -40,7 +40,7 @@ function ReposPage() {
             className="text-sm font-medium text-gray-900 flex items-center gap-2 hover:text-black"
           >
             <span className="inline-block h-6 w-6 rounded-md bg-black" aria-hidden />
-            vibe-platform
+            octo-canvas
           </Link>
           <Link to="/dashboard" className="text-sm text-gray-600 hover:text-black">
             ← Dashboard

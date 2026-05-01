@@ -54,7 +54,7 @@ async def _fetch_github_profile(access_token: str) -> dict[str, Any]:
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Accept": "application/vnd.github+json",
-        "User-Agent": "vibe-platform",
+        "User-Agent": "octo-canvas",
     }
     async with httpx.AsyncClient(timeout=10.0) as client:
         user_resp = await client.get(GITHUB_USER_URL, headers=headers)

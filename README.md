@@ -1,4 +1,4 @@
-# vibe-platform
+# octo-canvas
 
 A bilingual monorepo with a Python backend (FastAPI orchestrator + bridge) and a TypeScript frontend (Vite + React). Cross-language tasks are orchestrated by Turborepo.
 
@@ -15,7 +15,7 @@ A bilingual monorepo with a Python backend (FastAPI orchestrator + bridge) and a
 You register **one** GitHub OAuth App. It's used for both sign-in (slice 1) and repo access (slice 2). There is **no separate GitHub App** and no webhook tunnel.
 
 1. Go to GitHub Settings → Developer settings → OAuth Apps → **New OAuth App**.
-2. **Application name:** `vibe-platform (local dev)`.
+2. **Application name:** `octo-canvas (local dev)`.
 3. **Homepage URL:** `http://localhost:5173`.
 4. **Authorization callback URL:** `http://localhost:3001/api/auth/github/callback`.
 5. Click **Register application**, copy the **Client ID**, generate a **Client Secret**, copy that.
@@ -82,10 +82,10 @@ The frontend's HTTP client is typed against types generated from the orchestrato
 
 ```bash
 # Terminal 1 — keep the orchestrator running
-pnpm --filter @vibe-platform/orchestrator dev
+pnpm --filter @octo-canvas/orchestrator dev
 
 # Terminal 2 — regenerate types
-pnpm --filter @vibe-platform/api-types gen:api-types
+pnpm --filter @octo-canvas/api-types gen:api-types
 ```
 
 The generator overwrites `packages/api-types/generated/schema.d.ts`. The frontend picks up the new types on its next typecheck/build. (Auto-regeneration on backend changes is a future polish.)

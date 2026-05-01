@@ -131,7 +131,7 @@ Set up exactly the structure below. Create directories, create the listed config
 
 ```toml
 [project]
-name = "vibe-platform"
+name = "octo-canvas"
 version = "0.1.0"
 description = "Monorepo root"
 requires-python = ">=3.12"
@@ -221,7 +221,7 @@ Specifically: **commit `uv.lock` and `pnpm-lock.yaml`. Do NOT gitignore them.** 
 
 ```
 # Mongo (orchestrator + bridge)
-MONGODB_URI=mongodb://localhost:27017/vibe_platform
+MONGODB_URI=mongodb://localhost:27017/octo_canvas
 
 # Redis (orchestrator)
 REDIS_URL=redis://localhost:6379
@@ -299,7 +299,7 @@ Three files that other tsconfigs extend:
 - `library.json` — extends base, for `packages/*` if any are libraries. Adds `composite: true`, `declaration: true`, `outDir: "dist"`.
 - `react-app.json` — extends base, for `apps/web`. Adds `"jsx": "react-jsx"`, `"lib": ["DOM", "DOM.Iterable", "ES2022"]`.
 
-Plus a `package.json` declaring this as a workspace package so others can extend its files via `"extends": "@vibe-platform/tsconfig/react-app.json"`.
+Plus a `package.json` declaring this as a workspace package so others can extend its files via `"extends": "@octo-canvas/tsconfig/react-app.json"`.
 
 ### Apps
 
@@ -308,7 +308,7 @@ For each app, scaffold the structure and configs but **no real logic**.
 #### `apps/web` (Vite SPA, TypeScript)
 
 Files to create:
-- `package.json` — depends on: `react`, `react-dom`, `@tanstack/react-router`, `@tanstack/react-query`, `@tanstack/router-plugin`, `@tanstack/router-devtools`, `openapi-fetch`, `tailwindcss`, `clsx`, `tailwind-merge`, `class-variance-authority`. Workspace deps: `@vibe-platform/api-types`. Dev deps: `vite`, `@vitejs/plugin-react`, `typescript`, `@types/react`, `@types/react-dom`, `autoprefixer`, `postcss`, `vitest`. Scripts: `dev` (`vite`), `build` (`vite build`), `preview`, `typecheck` (`tsc --noEmit`), `lint` (`eslint .`), `test` (`vitest`).
+- `package.json` — depends on: `react`, `react-dom`, `@tanstack/react-router`, `@tanstack/react-query`, `@tanstack/router-plugin`, `@tanstack/router-devtools`, `openapi-fetch`, `tailwindcss`, `clsx`, `tailwind-merge`, `class-variance-authority`. Workspace deps: `@octo-canvas/api-types`. Dev deps: `vite`, `@vitejs/plugin-react`, `typescript`, `@types/react`, `@types/react-dom`, `autoprefixer`, `postcss`, `vitest`. Scripts: `dev` (`vite`), `build` (`vite build`), `preview`, `typecheck` (`tsc --noEmit`), `lint` (`eslint .`), `test` (`vitest`).
 - `tsconfig.json` extending `react-app.json`.
 - `vite.config.ts` with the React plugin and TanStack Router plugin configured.
 - `tailwind.config.ts` with content globs covering `src/**/*.{ts,tsx}`.
@@ -370,7 +370,7 @@ Files to create:
 - `package.json` (Turbo glue only):
   ```json
   {
-    "name": "@vibe-platform/orchestrator",
+    "name": "@octo-canvas/orchestrator",
     "private": true,
     "scripts": {
       "dev": "uv run uvicorn orchestrator.main:app --reload --host 0.0.0.0 --port 3001",
@@ -386,7 +386,7 @@ Files to create:
 - `Dockerfile` using `python:3.12-slim` base, installs uv, copies workspace, runs `uv sync`, runs the orchestrator. Single-stage is fine for now.
 - `src/orchestrator/__init__.py` — empty.
 - `src/orchestrator/main.py` — placeholder entry. Loads env via `pydantic-settings`, creates the FastAPI app from `app.py`. This is the module uvicorn imports: `from orchestrator.app import app`.
-- `src/orchestrator/app.py` — creates `app = FastAPI(title="vibe-platform orchestrator")`, mounts a single `GET /health` route returning `{"status": "ok"}`. CORS middleware configured for `WEB_BASE_URL`. No other routes.
+- `src/orchestrator/app.py` — creates `app = FastAPI(title="octo-canvas orchestrator")`, mounts a single `GET /health` route returning `{"status": "ok"}`. CORS middleware configured for `WEB_BASE_URL`. No other routes.
 - `src/orchestrator/lib/__init__.py` — empty.
 - `src/orchestrator/lib/env.py` — `pydantic-settings` `BaseSettings` class with the env vars the orchestrator needs for *this scaffolding task only* (port, web base URL). Do not include OAuth, Mongo, Redis, or other slice-1+ vars yet.
 - `src/orchestrator/lib/logger.py` — structlog setup, JSON in production, pretty in dev.
@@ -439,7 +439,7 @@ Files to create:
 - `package.json` (Turbo glue):
   ```json
   {
-    "name": "@vibe-platform/bridge",
+    "name": "@octo-canvas/bridge",
     "private": true,
     "scripts": {
       "dev": "uv run python -m bridge",
@@ -500,7 +500,7 @@ Pydantic models that will be imported by both the orchestrator and the bridge.
 - `package.json` (Turbo glue):
   ```json
   {
-    "name": "@vibe-platform/shared-models",
+    "name": "@octo-canvas/shared-models",
     "private": true,
     "scripts": {
       "test": "uv run pytest",
@@ -518,7 +518,7 @@ Pydantic models that will be imported by both the orchestrator and the bridge.
 Beanie models and Mongo connection helpers.
 
 - Depends on `beanie>=1.27`, `pydantic>=2.9`, `motor>=3.6`, `shared_models`.
-- `package.json` (Turbo glue) — same shape as above, name `@vibe-platform/db`.
+- `package.json` (Turbo glue) — same shape as above, name `@octo-canvas/db`.
 - `src/db/__init__.py` — placeholder.
 - `src/db/connect.py` — placeholder function:
   ```python
@@ -533,7 +533,7 @@ Beanie models and Mongo connection helpers.
 Sprites abstraction.
 
 - Depends on `pydantic>=2.9`. **Do not add the Sprites SDK dependency in this task** — leave a comment in the dependencies list.
-- `package.json` Turbo glue, name `@vibe-platform/sandbox-provider`.
+- `package.json` Turbo glue, name `@octo-canvas/sandbox-provider`.
 - `src/sandbox_provider/__init__.py` — placeholder.
 - `src/sandbox_provider/interface.py` — defines a Protocol class as the interface scaffold:
   ```python
@@ -550,7 +550,7 @@ Sprites abstraction.
 githubkit + GitHub App helpers.
 
 - Depends on `githubkit>=0.11`, `pydantic>=2.9`.
-- `package.json` Turbo glue, name `@vibe-platform/github-integration`.
+- `package.json` Turbo glue, name `@octo-canvas/github-integration`.
 - `src/github_integration/__init__.py` — placeholder.
 
 #### `python_packages/repo_introspection`
@@ -558,7 +558,7 @@ githubkit + GitHub App helpers.
 Detect language/framework from a cloned repo.
 
 - Depends on `pydantic>=2.9`.
-- `package.json` Turbo glue, name `@vibe-platform/repo-introspection`.
+- `package.json` Turbo glue, name `@octo-canvas/repo-introspection`.
 - `src/repo_introspection/__init__.py` — placeholder.
 
 #### `python_packages/agent_config`
@@ -566,15 +566,15 @@ Detect language/framework from a cloned repo.
 System prompts and tool allowlists for agents.
 
 - Depends on `pydantic>=2.9`.
-- `package.json` Turbo glue, name `@vibe-platform/agent-config`.
+- `package.json` Turbo glue, name `@octo-canvas/agent-config`.
 - `src/agent_config/__init__.py` — placeholder.
 - Empty `src/agent_config/dev_agent/__init__.py`. No prompts yet.
 
 ### Naming convention
 
-- TypeScript package names in `package.json`: `@vibe-platform/<kebab-name>` (e.g., `@vibe-platform/web`, `@vibe-platform/api-types`).
+- TypeScript package names in `package.json`: `@octo-canvas/<kebab-name>` (e.g., `@octo-canvas/web`, `@octo-canvas/api-types`).
 - Python package names in `pyproject.toml` and import statements: snake_case (e.g., `shared_models`, `github_integration`, `sandbox_provider`).
-- Each Python package's `package.json` (Turbo glue) uses the kebab-case TS-style name `@vibe-platform/<kebab-name>`. The Python module name and the npm name can differ — that's fine because the npm name is only for Turbo, not for imports.
+- Each Python package's `package.json` (Turbo glue) uses the kebab-case TS-style name `@octo-canvas/<kebab-name>`. The Python module name and the npm name can differ — that's fine because the npm name is only for Turbo, not for imports.
 
 The user can rename the project later via find-and-replace.
 

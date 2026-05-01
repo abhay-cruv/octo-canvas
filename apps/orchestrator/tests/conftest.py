@@ -9,7 +9,7 @@ os.environ.setdefault("ORCHESTRATOR_BASE_URL", "http://localhost:3001")
 os.environ.setdefault("AUTH_SECRET", "test-secret")
 os.environ.setdefault("GITHUB_OAUTH_CLIENT_ID", "test-client-id")
 os.environ.setdefault("GITHUB_OAUTH_CLIENT_SECRET", "test-client-secret")
-os.environ.setdefault("MONGODB_URI", "mongodb://localhost:27017/vibe_platform_test")
+os.environ.setdefault("MONGODB_URI", "mongodb://localhost:27017/octo_canvas_test")
 os.environ.setdefault("REDIS_URL", "redis://localhost:6379/15")
 os.environ.setdefault("SANDBOX_PROVIDER", "mock")
 
@@ -20,7 +20,7 @@ from db import mongo
 from orchestrator.app import app
 from orchestrator.services.sandbox_manager import SandboxManager
 
-TEST_DB_NAME = "vibe_platform_test"
+TEST_DB_NAME = "octo_canvas_test"
 
 
 @pytest_asyncio.fixture

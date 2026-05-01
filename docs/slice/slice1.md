@@ -58,7 +58,7 @@ Use **Authlib** (`authlib`) as the OAuth client library. It handles only the OAu
 The user will register a GitHub OAuth App separately and provide the credentials via env vars. **Do not register the app yourself.** Document in the README what the user needs to do:
 
 1. Go to GitHub Settings → Developer settings → OAuth Apps → New OAuth App.
-2. Application name: `vibe-platform (local dev)`.
+2. Application name: `octo-canvas (local dev)`.
 3. Homepage URL: `http://localhost:5173`.
 4. Authorization callback URL: `http://localhost:3001/api/auth/github/callback`.
 5. Click "Register application," copy the Client ID, generate a Client Secret, copy that.
@@ -82,7 +82,7 @@ Replace the `NotImplementedError` placeholder with a real connection helper:
   - Logs successful connection and connection errors via structlog
   - Raises on connection failure (orchestrator should fail to start)
 - An `async def disconnect() -> None` for graceful shutdown.
-- Extract the database name from the URI's path component (default to `vibe_platform` if absent).
+- Extract the database name from the URI's path component (default to `octo_canvas` if absent).
 
 The `document_models` list passed to `init_beanie` should include all Beanie `Document` classes. For this slice that's the `User` model and the `Session` model (both described next).
 
@@ -216,7 +216,7 @@ async def lifespan(app: FastAPI):
     await disconnect()
     logger.info("orchestrator.shutdown_complete")
 
-app = FastAPI(title="vibe-platform orchestrator", lifespan=lifespan)
+app = FastAPI(title="octo-canvas orchestrator", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -318,10 +318,10 @@ After the orchestrator is running with the new endpoints, regenerate the TS type
 
 ```bash
 # In one terminal:
-pnpm --filter @vibe-platform/orchestrator dev
+pnpm --filter @octo-canvas/orchestrator dev
 
 # In another:
-pnpm --filter @vibe-platform/api-types gen:api-types
+pnpm --filter @octo-canvas/api-types gen:api-types
 ```
 
 This overwrites `packages/api-types/generated/schema.d.ts` with real types derived from the live OpenAPI schema. After regeneration, the frontend can import `paths`, `components`, and `operations` types and use them with `openapi-fetch`.
@@ -332,7 +332,7 @@ Document this two-terminal workflow in the README under a "Regenerating API type
 
 ```ts
 import createClient from "openapi-fetch";
-import type { paths } from "@vibe-platform/api-types";
+import type { paths } from "@octo-canvas/api-types";
 
 const baseUrl = import.meta.env.VITE_ORCHESTRATOR_BASE_URL;
 if (!baseUrl) {
@@ -559,7 +559,7 @@ Add real tests alongside the existing smoke tests.
 
 For mocking GitHub, patch the Authlib client or the httpx call inside the callback handler. Use `pytest-mock` or `unittest.mock`. **Add `pytest-mock` to the orchestrator's `[project.optional-dependencies] dev` if it isn't there.**
 
-For the test database: use a separate database name (e.g., `vibe_platform_test`), connect/disconnect in a session-scoped fixture, drop the database at the end. Don't touch the dev database from tests.
+For the test database: use a separate database name (e.g., `octo_canvas_test`), connect/disconnect in a session-scoped fixture, drop the database at the end. Don't touch the dev database from tests.
 
 **`apps/web/`** — no tests required for this slice. Vitest stays at 0 files with `--passWithNoTests`.
 
@@ -576,12 +576,12 @@ cp .env.example .env        # if not done already
 # Fill in MONGODB_URI, AUTH_SECRET, GITHUB_OAUTH_CLIENT_ID, GITHUB_OAUTH_CLIENT_SECRET
 pnpm install
 uv sync --all-packages --all-extras
-pnpm --filter @vibe-platform/orchestrator dev   # terminal 1
-pnpm --filter @vibe-platform/api-types gen:api-types  # terminal 2, run once after orchestrator is up
+pnpm --filter @octo-canvas/orchestrator dev   # terminal 1
+pnpm --filter @octo-canvas/api-types gen:api-types  # terminal 2, run once after orchestrator is up
 pnpm dev                    # terminal 3, runs everything
 ```
 
-**"Regenerating API types"** — when you change a route or response model in the orchestrator, run `pnpm --filter @vibe-platform/api-types gen:api-types` against a running orchestrator. The frontend's typecheck will pick up the new types. (This is manual for now; auto-regeneration on backend changes is a future polish.)
+**"Regenerating API types"** — when you change a route or response model in the orchestrator, run `pnpm --filter @octo-canvas/api-types gen:api-types` against a running orchestrator. The frontend's typecheck will pick up the new types. (This is manual for now; auto-regeneration on backend changes is a future polish.)
 
 ---
 
@@ -622,7 +622,7 @@ After this task, all of the following must hold. Capture the actual command/outp
 8. With `.env` populated and the orchestrator running:
    - `curl http://localhost:3001/health` returns `{"status":"ok"}`.
    - `curl http://localhost:3001/openapi.json` returns a schema that includes `/api/auth/github/login`, `/api/auth/github/callback`, `/api/auth/logout`, `/api/auth/session`, `/api/me`.
-9. After running `pnpm --filter @vibe-platform/api-types gen:api-types` against the live orchestrator, `packages/api-types/generated/schema.d.ts` contains real `paths` types (not the stub from scaffolding).
+9. After running `pnpm --filter @octo-canvas/api-types gen:api-types` against the live orchestrator, `packages/api-types/generated/schema.d.ts` contains real `paths` types (not the stub from scaffolding).
 10. With all three apps running (`pnpm dev`):
     - Visiting `http://localhost:5173` while signed out redirects to `/login`.
     - Clicking "Sign in with GitHub" navigates to GitHub's OAuth consent page with the requested scopes (`read:user user:email`).

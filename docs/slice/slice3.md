@@ -368,7 +368,7 @@ If `introspection === null` on a row (e.g., introspection failed silently during
 End of slice, with the orchestrator running:
 
 ```bash
-pnpm --filter @vibe-platform/api-types gen:api-types
+pnpm --filter @octo-canvas/api-types gen:api-types
 ```
 
 Verify `schema.d.ts` exposes:

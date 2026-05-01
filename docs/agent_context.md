@@ -98,16 +98,16 @@ pnpm dev                                      # runs web (5173), orchestrator (3
 pnpm typecheck && pnpm lint && pnpm test
 
 # Single-package commands
-pnpm --filter @vibe-platform/orchestrator test
-pnpm --filter @vibe-platform/orchestrator typecheck
-pnpm --filter @vibe-platform/web typecheck
+pnpm --filter @octo-canvas/orchestrator test
+pnpm --filter @octo-canvas/orchestrator typecheck
+pnpm --filter @octo-canvas/web typecheck
 
 # Single pytest test
 uv run pytest apps/orchestrator/tests/test_auth.py::test_logout_clears_session -v
 
 # Regenerate TS types after backend changes (orchestrator must be running)
-pnpm --filter @vibe-platform/orchestrator dev   # terminal 1
-pnpm --filter @vibe-platform/api-types gen:api-types   # terminal 2
+pnpm --filter @octo-canvas/orchestrator dev   # terminal 1
+pnpm --filter @octo-canvas/api-types gen:api-types   # terminal 2
 ```
 
 ---

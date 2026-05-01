@@ -75,7 +75,7 @@ FastAPI routes (apps/orchestrator)
    ▼
 /openapi.json  (served at runtime by FastAPI)
    │
-   ▼  pnpm --filter @vibe-platform/api-types gen:api-types
+   ▼  pnpm --filter @octo-canvas/api-types gen:api-types
    │
    ▼
 packages/api-types/generated/schema.d.ts  (TypeScript)
@@ -211,8 +211,8 @@ Required env vars (no default) make the orchestrator fail-fast at startup. That'
 ### Step 5 — Run typecheck and tests
 
 ```bash
-pnpm --filter @vibe-platform/orchestrator typecheck
-pnpm --filter @vibe-platform/orchestrator test
+pnpm --filter @octo-canvas/orchestrator typecheck
+pnpm --filter @octo-canvas/orchestrator test
 ```
 
 If Pyright complains about a third-party library's types (Authlib is a known weak-types case), use targeted `# pyright: ignore[reportUnknownMemberType]` rather than disabling strict mode.
@@ -233,10 +233,10 @@ After **any** change to:
 
 ```bash
 # Terminal 1 — keep the orchestrator running
-pnpm --filter @vibe-platform/orchestrator dev
+pnpm --filter @octo-canvas/orchestrator dev
 
 # Terminal 2 — regenerate
-pnpm --filter @vibe-platform/api-types gen:api-types
+pnpm --filter @octo-canvas/api-types gen:api-types
 ```
 
 What this does:
@@ -247,7 +247,7 @@ What this does:
 
 The generated file is **gitignored** — it's an artifact, not source. You regenerate it locally; CI regenerates it on its own when needed (slice 2+ will automate this).
 
-After regenerating, run `pnpm --filter @vibe-platform/web typecheck` — if a route's response shape changed, the frontend's `openapi-fetch` calls will fail to compile and you'll see the exact callsite that needs updating. That's the type-system pulling its weight.
+After regenerating, run `pnpm --filter @octo-canvas/web typecheck` — if a route's response shape changed, the frontend's `openapi-fetch` calls will fail to compile and you'll see the exact callsite that needs updating. That's the type-system pulling its weight.
 
 **Common mistake:** forgetting `response_model=...` on a new route. The route works, but `gen:api-types` produces `unknown` for the response, and the frontend can't use it. Always set `response_model`.
 
@@ -405,10 +405,10 @@ Never disable strict mode globally.
 
 ```bash
 # Web app only:
-pnpm --filter @vibe-platform/web add some-library
+pnpm --filter @octo-canvas/web add some-library
 
 # Dev dep:
-pnpm --filter @vibe-platform/web add -D some-library
+pnpm --filter @octo-canvas/web add -D some-library
 
 # Workspace dependency between packages:
 # pnpm picks this up automatically because of pnpm-workspace.yaml.
@@ -426,8 +426,8 @@ pnpm --filter @vibe-platform/web add -D some-library
 
 **TypeScript:**
 
-1. Create `packages/<pkg>/package.json` with name `@vibe-platform/<kebab>`.
-2. Create `packages/<pkg>/tsconfig.json` extending `@vibe-platform/tsconfig/library.json`.
+1. Create `packages/<pkg>/package.json` with name `@octo-canvas/<kebab>`.
+2. Create `packages/<pkg>/tsconfig.json` extending `@octo-canvas/tsconfig/library.json`.
 3. Add to root [tsconfig.json](tsconfig.json) `references` array.
 4. `pnpm install`.
 
@@ -447,12 +447,12 @@ For backend route changes specifically:
 
 ```bash
 # 1. Run the focused test suite first
-pnpm --filter @vibe-platform/orchestrator test
+pnpm --filter @octo-canvas/orchestrator test
 
 # 2. Then regenerate types and run the frontend typecheck
-pnpm --filter @vibe-platform/orchestrator dev   # terminal 1
-pnpm --filter @vibe-platform/api-types gen:api-types  # terminal 2 (one-shot)
-pnpm --filter @vibe-platform/web typecheck
+pnpm --filter @octo-canvas/orchestrator dev   # terminal 1
+pnpm --filter @octo-canvas/api-types gen:api-types  # terminal 2 (one-shot)
+pnpm --filter @octo-canvas/web typecheck
 
 # 3. Click through the affected page in a browser
 pnpm dev

@@ -1,5 +1,5 @@
 {
-  "name": "@vibe-platform/github-integration",
+  "name": "@octo-canvas/github-integration",
   "version": "0.1.0",
   "private": true,
   "scripts": {

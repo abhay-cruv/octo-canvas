@@ -1,5 +1,5 @@
 {
-  "name": "@vibe-platform/sandbox-provider",
+  "name": "@octo-canvas/sandbox-provider",
   "version": "0.1.0",
   "private": true,
   "scripts": {

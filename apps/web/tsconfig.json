@@ -1,5 +1,5 @@
 {
-  "extends": "@vibe-platform/tsconfig/react-app.json",
+  "extends": "@octo-canvas/tsconfig/react-app.json",
   "compilerOptions": {
     "noEmit": true,
     "types": ["vite/client"]

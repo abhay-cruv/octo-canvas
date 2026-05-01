@@ -1,5 +1,5 @@
 import createClient from 'openapi-fetch';
-import type { paths } from '@vibe-platform/api-types';
+import type { paths } from '@octo-canvas/api-types';
 
 const baseUrl = import.meta.env.VITE_ORCHESTRATOR_BASE_URL;
 if (!baseUrl) {

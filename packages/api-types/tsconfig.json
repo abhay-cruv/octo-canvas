@@ -1,5 +1,5 @@
 {
-  "extends": "@vibe-platform/tsconfig/library.json",
+  "extends": "@octo-canvas/tsconfig/library.json",
   "compilerOptions": {
     "rootDir": ".",
     "outDir": "dist",

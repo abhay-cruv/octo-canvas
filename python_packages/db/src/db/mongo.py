@@ -37,7 +37,7 @@ if TYPE_CHECKING:
     from pymongo.asynchronous.database import AsyncDatabase
 
 _logger = structlog.get_logger("db")
-_DEFAULT_DB_NAME = "vibe_platform"
+_DEFAULT_DB_NAME = "octo_canvas"
 
 # Every Beanie Document must appear here or it silently fails to query.
 _DOCUMENT_MODELS: list[type] = [User, Session, Repo, Sandbox]

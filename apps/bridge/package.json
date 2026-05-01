@@ -1,5 +1,5 @@
 {
-  "name": "@vibe-platform/bridge",
+  "name": "@octo-canvas/bridge",
   "version": "0.1.0",
   "private": true,
   "scripts": {

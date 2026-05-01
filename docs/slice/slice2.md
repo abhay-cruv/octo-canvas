@@ -309,7 +309,7 @@ If you previously implemented the GitHub App path, delete:
 End of slice, with the orchestrator running:
 
 ```bash
-pnpm --filter @vibe-platform/api-types gen:api-types
+pnpm --filter @octo-canvas/api-types gen:api-types
 ```
 
 Verify `schema.d.ts` exposes `/api/repos`, `/api/repos/available`, `/api/repos/connect`, `/api/repos/{repo_id}` and that `UserResponse` includes `needs_github_reauth`. Confirm none of `/api/github/...` paths are present.

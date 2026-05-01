@@ -1,5 +1,5 @@
 {
-  "name": "@vibe-platform/repo-introspection",
+  "name": "@octo-canvas/repo-introspection",
   "version": "0.1.0",
   "private": true,
   "scripts": {

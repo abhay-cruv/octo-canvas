@@ -1,4 +1,4 @@
-# Plan.md — vibe-platform
+# Plan.md — octo-canvas
 
 End-to-end design and rollout plan for the platform. Source of truth for *what* we're building, *why* the boundaries are where they are, and *the order things ship in*. Live document — slice briefs override it where they conflict, but new design decisions land here first.
 
@@ -223,7 +223,7 @@ Workspace rules:
                               ▼  served at runtime
        /openapi.json
                               │
-                              ▼  pnpm --filter @vibe-platform/api-types gen:api-types
+                              ▼  pnpm --filter @octo-canvas/api-types gen:api-types
        packages/api-types/generated/schema.d.ts
                               │
                               ▼  imported via openapi-fetch
@@ -241,7 +241,7 @@ Same principle for WebSocket: messages are Pydantic discriminated unions in `sha
 
 ## 8. Data model (planned, full v1 surface)
 
-Collections in `vibe_platform` Mongo database, each Beanie `Document`. Slice annotation in parens.
+Collections in `octo_canvas` Mongo database, each Beanie `Document`. Slice annotation in parens.
 
 ### `users` (slice 1 — done; user-agent prefs added in slice 6b)
 ```python
@@ -900,7 +900,7 @@ The User Agent does **not** have direct access to the sandbox filesystem or to t
 - All git ops happen inside `/work/<repo_full_name>/`. Each `provider.exec_oneshot` call sets `dir` per command; never `cd`s globally (so concurrent runs in the future stay isolated).
 - Repo bootstrap (slice 5b clone op): `git clone --filter=blob:none https://x-access-token:<user_token>@github.com/<full_name>.git /work/<full_name>` — partial clone for fast first-pull on big repos. Then `git remote set-url origin https://github.com/<full_name>.git` to scrub the token.
 - Branch naming: `vibe/task-{slug}` where `slug` is 8 chars of the task id. Run 1 creates it; follow-up runs check it out and add commits.
-- Commit messages: agent generates them; the agent-runner appends `Co-Authored-By: vibe-platform <bot@vibe.dev>`.
+- Commit messages: agent generates them; the agent-runner appends `Co-Authored-By: octo-canvas <bot@octo-canvas.dev>`.
 - Push: HTTPS with the user's OAuth access token via `git -c http.extraheader="AUTHORIZATION: bearer <user_token>" push`. Token never written to `.git/config`.
 - PR creation: githubkit `repos.create_pull_request` against `default_branch`. Body includes a deep link back to the platform task page.
 - PR updates on follow-ups: just push more commits to the same branch — GitHub auto-updates the PR diff.
@@ -945,7 +945,7 @@ Three layers:
 
 Conventions:
 - Pytest uses an `httpx.AsyncClient` + `ASGITransport` fixture. Don't add `TestClient`-based tests for DB-touching code (event-loop wiring breaks).
-- Test DB is `vibe_platform_test`, dropped in a session-scoped fixture.
+- Test DB is `octo_canvas_test`, dropped in a session-scoped fixture.
 - GitHub API is mocked at the httpx layer in unit tests; layer 3 hits real GitHub.
 
 ### 16.5 Codegen pipeline
@@ -954,9 +954,9 @@ After any change to an orchestrator route or response model:
 
 ```bash
 # Terminal 1
-pnpm --filter @vibe-platform/orchestrator dev
+pnpm --filter @octo-canvas/orchestrator dev
 # Terminal 2 (once orchestrator is up)
-pnpm --filter @vibe-platform/api-types gen:api-types
+pnpm --filter @octo-canvas/api-types gen:api-types
 ```
 
 This rewrites [packages/api-types/generated/schema.d.ts](../packages/api-types/generated/schema.d.ts). The frontend picks up the new types on next typecheck. **Auto-regen on backend change is intentionally deferred** — the manual two-terminal step is fine for v1.
@@ -1016,7 +1016,7 @@ Sign-in flow + `User`/`Session` collections + protected route convention. Accept
 4. Restart `pnpm dev` (picks up Vite `envDir` fix + new env).
 5. Walk the sign-in flow in a browser; verify `users` and `sessions` writes in Mongo.
 6. `pnpm typecheck && pnpm lint && pnpm test` all green.
-7. `pnpm --filter @vibe-platform/api-types gen:api-types` so [packages/api-types/generated/schema.d.ts](../packages/api-types/generated/schema.d.ts) is real, not the stub.
+7. `pnpm --filter @octo-canvas/api-types gen:api-types` so [packages/api-types/generated/schema.d.ts](../packages/api-types/generated/schema.d.ts) is real, not the stub.
 8. User reviews and approves; *only then* slice 2 brief is written.
 
 ### Slice 2 — OAuth `repo` scope + repo connection

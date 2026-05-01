@@ -1,5 +1,5 @@
 {
-  "name": "@vibe-platform/orchestrator",
+  "name": "@octo-canvas/orchestrator",
   "version": "0.1.0",
   "private": true,
   "scripts": {

@@ -1,5 +1,5 @@
 {
-  "name": "@vibe-platform/db",
+  "name": "@octo-canvas/db",
   "version": "0.1.0",
   "private": true,
   "scripts": {

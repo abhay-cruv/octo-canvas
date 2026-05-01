@@ -1,5 +1,5 @@
 {
-  "name": "@vibe-platform/agent-config",
+  "name": "@octo-canvas/agent-config",
   "version": "0.1.0",
   "private": true,
   "scripts": {

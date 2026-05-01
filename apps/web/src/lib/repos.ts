@@ -1,4 +1,4 @@
-import type { components } from '@vibe-platform/api-types';
+import type { components } from '@octo-canvas/api-types';
 import { api } from './api';
 
 export type IntrospectionOverrides =

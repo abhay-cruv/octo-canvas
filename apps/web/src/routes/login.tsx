@@ -19,7 +19,7 @@ function LoginPage() {
       <header className="px-6 py-5">
         <div className="flex items-center gap-2 text-sm font-medium text-gray-900">
           <span className="inline-block h-6 w-6 rounded-md bg-black" aria-hidden />
-          vibe-platform
+          octo-canvas
         </div>
       </header>
 
@@ -63,7 +63,7 @@ function LoginPage() {
       </main>
 
       <footer className="px-6 py-4 text-center text-xs text-gray-400">
-        © {new Date().getFullYear()} vibe-platform
+        © {new Date().getFullYear()} octo-canvas
       </footer>
     </div>
   );

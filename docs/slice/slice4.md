@@ -481,7 +481,7 @@ For non-terminal states (`spawning`/`resuming`), TanStack Query's `refetchInterv
 End of slice, with the orchestrator running (or via the `app.openapi()` dump trick from slice 3):
 
 ```bash
-pnpm --filter @vibe-platform/api-types gen:api-types
+pnpm --filter @octo-canvas/api-types gen:api-types
 ```
 
 Verify `schema.d.ts` exposes the five sandbox endpoints + `SandboxResponse`.

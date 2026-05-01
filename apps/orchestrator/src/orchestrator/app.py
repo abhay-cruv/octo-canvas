@@ -49,7 +49,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         logger.info("orchestrator.shutdown_complete")
 
 
-app = FastAPI(title="vibe-platform orchestrator", lifespan=lifespan)
+app = FastAPI(title="octo-canvas orchestrator", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,

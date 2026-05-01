@@ -1,5 +1,5 @@
 {
-  "name": "@vibe-platform/web",
+  "name": "@octo-canvas/web",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -23,10 +23,10 @@
     "clsx": "^2.1.1",
     "tailwind-merge": "^2.5.4",
     "class-variance-authority": "^0.7.0",
-    "@vibe-platform/api-types": "workspace:*"
+    "@octo-canvas/api-types": "workspace:*"
   },
   "devDependencies": {
-    "@vibe-platform/tsconfig": "workspace:*",
+    "@octo-canvas/tsconfig": "workspace:*",
     "@tanstack/router-plugin": "^1.87.0",
     "@tanstack/router-cli": "^1.87.0",
     "@vitejs/plugin-react": "^4.3.3",

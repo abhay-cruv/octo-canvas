@@ -30,9 +30,9 @@ If all four pass, the contracts are solid. If only `pnpm test` fails, the runtim
 ### Running just one slice
 
 ```bash
-pnpm --filter @vibe-platform/orchestrator test         # Python auth tests only
-pnpm --filter @vibe-platform/orchestrator typecheck    # Pyright on the orchestrator
-pnpm --filter @vibe-platform/web typecheck             # tsc on the web app
+pnpm --filter @octo-canvas/orchestrator test         # Python auth tests only
+pnpm --filter @octo-canvas/orchestrator typecheck    # Pyright on the orchestrator
+pnpm --filter @octo-canvas/web typecheck             # tsc on the web app
 ```
 
 To re-run a single pytest test:
@@ -92,7 +92,7 @@ This is the only way to verify "click button, sign in, land on dashboard."
 
 1. **GitHub** → Settings → Developer settings → OAuth Apps → **New OAuth App**.
 2. Fill in:
-   - Application name: `vibe-platform (local dev)`
+   - Application name: `octo-canvas (local dev)`
    - Homepage URL: `http://localhost:5173`
    - Authorization callback URL: `http://localhost:3001/api/auth/github/callback`
 3. Click **Register application**.
@@ -129,7 +129,7 @@ Open `http://localhost:5173`.
 ### Database verification
 
 ```bash
-docker exec -it vibe-mongo mongosh vibe_platform
+docker exec -it octo-mongo mongosh octo_canvas
 
 # In mongosh:
 db.users.find().pretty()
@@ -158,7 +158,7 @@ curl http://localhost:3001/api/me
 | Symptom | Likely cause | Fix |
 | --- | --- | --- |
 | Orchestrator crashes on startup with `ValidationError: 6 validation errors for Settings` | `.env` not present or missing required vars | Confirm `.env` exists at repo root with `MONGODB_URI`, `AUTH_SECRET`, `GITHUB_OAUTH_CLIENT_ID`, `GITHUB_OAUTH_CLIENT_SECRET`, `WEB_BASE_URL`, `ORCHESTRATOR_BASE_URL` |
-| `db.connect_failed` in orchestrator log | Mongo not running | `docker compose up -d`, then `docker ps` to confirm `vibe-mongo` is Up |
+| `db.connect_failed` in orchestrator log | Mongo not running | `docker compose up -d`, then `docker ps` to confirm `octo-mongo` is Up |
 | GitHub returns `redirect_uri_mismatch` | Callback URL in the OAuth App doesn't match `${ORCHESTRATOR_BASE_URL}/api/auth/github/callback` | Edit the OAuth App on GitHub or fix `ORCHESTRATOR_BASE_URL` in `.env` |
 | Browser stays on `/login` after authorizing | Session cookie not set — usually a CORS or `credentials: 'include'` issue | Open dev tools → Network → click the callback redirect → the response should have a `set-cookie: vibe_session=...` header. If it does, confirm `WEB_BASE_URL` matches the URL you're hitting in the browser. |
 | "Failed to fetch /api/me" in browser console | Orchestrator unreachable or CORS misconfigured | Check `VITE_ORCHESTRATOR_BASE_URL` in `.env` matches the orchestrator's actual address |

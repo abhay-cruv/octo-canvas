@@ -1,5 +1,5 @@
 {
-  "name": "@vibe-platform/shared-models",
+  "name": "@octo-canvas/shared-models",
   "version": "0.1.0",
   "private": true,
   "scripts": {

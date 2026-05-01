@@ -151,7 +151,7 @@ function ProfilePanel({
           <div className="h-14 px-4 flex items-center justify-between border-b border-gray-200">
             <div className="flex items-center gap-2 text-sm font-medium text-gray-900 min-w-0">
               <BrandMark className="h-6 w-6 shrink-0" />
-              <span className="truncate">vibe-platform</span>
+              <span className="truncate">octo-canvas</span>
             </div>
             <button
               type="button"
