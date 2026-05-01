@@ -14,7 +14,7 @@ Sibling docs: [agent_context.md](agent_context.md) (quick-start) · [engineering
 | 1 | GitHub OAuth + user persistence | ✅ shipped | `User` + `Session` collections, `/login` → `/dashboard` flow, `require_user` dependency. UI redesigned to profile view. |
 | 2 | OAuth `repo` scope + repo connection | ✅ shipped | OAuth scope expanded to include `repo`; access token persisted on `User`; `Repo` collection; list/connect/disconnect endpoints; **401 → clear token + 403 `github_reauth_required`**; UI Reconnect flow. **No GitHub App, no smee, no webhooks** (rejected design). **No clone, no introspection, no sandbox** (slices 3 + 4). [slice2.md](slice/slice2.md) is now frozen — corrections live below. |
 | 3 | Repo introspection | ✅ shipped | GitHub Trees + Contents detection, no clone. Five fields incl. `dev_command`. Per-field user overrides via `PATCH /api/repos/{id}/introspection`. [slice3.md](slice/slice3.md) is now frozen — corrections live below. |
-| 4 | Sandbox provisioning (the box exists) | ⬜ next — brief to be authored | Scope-narrow rewrite (no WS, no clone). Plan.md §18 rewritten 2026-05-01. |
+| 4 | Sandbox provisioning (the box exists) | 🟡 active — brief drafted, awaiting sign-off | Brief at [slice4.md](slice/slice4.md). Six open decisions resolved inline (lazy doc creation, no salt, 20 GB cap, mock provider when key empty, etc.) — push back on any. |
 | 5a | WebSocket transport — control + events | ⬜ not started | Plan.md §10 rewritten with multi-WS architecture, disconnect handling, sticky routing. |
 | 5b | Reconciliation + clone | ⬜ not started | `EnsureRepoCloned` / `RemoveRepo` directives; clone reconciliation on `ClientHello`. |
 | 6 | Tasks + Agent SDK invocation | ⬜ not started | |

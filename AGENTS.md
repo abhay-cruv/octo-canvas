@@ -40,6 +40,7 @@ It is an **always-update** file (see §3.1). Update it in the same session as yo
 - A locked-in stack choice changes (rare — and requires user approval per §2.6).
 - A common command changes (new dev/test/codegen invocation a future agent will need).
 - The slice status table or "what's next" framing materially shifts.
+- Any other fact that would make a future cold-start agent's life harder if it loaded stale context.
 
 Do **not** update it for: ephemeral progress (that's [progress.md](docs/progress.md)), per-session activity (that's [Contributions.md](docs/Contributions.md)), or new conventions/change-flow recipes (that's [engineering.md](docs/engineering.md)). If you're unsure which file a fact belongs in, prefer the more specific one and link from `agent_context.md` only if a cold-start agent genuinely needs the pointer.
 

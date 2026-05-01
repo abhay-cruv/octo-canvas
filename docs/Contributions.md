@@ -40,6 +40,13 @@ For *what changed structurally*, read [progress.md](progress.md). For *who and w
 
 ## Log
 
+### 2026-05-01 — Claude Opus 4.7 via Claude Code (slice 4 brief authored)
+
+- Authored [slice/slice4.md](slice/slice4.md) — sandbox provisioning, scope-narrow ("the box exists"). Six open decisions resolved inline (Sprites SDK behind a wrapper, `iad` default region, no salt suffix needed, 20 GB disk cap, three Redis keys per active sandbox, lazy `Sandbox` doc creation).
+- Brief covers: `FlySpritesProvider` + `MockSandboxProvider` behind a single Protocol; `Sandbox` Beanie doc with 7-state machine; `services/sandbox_manager.py` enforcing single-running-per-user at the routing layer (not the index); five REST endpoints all path-parameterized; idle-hibernation job using `spawned_at` fallback so it works without slice-5a heartbeat data; Redis hot cache keys defined now so slice 5a's sticky routing has a settled schema; dashboard "Sandbox" panel with status polling.
+- Hard rules: no WS, no clone, no `Repo.sandbox_id` binding, no DELETE for destroy. Out-of-scope list explicitly defers WS + bridge runtime to 5a, clone + reconciliation to 5b.
+- Acceptance includes a two-user isolation check and both mock-mode + real-Sprites-mode end-to-end flows.
+
 ### 2026-05-01 — Claude Opus 4.7 via Claude Code (Plan.md rewrite — transport architecture + slice resplit)
 
 - Rewrote [Plan.md §10](Plan.md) end-to-end with explicit user authorization. New architecture: WS for both legs, four logical channels on separate WS connections (control+events, PTY, file ops, HTTP preview), sticky-by-sandbox routing via Fly `fly-replay` with Redis pub/sub fallback, per-instance soft cap of 5000 WS connections with hot-shedding. gRPC considered and rejected; reasoning recorded in §10.1.
