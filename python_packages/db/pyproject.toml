@@ -3,9 +3,9 @@ name = "db"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
-    "beanie>=1.27,<2.0",
+    "beanie>=2.0,<3.0",
     "pydantic>=2.9",
-    "motor>=3.6,<4.0",
+    "pymongo>=4.11,<5.0",
     "shared_models",
 ]
 

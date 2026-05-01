@@ -10,7 +10,8 @@ Distilled context for any AI coding agent picking up work in this repo. Read thi
 
 - **Product**: a tool where a user connects GitHub repos, files chat-driven coding tasks, and a Claude Agent SDK process running in a Fly Sprite makes the changes and opens a PR.
 - **Sandbox model**: **one persistent Sprite per user**, holding *all* of that user's connected repos under `/work/<full_name>/`. One active agent run at a time per sandbox; rest queue.
-- **Stack**: Python 3.12 + FastAPI + Beanie (Mongo) on the backend; Vite + React 18 + TanStack on the frontend; Turborepo across uv (Python) and pnpm (TS) workspaces.
+- **Stack**: Python 3.12 + FastAPI + Beanie 2.x on `pymongo.AsyncMongoClient` (motor was retired) on the backend; Vite + React 18 + TanStack on the frontend; Turborepo across uv (Python) and pnpm (TS) workspaces.
+- **Mongo access**: `from db import mongo` gives you the process singleton — `mongo.users`, `mongo.repos`, `mongo.sessions` for raw collection ops; Beanie ORM still works (`Repo.find_one(...)`). Lifecycle: `await mongo.connect(uri)` / `await mongo.disconnect()` (idempotent on same DB). `await mongo.ping()` for readiness checks. See [python_packages/db/src/db/mongo.py](../python_packages/db/src/db/mongo.py).
 - **Status**: Slices 0 + 1 (scaffolding + GitHub OAuth) and Slice 2 (OAuth `repo` scope + repo connection) shipped. Slice 3 (repo introspection) is next; brief not yet written.
 - **Repo access uses the user's OAuth token, not a GitHub App.** The slice 2 brief was redesigned mid-build to drop the App/installation/webhook path in favor of expanding the slice 1 OAuth scope to `read:user user:email repo` and persisting the token on `User.github_access_token`. See [slice/slice2.md](slice/slice2.md), [Plan.md §12](Plan.md), and the redesign block in [Contributions.md](Contributions.md) for the rationale.
 
@@ -128,7 +129,8 @@ pnpm --filter @vibe-platform/api-types gen:api-types   # terminal 2
 
 ## Sandbox model — read this before touching slice 4+ work
 
-- **One Sprite per user**, deterministic name `vibe-sbx-{user_id}`. All of that user's repos live in it under `/work/<full_name>/`.
+- **One Sprite per user in v1, multiple-per-user is the design target.** v1 enforces "one per user" at the orchestrator routing layer; the schema, indexes, API paths (`/api/sandboxes/{sandbox_id}/...`), and Sprite naming (`vibe-sbx-{sandbox_id}`) are multi-sandbox-ready. Never code "the user's sandbox" as a data-model invariant. See [Plan.md §4 forward-compat note](Plan.md).
+- All of a sandbox's repos live in it under `/work/<full_name>/`. `Repo.sandbox_id` (added to schema for slice 4) binds a connected repo to a specific sandbox.
 - Lifecycle states: `none → spawning → running → idle → hibernated → resumed → running …`. Destroyed only on explicit user request. Sign-out does **not** destroy.
 - One active agent run at a time per sandbox; the rest queue in Redis (`sandbox:{user_id}:queue`).
 - The bridge is **long-lived per sandbox**, not per task. It `cd`s into the relevant repo subdir per `StartRun` directive.

@@ -1,6 +1,18 @@
-"""Beanie models and Mongo connection helpers."""
+"""Beanie models, raw collection access, and Mongo lifecycle helpers."""
 
-from db.connect import connect, disconnect
+from db.collections import ALL as ALL_COLLECTIONS
+from db.collections import Collections
 from db.models import Repo, Session, User
+from db.mongo import Mongo, connect, disconnect, mongo
 
-__all__ = ["Repo", "Session", "User", "connect", "disconnect"]
+__all__ = [
+    "ALL_COLLECTIONS",
+    "Collections",
+    "Mongo",
+    "Repo",
+    "Session",
+    "User",
+    "connect",
+    "disconnect",
+    "mongo",
+]

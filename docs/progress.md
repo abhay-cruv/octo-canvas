@@ -37,6 +37,7 @@ Sibling docs: [agent_context.md](agent_context.md) (quick-start) · [engineering
 
 ### Known issues / blockers
 
+- **Dev Mongo has a stale `github_repo_id_1` unique index** from the pre-fix schema — drop it once with `docker exec vibe-mongo mongosh vibe_platform --eval 'db.repos.dropIndex("github_repo_id_1")'` so cross-user repo connects work. Test DB rebuilds indexes per run (see conftest), so tests are unaffected.
 - v1.1 followup: encrypt `User.github_access_token` at rest (currently plaintext in Mongo for dev simplicity)
 - Org SSO requires per-org "Authorize" click on github.com before personal OAuth tokens can list/clone org repos. Mitigation: "Manage GitHub org access" button in the dashboard panel deep-links to the OAuth-app settings page; no auto-detection yet
 - Server-side search via `/search/repositories` doesn't include repos the user has *only* collaborator access to on someone else's personal account (we can't enumerate "who you collaborate with"). The non-search browse path covers them via `/user/repos?affiliation=collaborator`. Acceptable for v1; flag if it bites

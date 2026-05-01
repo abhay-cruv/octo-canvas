@@ -40,6 +40,39 @@ For *what changed structurally*, read [progress.md](progress.md). For *who and w
 
 ## Log
 
+### 2026-05-01 — Claude Opus 4.7 via Claude Code (motor → pymongo migration + Mongo singleton)
+
+- **Driver swap.** Beanie 1.30 (motor-based) → Beanie 2.1 (pymongo's new `AsyncMongoClient`). Motor uninstalled. Pinned `beanie>=2.0,<3.0`, `pymongo>=4.11,<5.0` in [python_packages/db/pyproject.toml](../python_packages/db/pyproject.toml) and the orchestrator's pyproject.
+- **New singleton class** [db/mongo.py](../python_packages/db/src/db/mongo.py): `Mongo` exposes `client`, `db`, typed collection accessors (`mongo.users`, `mongo.sessions`, `mongo.repos`), `connect(uri, *, database=None, register_models=True)`, `disconnect()`, and `ping()`. Enforces single-process singleton; `connect` is idempotent if called twice with the same DB so the FastAPI lifespan and the test fixture can both call it without tripping over each other. Backwards-compat thin wrappers `connect()` / `disconnect()` re-exported.
+- Deleted [db/connect.py](../python_packages/db/src/db/connect.py) — superseded.
+- **Beanie document_models registration** centralized in [db/mongo.py](../python_packages/db/src/db/mongo.py)'s `_DOCUMENT_MODELS` list — adding a new `Document` class is a one-line edit there, no longer scattered.
+- **`/health` upgraded** to a real readiness probe: returns `{"status":"ok","mongo":true}` on success, **503** with `{"status":"degraded","mongo":false}` if Mongo is unreachable. Load balancers will drop the instance out of rotation cleanly.
+- **Test fixture** ([apps/orchestrator/tests/conftest.py](../apps/orchestrator/tests/conftest.py)) now uses the singleton: connects, drops collections, re-connects (so Beanie rebuilds indexes against empty collections), runs the test through `httpx.ASGITransport`, then disconnects. Catches the case where stale unique indexes from a prior schema would block valid writes.
+- All 22 pytest tests green; pyright strict clean; ruff clean; orchestrator boots end-to-end and `/health` returns the new readiness payload.
+
+### 2026-05-01 — Claude Opus 4.7 via Claude Code (per-sandbox repo binding + global-unique bug fix)
+
+- User clarified: "different sandboxes can have different repos" — i.e. repo connection is per-sandbox and the same repo can be in multiple sandboxes. Audited and fixed the schema accordingly.
+- **Bug fix in shipped slice 2:** [Repo](../python_packages/db/src/db/models/repo.py) had `github_repo_id: Annotated[int, Indexed(unique=True)]` — globally unique. Two different users could not connect the same GitHub repo. Changed to a compound unique index on `(sandbox_id, user_id, github_repo_id)` via `IndexModel`. Also added `sandbox_id: PydanticObjectId | None = None` to the model so slice 4 can populate it without a schema migration.
+- [Repos route](../apps/orchestrator/src/orchestrator/routes/repos.py) duplicate check rescoped from `Repo.github_repo_id == X` to `(user_id, github_repo_id)`. Slice 4 will further scope to sandbox.
+- [Test conftest](../apps/orchestrator/tests/conftest.py) now drops collections (not just `delete_many`) so Beanie rebuilds indexes cleanly each test run — without this, the stale `github_repo_id_1` unique index from the old schema kept blocking writes that the new schema allows. **Dev Mongo (not test) still has the old index** — followup: drop manually with `db.repos.dropIndex("github_repo_id_1")` once.
+- New regression test [test_connect_allows_same_repo_for_different_users](../apps/orchestrator/tests/test_repos.py) exercises the cross-user case explicitly. 22 pytest tests total, all green.
+- **Plan.md §8 Repo**: dropped global unique on `github_repo_id`, added compound `(sandbox_id, user_id, github_repo_id)` unique index, documented the rationale.
+- **Plan.md §9 Repos API**: added per-sandbox connect endpoint `POST /api/sandboxes/{sandbox_id}/repos/connect` (slice 4) alongside the slice-2 flat `POST /api/repos/connect`. `GET /api/repos` will accept `?sandbox_id=` filter in slice 4. Disconnect copy now notes that other sandbox-bindings of the same repo are untouched.
+- API types regenerated.
+
+### 2026-05-01 — Claude Opus 4.7 via Claude Code (multi-sandbox forward-compat audit + Plan.md fixes)
+
+- Audit triggered by user adding a §4 forward-compat note ("multiple sandboxes per user, future"). Audited shipped slices 0–2 + the planned slice 4–6 schemas/APIs for hard one-sandbox-per-user assumptions. **Shipped code is clean** — no sandbox refs outside two UI strings. Six Plan.md spots needed surgery to make slice 4+ land multi-sandbox-ready without a rewrite.
+- **§8 `Sandbox`**: dropped `Indexed(unique=True)` on `user_id` (now plain `Indexed()`); added optional `name: str | None = None` for future per-sandbox labels. v1 enforces "one per user" at the orchestrator routing layer, NOT at the index.
+- **§8 `Repo`**: added `sandbox_id: PydanticObjectId | None` (set by slice 4 when bound; null in slice 2). Forward-compat per the §4 note about repo-connect flow gaining sandbox selection.
+- **§8 `Task`**: added `sandbox_id: PydanticObjectId` (required). Resolves an inconsistency where the §4 note claimed "sandbox_id already on Task" but the model only had `user_id` + `repo_id`.
+- **§9 Sandbox API**: renamed all routes from `/api/sandbox/*` (singleton) → `/api/sandboxes/{sandbox_id}/*` (parameterized) plus `GET /api/sandboxes` (list — length-0/1 in v1) and `POST /api/sandboxes` (create — 409 if user already has one in v1). UI resolves the singleton id transparently; multi-sandbox future just adds a picker.
+- **§13 Sprite naming**: `vibe-sbx-{user_id}` → `vibe-sbx-{sandbox_id}` (collision-free with N sandboxes per user).
+- **§13–14 reconciliation**: clarified everywhere as **per-sandbox** (`Repo.sandbox_id == this.sandbox_id`), never per-user. Updated slice-4 brief in §18 + acceptance test in §19 (four-quadrant matrix is per-sandbox).
+- **§18 slice 4 brief** rewritten to reflect the new schema + API shape; acceptance test calls the parameterized endpoints.
+- **No shipped-code changes** — adding `sandbox_id` to `Repo` today would be dead-field scaffolding (no `Sandbox` model exists in slice 2). Per AGENTS.md §2.3 (no future-proofing), defer until slice 4 binds it. `AgentRun.sandbox_id` was already correct; WS endpoint `/ws/bridge/sandboxes/{sandbox_id}` was already parameterized.
+
 ### 2026-05-01 — Claude Opus 4.7 via Claude Code (slice 2 polish — pagination, server-side search, scope toggle, manage-orgs)
 
 - **Fix: `/repos/connect` was unreachable.** Parent `_authed/repos.tsx` was a TanStack Router parent route to `_authed/repos/connect.tsx` but didn't render `<Outlet />`, so clicking "Browse repositories" navigated to `/repos/connect` while the parent's UI stayed put. Moved `repos.tsx` → [_authed/repos/index.tsx](../apps/web/src/routes/_authed/repos/index.tsx) so they're siblings; route id changed from `/_authed/repos` → `/_authed/repos/`.

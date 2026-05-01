@@ -4,6 +4,8 @@ from typing import Annotated
 from beanie import Document, Indexed
 from pydantic import Field
 
+from db.collections import Collections
+
 
 def _now() -> datetime:
     return datetime.now(UTC)
@@ -22,4 +24,4 @@ class User(Document):
     github_access_token: str | None = None
 
     class Settings:
-        name = "users"
+        name = Collections.USERS

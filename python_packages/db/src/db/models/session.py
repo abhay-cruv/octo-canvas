@@ -4,6 +4,8 @@ from typing import Annotated
 from beanie import Document, Indexed, PydanticObjectId
 from pydantic import Field
 
+from db.collections import Collections
+
 
 def _now() -> datetime:
     return datetime.now(UTC)
@@ -17,4 +19,4 @@ class Session(Document):
     last_used_at: datetime = Field(default_factory=_now)
 
     class Settings:
-        name = "sessions"
+        name = Collections.SESSIONS

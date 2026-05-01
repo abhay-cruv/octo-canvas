@@ -163,7 +163,14 @@ async def connect_repo(
         )
     owner, repo_name = body.full_name.split("/", 1)
 
-    existing = await Repo.find_one(Repo.github_repo_id == body.github_repo_id)
+    # Scope the duplicate check to *this user's* connections. A different user
+    # connecting the same github_repo_id is fine. Slice 4 will further scope to
+    # the chosen sandbox, allowing the same user to connect a repo to multiple
+    # sandboxes.
+    existing = await Repo.find_one(
+        Repo.user_id == user.id,
+        Repo.github_repo_id == body.github_repo_id,
+    )
     if existing is not None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,

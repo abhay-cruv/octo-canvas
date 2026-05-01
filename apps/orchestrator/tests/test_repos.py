@@ -197,6 +197,36 @@ async def test_connect_happy_path(
 
 
 @pytest.mark.asyncio
+async def test_connect_allows_same_repo_for_different_users(
+    client: httpx.AsyncClient, mocker: MockerFixture
+) -> None:
+    """Two users connecting the same github_repo_id must both succeed.
+    Previously blocked by a global unique index — fixed with the per-user
+    compound key (multi-sandbox forward-compat per Plan.md §4)."""
+    other, _ = await _seed_user_and_session(github_user_id=100)
+    assert other.id is not None
+    await Repo(
+        user_id=other.id,
+        github_repo_id=555,
+        full_name="octo-org/repo",
+        default_branch="main",
+        private=False,
+    ).create()
+
+    _, session = await _seed_user_and_session(github_user_id=200)
+    client.cookies.set(SESSION_COOKIE_NAME, session.session_id)
+    _patch_user_client(mocker, repo_id=555)
+
+    response = await client.post(
+        "/api/repos/connect",
+        json={"github_repo_id": 555, "full_name": "octo-org/repo"},
+    )
+    assert response.status_code == 201
+    rows = await Repo.find(Repo.github_repo_id == 555).to_list()
+    assert len(rows) == 2  # one row per user
+
+
+@pytest.mark.asyncio
 async def test_connect_rejects_duplicate(
     client: httpx.AsyncClient, mocker: MockerFixture
 ) -> None:

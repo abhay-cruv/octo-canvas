@@ -275,7 +275,8 @@ A repo the user has connected. Lives inside their sandbox under `/work/<full_nam
 ```python
 class Repo(Document):
     user_id: PydanticObjectId
-    github_repo_id: Annotated[int, Indexed(unique=True)]
+    sandbox_id: PydanticObjectId | None  # set by slice 4 when the user picks a sandbox at connect time; null in slice 2
+    github_repo_id: int           # NOT globally unique — same repo can be connected by many users, and same user can connect one repo to many sandboxes
     full_name: str                # "octo-org/repo-name"
     default_branch: str
     private: bool
@@ -284,18 +285,26 @@ class Repo(Document):
     clone_path: str | None        # "/work/octo-org/repo-name"
     last_synced_at: datetime | None  # last `git fetch` against origin
     connected_at: datetime
-    class Settings: name = "repos"
+    class Settings:
+        name = "repos"
+        # Compound unique on (sandbox_id, user_id, github_repo_id). user_id is
+        # included so the slice-2 row (sandbox_id=null) still enforces "one
+        # connection per (user, repo)"; once slice 4 populates sandbox_id, the
+        # same repo can appear in N rows — one per sandbox the user attached
+        # it to.
+        indexes = [IndexModel([("sandbox_id",1),("user_id",1),("github_repo_id",1)], unique=True)]
 ```
 
 > **Note on auth:** there is no `github_installations` collection. Repo access uses the user's OAuth access token (`User.github_access_token` from §11), not a GitHub App installation token. Cloning, fetching, and pushing all run with that single token.
 
 ### `sandboxes` (slice 4)
 
-**One per user.** Holds the sandbox-side state that needs to survive orchestrator restarts (Redis is the hot cache; this is the source of truth).
+Holds the sandbox-side state that needs to survive orchestrator restarts (Redis is the hot cache; this is the source of truth). **In v1 the orchestrator enforces one sandbox per user as a routing/UI choice, not a data-model invariant** — the schema and indexes are multi-sandbox-ready (see §4 forward-compat note).
 
 ```python
 class Sandbox(Document):
-    user_id: Annotated[PydanticObjectId, Indexed(unique=True)]  # 1:1 with User
+    user_id: Annotated[PydanticObjectId, Indexed()]  # NOT unique — see §4 forward-compat note
+    name: str | None = None        # user-facing label; null for v1 singletons
     sprite_id: str | None         # Fly Sprite ID; null before first spawn
     status: Literal["none","spawning","running","idle","hibernated","destroyed","failed"]
     region: str                    # Fly region the sprite lives in
@@ -317,10 +326,11 @@ class RepoIntrospection(BaseModel):
 ```
 
 ### `tasks` (slice 6)
-A user-filed unit of work against one of the user's connected repos. Tasks always run in the user's single sandbox.
+A user-filed unit of work against one of the user's connected repos. Each task runs in a specific sandbox; in v1 that's the user's singleton, in multi-sandbox future the user (or routing logic) picks one at create time.
 ```python
 class Task(Document):
     user_id: PydanticObjectId
+    sandbox_id: PydanticObjectId  # required — disambiguates which sandbox runs the task (multi-sandbox forward-compat per §4)
     repo_id: PydanticObjectId     # which connected repo this task targets
     title: str                    # first line of initial message, or LLM-summarized
     status: Literal["pending","running","awaiting_review","completed","failed","cancelled"]
@@ -396,25 +406,30 @@ All under `/api`. Auth via `vibe_session` cookie except where noted. Bodies and 
 
 All repo endpoints use the user's stored OAuth access token (`User.github_access_token`). On any 401 from GitHub, the orchestrator clears the token and returns `403 {"detail": "github_reauth_required"}` — the web app uses that signal to send the user back through the OAuth flow.
 
+**Repo connections are per-sandbox** (multi-sandbox forward-compat per §4). Different sandboxes for the same user can have different repo lists; the same `github_repo_id` may appear in N rows (one per sandbox the user attached it to). Slice 2 ships the `user_id`-scoped flat routes below; slice 4 introduces the sandbox-scoped variants and the singleton constraint becomes a routing-layer rule, not a data-model one.
+
 | Method | Path | Notes |
 |---|---|---|
-| GET | `/api/repos/available` | Repos accessible to the user via their OAuth token, minus those already connected. Backed by `GET /user/repos`. |
-| GET | `/api/repos` | Connected repos for this user (with `clone_status` per repo). |
-| POST | `/api/repos/connect` | Body `{github_repo_id, full_name}`. Verifies access via `GET /repos/{owner}/{repo}` with the user token, creates `Repo`, ensures sandbox is up (slice 4), enqueues clone (slice 4), kicks off introspection (slice 3). |
-| DELETE | `/api/repos/{repo_id}` | Disconnect: removes the clone from the sandbox (`rm -rf /work/<full_name>/`), deletes `Repo`, leaves the sandbox + other repos untouched. |
+| GET | `/api/repos/available` | Repos accessible to the user via their OAuth token. `is_connected` is per-sandbox (slice 4) or per-user (slice 2). Backed by `GET /user/repos` or `GET /search/repositories` when `q` is set. |
+| GET | `/api/repos` | Connected repos for this user (with `clone_status` per repo). Slice 4: also accepts `?sandbox_id=` to filter to one sandbox. |
+| POST | `/api/sandboxes/{sandbox_id}/repos/connect` *(slice 4)* | Body `{github_repo_id, full_name}`. Verifies access, creates `Repo` with `sandbox_id` populated, enqueues clone, kicks off introspection (slice 3). Returns 409 if the repo is already connected to *this* sandbox. The same repo can be connected to a sibling sandbox without conflict. |
+| POST | `/api/repos/connect` *(slice 2 only — deprecated by slice 4)* | Singleton form: body `{github_repo_id, full_name}`. Creates `Repo` with `sandbox_id=null`. Slice 4 will migrate existing rows by binding them to the user's first sandbox. |
+| DELETE | `/api/repos/{repo_id}` | Disconnect: removes the clone from its sandbox (slice 4), deletes `Repo`. The repo's other sandbox-bindings (if any) are untouched. |
 | POST | `/api/repos/{repo_id}/reintrospect` | Re-run introspection. (slice 3) |
 | POST | `/api/repos/{repo_id}/sync` | `git fetch` against origin in the sandbox; updates `last_synced_at`. |
 
-### Sandbox (slice 4)
+### Sandboxes (slice 4)
 
-The sandbox is per-user; these endpoints operate on `current_user`'s sandbox implicitly. No `{sandbox_id}` in the path.
+Endpoints are parameterized by `{sandbox_id}` from day one (multi-sandbox forward-compat per §4). v1 enforces one sandbox per user at the orchestrator layer — the web app calls `GET /api/sandboxes` to discover the user's singleton id, then uses that id transparently. No API rewrite when the limit lifts; the UI just gains a sandbox picker.
 
 | Method | Path | Notes |
 |---|---|---|
-| GET | `/api/sandbox` | Returns `SandboxResponse` — status, sprite_id, last_active_at, region, list of cloned repo paths. |
-| POST | `/api/sandbox/wake` | Spawn (if `none`/`destroyed`) or resume (if `hibernated`). Idempotent if already running. |
-| POST | `/api/sandbox/hibernate` | Force hibernate now. |
-| POST | `/api/sandbox/destroy` | Destroys the Sprite. Repos remain in `repos` collection but `clone_status="pending"` until next wake. |
+| GET | `/api/sandboxes` | Returns `list[SandboxResponse]`. v1 always length-0 or length-1; future may be longer. |
+| POST | `/api/sandboxes` | Create a new sandbox. v1: 409 if user already has one. Future: returns the new sandbox. |
+| GET | `/api/sandboxes/{sandbox_id}` | Returns `SandboxResponse` — status, sprite_id, last_active_at, region, list of cloned repo paths. 404 if not the caller's. |
+| POST | `/api/sandboxes/{sandbox_id}/wake` | Spawn (if `none`/`destroyed`) or resume (if `hibernated`). Idempotent if already running. |
+| POST | `/api/sandboxes/{sandbox_id}/hibernate` | Force hibernate now. |
+| POST | `/api/sandboxes/{sandbox_id}/destroy` | Destroys the Sprite. Repos bound to this sandbox remain in `repos` but `clone_status="pending"` until next wake. |
 
 ### Tasks (slice 6)
 
@@ -559,7 +574,7 @@ class SandboxProvider(Protocol):
     async def remove_repo(self, sprite_id: str, *, full_name: str) -> None: ...
 ```
 
-Concrete impl: `FlySpritesProvider`, calling Fly Sprites REST API with `SPRITES_API_KEY`. One Sprite **per user**, identified in Sprites by a deterministic name like `vibe-sbx-{user_id}`.
+Concrete impl: `FlySpritesProvider`, calling Fly Sprites REST API with `SPRITES_API_KEY`. Sprites are named by `Sandbox._id`: `vibe-sbx-{sandbox_id}`. v1 enforces exactly one Sandbox per user at the orchestrator routing layer; the multi-sandbox future (§4 forward-compat note) simply lifts that enforcement — no naming or schema change needed.
 
 ### Per-user state machine
 
@@ -630,7 +645,7 @@ The bridge is **long-lived per sandbox** — boots once when the Sprite spawns, 
 1. Read env: `BRIDGE_TOKEN` (per-sandbox, long-lived but rotatable), `ORCHESTRATOR_BASE_URL`, `USER_ID`, `SANDBOX_ID`.
 2. Connect WS to `/ws/bridge/sandboxes/{sandbox_id}`. Send `ClientHello{bridge_version, cloned_repos: [...]}` listing what's already on disk under `/work/`.
 3. Receive `ServerHello{tool_allowlist, agent_defaults}`.
-4. Reconcile clones: orchestrator compares `cloned_repos` to the user's `repos` collection and issues `EnsureRepoCloned` / `RemoveRepo` directives until the disk matches the desired state.
+4. Reconcile clones: orchestrator compares `cloned_repos` (reported by *this* bridge for *this* sandbox_id) to the `Repo` rows where `sandbox_id == this.sandbox_id`, and issues `EnsureRepoCloned` / `RemoveRepo` directives until the disk matches the desired state. Reconciliation is **per-sandbox**, not per-user — each sandbox owns its own subset of the user's `Repo` rows (multi-sandbox forward-compat per §4).
 5. Enter the run loop.
 
 ### Run loop (per agent run)
@@ -810,10 +825,10 @@ Sign-in flow + `User`/`Session` collections + protected route convention. Accept
 
 ### Slice 4 — Sandbox provider (Sprites) — **per-user, multi-repo**
 
-**Adds:** `FlySpritesProvider` implementing the `SandboxProvider` Protocol; `Sandbox` Mongo collection (1:1 with User); Redis-backed hot state; `/api/sandbox/{wake,hibernate,destroy}` and `/api/sandbox` endpoints; idle-hibernation job; reconciliation step on bridge `ClientHello` that diffs the user's connected `repos` against `cloned_repos` reported by the bridge and issues `EnsureRepoCloned`/`RemoveRepo`. Per-repo connection (slice 2) gains a clone enqueue when the sandbox is up.
+**Adds:** `FlySpritesProvider` implementing the `SandboxProvider` Protocol; `Sandbox` Mongo collection (one per user enforced at orchestrator routing layer, NOT at the index — see §4 forward-compat note); Redis-backed hot state; `/api/sandboxes/{id}/{wake,hibernate,destroy}` + `GET /api/sandboxes` + `POST /api/sandboxes` endpoints (parameterized by id from day one); idle-hibernation job; per-sandbox reconciliation step on bridge `ClientHello` that diffs `Repo` rows where `sandbox_id == this.sandbox_id` against `cloned_repos` reported by the bridge and issues `EnsureRepoCloned`/`RemoveRepo`. Per-repo connection (slice 2) gains a clone enqueue when the sandbox is up; the connect endpoint sets `Repo.sandbox_id` to the user's singleton sandbox id.
 **Files:** `python_packages/sandbox_provider/src/sandbox_provider/sprites.py`; orchestrator `services/sandbox_manager.py`; `routes/sandbox.py`; `jobs/hibernate_idle.py`.
 **Risks:** Sprites SDK churn; Redis schema must survive orchestrator restarts (Mongo is the source of truth); ensuring the deterministic `vibe-sbx-{user_id}` Sprite name doesn't collide if a user is fully destroyed and re-created. Cap Sprite size early (CPU/RAM/disk) to keep cost predictable.
-**Acceptance:** for a fresh user with zero repos, `POST /api/sandbox/wake` spawns a Sprite, the bridge dials WS, `Sandbox.status` becomes `"running"`. Connecting two repos triggers two `EnsureRepoCloned` directives; each becomes `clone_status="ready"` with a path under `/work/`. `POST /api/sandbox/hibernate` flips status to `"hibernated"`. `POST /api/sandbox/wake` resumes; `cloned_repos` in the next `ClientHello` lists both.
+**Acceptance:** for a fresh user with zero repos, `POST /api/sandboxes` creates the singleton, `POST /api/sandboxes/{id}/wake` spawns a Sprite, the bridge dials WS, `Sandbox.status` becomes `"running"`. Connecting two repos sets their `sandbox_id` to the singleton and triggers two `EnsureRepoCloned` directives; each becomes `clone_status="ready"` with a path under `/work/`. `POST /api/sandboxes/{id}/hibernate` flips status to `"hibernated"`. `POST /api/sandboxes/{id}/wake` resumes; `cloned_repos` in the next `ClientHello` lists both.
 
 ### Slice 5 — WebSocket transport (orchestrator ↔ bridge ↔ web)
 **Adds:** WS server in orchestrator with two endpoints (`/ws/web/tasks/{task_id}`, `/ws/bridge/sandboxes/{sandbox_id}`), Pydantic discriminated unions for messages in `python_packages/shared_models/wire_protocol/`, replay-on-reconnect via `seq`, bridge token issuance and verification, ping/pong heartbeat. Bridge's `__main__.py` becomes a real WS client: long-lived, `ClientHello`-with-cloned-repos, ack of `EnsureRepoCloned`/`RemoveRepo` directives, dummy `StartRun` echo for the smoke test.
@@ -866,7 +881,7 @@ Sign-in flow + `User`/`Session` collections + protected route convention. Accept
 10. **Bridge token (slice 5)** — long-lived per sandbox, not per run. Rotate on every wake; bridge re-auths after every hibernate/resume. Treat as signed JWTs with TTL ≤ sandbox idle window.
 11. **Per-user sandbox = noisy-neighbor surface** — all of one user's tasks share one Sprite. v1 limits this to one active run at a time per sandbox (queue the rest). Hard cap Sprite CPU/RAM/disk early so a single user can't cost-spiral.
 12. **Multi-repo install token scoping** — different repos in the same sandbox can be on different GitHub App installations (different orgs). Mint **per-repo, per-run** install tokens at `StartRun` time; never share a token across repos or persist it on the sandbox disk.
-13. **Reconciliation correctness on `ClientHello`** — the diff between `Repo` rows in Mongo and `cloned_repos` reported by the bridge must converge: missing on disk → `EnsureRepoCloned`; on disk but not connected → `RemoveRepo`. Test the four-quadrant matrix explicitly in slice 4.
+13. **Reconciliation correctness on `ClientHello`** — the diff between `Repo` rows where `sandbox_id == this.sandbox_id` and `cloned_repos` reported by the bridge must converge: missing on disk → `EnsureRepoCloned`; on disk but not bound to this sandbox → `RemoveRepo`. Reconciliation is per-sandbox, never per-user. Test the four-quadrant matrix explicitly in slice 4.
 14. **Sandbox name collisions** — `vibe-sbx-{user_id}` is deterministic; if `/api/sandbox/destroy` is called and a new spawn happens immediately, Sprites may still hold the old name. Either wait for full destroy or include a salt suffix; decide in slice 4.
 15. **`/work` quota and warm-cache bloat** — `node_modules` per repo plus `.venv` plus pip cache will grow. Slice 4 sets a per-sandbox disk cap and a `du`-based eviction job; don't ship without it or the first heavy user wedges their own sandbox.
 

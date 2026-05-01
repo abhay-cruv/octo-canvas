@@ -12,10 +12,8 @@ os.environ.setdefault("GITHUB_OAUTH_CLIENT_SECRET", "test-client-secret")
 os.environ.setdefault("MONGODB_URI", "mongodb://localhost:27017/vibe_platform_test")
 
 import httpx  # noqa: E402
-from beanie import init_beanie  # noqa: E402
-from motor.motor_asyncio import AsyncIOMotorClient  # noqa: E402
 
-from db.models import Repo, Session, User  # noqa: E402
+from db import mongo  # noqa: E402
 from orchestrator.app import app  # noqa: E402
 
 TEST_DB_NAME = "vibe_platform_test"
@@ -23,16 +21,18 @@ TEST_DB_NAME = "vibe_platform_test"
 
 @pytest_asyncio.fixture
 async def client() -> AsyncIterator[httpx.AsyncClient]:
-    motor_client: AsyncIOMotorClient[dict[str, object]] = AsyncIOMotorClient(
-        os.environ["MONGODB_URI"]
-    )
-    for collection in (User, Session, Repo):
-        await motor_client[TEST_DB_NAME][collection.Settings.name].delete_many({})
-    await init_beanie(
-        database=motor_client[TEST_DB_NAME],
-        document_models=[User, Session, Repo],
-    )
+    # Connect → drop everything → reconnect so Beanie rebuilds indexes against
+    # empty collections. (`delete_many({})` would leave stale indexes from
+    # prior schemas in place, which then block valid writes.)
+    if mongo._client is not None and mongo._db_name != TEST_DB_NAME:  # pyright: ignore[reportPrivateUsage]
+        await mongo.disconnect()
+    await mongo.connect(os.environ["MONGODB_URI"], database=TEST_DB_NAME)
+    await mongo.drop_all_collections()
+    await mongo.disconnect()
+    await mongo.connect(os.environ["MONGODB_URI"], database=TEST_DB_NAME)
+
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as c:
         yield c
-    motor_client.close()
+
+    await mongo.disconnect()
