@@ -40,6 +40,35 @@ For *what changed structurally*, read [progress.md](progress.md). For *who and w
 
 ## Log
 
+### 2026-05-02 — Claude Opus 4.7 via Claude Code (Plan.md rewrite + Sprites docs converted to Markdown)
+
+- Replaced the Sprites SDK PDFs in [docs/sprites/v0.0.1-rc43/](../docs/sprites/v0.0.1-rc43/) with [python.md](../docs/sprites/v0.0.1-rc43/python.md) + [http.md](../docs/sprites/v0.0.1-rc43/http.md). Deleted the `python/` and `http/` PDF subdirs. Updated all references — slice4.md, agent_context.md, progress.md, sprites.py module docstring, sandbox_provider/pyproject.toml — to point at the markdown files.
+- Added the Sprites docs to discoverability surfaces: new row in [CLAUDE.md](../CLAUDE.md) "where things live" table; new line in [agent_context.md](../docs/agent_context.md) docs/ map.
+- Rewrote [Plan.md](../docs/Plan.md) to match post-rc43 Sprites architecture: §8 sandbox doc (drop sprite_id/region/bridge_version, add provider_name/provider_handle/public_url), §10 transport (web↔orchestrator WS only; Sprites SDK is the sandbox leg), §13 lifecycle (Sprites status enum, auto-hibernation delegated, reset via checkpoints), §14 agent runtime (subprocess-per-run via Sprites Exec, no daemon), §15 git workflow (drop EnsureRepoCloned/RemoveRepo directive language), §17 env vars (drop GITHUB_APP_*, switch SPRITES_API_KEY → SPRITES_TOKEN/SANDBOX_PROVIDER/SPRITES_BASE_URL), §18 slice plan (5a web-WS-only, 5b adds clone+checkpoints, 8 mostly Sprites-handled, 9 collapses to surfacing the built-in URL), §19 risks (replaced bridge-WS gotchas with Sprites realities), §20 snapshot (slice 4 🟡 awaiting sign-off), §21 next steps.
+- First substantive Plan.md edit since the 2026-05-01 transport-architecture rewrite. Permitted under explicit user direction per [AGENTS.md §3.3](../AGENTS.md).
+
+### 2026-05-01 — Claude Opus 4.7 via Claude Code (slice 4 — Sprites SDK rewrite + cleanup)
+
+- Rewrote slice 4 onto the `sprites-py` SDK (rc43 docs, rc37 on PyPI; `[tool.uv] prerelease = "allow"` in workspace root). Provider Protocol made opaque via `SandboxHandle(provider, payload)`; `SpritesProvider` and `MockSandboxProvider` are the only impls and are easily replaceable.
+- Deleted [`apps/orchestrator/src/orchestrator/jobs/hibernate_idle.py`](../apps/orchestrator/src/orchestrator/jobs/hibernate_idle.py), [`apps/orchestrator/tests/test_hibernate_idle_job.py`](../apps/orchestrator/tests/test_hibernate_idle_job.py), [`python_packages/sandbox_provider/src/sandbox_provider/fly.py`](../python_packages/sandbox_provider/src/sandbox_provider/fly.py), [`python_packages/sandbox_provider/tests/test_fly.py`](../python_packages/sandbox_provider/tests/test_fly.py). Sprites manages idle hibernation; Fly impl was based on the wrong API.
+- Dropped env vars: `FLY_REGION`, `SPRITE_CPU`, `SPRITE_RAM_MB`, `SPRITE_DISK_GB`, `BRIDGE_IMAGE`, `SANDBOX_IDLE_MINUTES`, `SPRITES_API_BASE`, `SPRITES_ORG`. Renamed `SPRITES_API_KEY` → `SPRITES_TOKEN`; `SANDBOX_PROVIDER=fly` → `sprites`. Updated `.env.example` to match.
+- `Sandbox` Beanie doc: dropped `region`/`bridge_version`/`hibernated_at`/`sprite_id`; added `provider_name` (discriminator) + `provider_handle: dict[str, str]` (opaque payload) + `public_url`. Status enum: 7 states matching Sprites' `cold/warm/running` plus our app-level `provisioning/resetting/destroyed/failed`.
+- `SandboxManager` lost the `hibernate` transition and `_resume` helper; `wake` now issues a no-op exec to force `cold→warm/running`. New `refresh_status` resyncs from the provider for the upcoming Refresh endpoint.
+- Routes: dropped `POST .../hibernate`; added `POST .../refresh`. Web UI dropped the Pause button, added the public-URL link and Refresh button.
+- Tests: 56 orchestrator + 17 provider all green; mock provider rotates handle-id per create so reset semantics match Sprites' real UUID rotation.
+
+### 2026-05-01 — Claude Opus 4.7 via Claude Code (slice 4 — sandbox provisioning shipped)
+
+- Filled in [python_packages/sandbox_provider/](../python_packages/sandbox_provider/) with `SandboxProvider` Protocol, `SpawnResult`, `SpritesError(retriable)`, `FlySpritesProvider` (httpx wrapper over Fly Machines API), `MockSandboxProvider` (in-memory). Persistent volume at `/work` baked into `spawn`. 15 unit tests via `httpx.MockTransport`.
+- Added `Sandbox` Beanie doc with the 8-state machine + `reset_count` / `last_reset_at`. Registered in `_DOCUMENT_MODELS`. Wire shape `SandboxResponse` in `shared_models`.
+- `SandboxManager` at [../apps/orchestrator/src/orchestrator/services/sandbox_manager.py](../apps/orchestrator/src/orchestrator/services/sandbox_manager.py) owns the matrix; `IllegalSandboxTransitionError` → HTTP 409. Provider failures mark the doc `failed` rather than crash the request. `reset` is sequential `provider.destroy → provider.spawn` on the same `Sandbox._id`.
+- 5 REST endpoints at [../apps/orchestrator/src/orchestrator/routes/sandbox.py](../apps/orchestrator/src/orchestrator/routes/sandbox.py) (list, get-or-create, wake, hibernate, reset, destroy). All path-parameterized.
+- Explicit provider selection at [../apps/orchestrator/src/orchestrator/lib/provider_factory.py](../apps/orchestrator/src/orchestrator/lib/provider_factory.py) — `SANDBOX_PROVIDER=fly` + empty `SPRITES_API_KEY` aborts startup; `mock` emits a loud warning. **No silent fallback.**
+- Redis client singleton + idle-hibernation job (2 min tick, `spawned_at` fallback when `last_active_at` is null). Cancel-clean.
+- Web: new [SandboxPanel](../apps/web/src/components/SandboxPanel.tsx) above the repos section. Distinct **Reset** + **Delete sandbox** buttons, both with confirmation dialogs. Pause is non-destructive, no confirmation. Polling at 2s for transient states.
+- New env vars wired through `Settings` and `.env.example`. API types regenerated.
+- Tests: 61 orchestrator + 15 provider, all green. State-machine matrix parameterized; two-user isolation verified.
+
 ### 2026-05-01 — Claude Opus 4.7 via Claude Code (slice 4 brief authored)
 
 - Authored [slice/slice4.md](slice/slice4.md) — sandbox provisioning, scope-narrow ("the box exists"). Six open decisions resolved inline (Sprites SDK behind a wrapper, `iad` default region, no salt suffix needed, 20 GB disk cap, three Redis keys per active sandbox, lazy `Sandbox` doc creation).

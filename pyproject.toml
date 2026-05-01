@@ -7,6 +7,10 @@ requires-python = ">=3.12"
 [tool.uv.workspace]
 members = ["apps/orchestrator", "apps/bridge", "python_packages/*"]
 
+[tool.uv]
+# Sprites SDK ships only as rc-tagged versions; allow them globally.
+prerelease = "allow"
+
 [tool.uv.sources]
 shared_models = { workspace = true }
 db = { workspace = true }

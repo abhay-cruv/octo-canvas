@@ -25,6 +25,7 @@ Entry point for Claude Code sessions in this repository. The actual rules live e
 | Frontend theme + responsiveness rules (light mode only, light/transparent surfaces, black accents, mobile-first) | [AGENTS.md §2.8](AGENTS.md) |
 | Engineering change-flow recipes | [docs/engineering.md](docs/engineering.md) |
 | Test strategy | [docs/TESTING.md](docs/TESTING.md) |
+| Sprites SDK reference (sandbox provider — slice 4) | [docs/sprites/v0.0.1-rc43/python.md](docs/sprites/v0.0.1-rc43/python.md) (Python) · [http.md](docs/sprites/v0.0.1-rc43/http.md) (raw HTTP/WSS) |
 
 ## What to update when you ship
 

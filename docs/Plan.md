@@ -297,23 +297,28 @@ class Repo(Document):
 
 > **Note on auth:** there is no `github_installations` collection. Repo access uses the user's OAuth access token (`User.github_access_token` from §11), not a GitHub App installation token. Cloning, fetching, and pushing all run with that single token.
 
-### `sandboxes` (slice 4)
+### `sandboxes` (slice 4 — implemented)
 
-Holds the sandbox-side state that needs to survive orchestrator restarts (Redis is the hot cache; this is the source of truth). **In v1 the orchestrator enforces one sandbox per user as a routing/UI choice, not a data-model invariant** — the schema and indexes are multi-sandbox-ready (see §4 forward-compat note).
+Holds the sandbox-side state that needs to survive orchestrator restarts (Redis is the hot cache; this is the source of truth). **In v1 the orchestrator enforces one alive sandbox per user as a routing/UI choice, not a data-model invariant** — the schema and indexes are multi-sandbox-ready (see §4 forward-compat note).
 
 ```python
 class Sandbox(Document):
     user_id: Annotated[PydanticObjectId, Indexed()]  # NOT unique — see §4 forward-compat note
-    name: str | None = None        # user-facing label; null for v1 singletons
-    sprite_id: str | None         # Fly Sprite ID; null before first spawn
-    status: Literal["none","spawning","running","idle","hibernated","destroyed","failed"]
-    region: str                    # Fly region the sprite lives in
-    bridge_version: str | None     # set on bridge ClientHello
+    provider_name: Literal["sprites", "mock"]    # discriminator
+    provider_handle: dict[str, str]              # opaque payload, e.g. {"name": "vibe-sbx-...", "id": "sprite-..."}
+    status: Literal["provisioning","cold","warm","running","resetting","destroyed","failed"]
+    public_url: str | None       # Sprites' per-sandbox URL (cf. python.md → Management)
     last_active_at: datetime | None
     spawned_at: datetime | None
-    hibernated_at: datetime | None
+    destroyed_at: datetime | None
+    last_reset_at: datetime | None
+    reset_count: int             # increments on every reset
+    failure_reason: str | None   # sanitized; never contains tokens
+    created_at: datetime
     class Settings: name = "sandboxes"
 ```
+
+No `region`/`sprite_id`/`bridge_version`/`hibernated_at` — Sprites manages region and resources, the SDK owns the sprite UUID inside `provider_handle.id`, and there's no bridge daemon to version-track. See [slice/slice4.md](slice/slice4.md) for the full design discussion and [`python_packages/db/src/db/models/sandbox.py`](../python_packages/db/src/db/models/sandbox.py) for the canonical schema.
 
 ### `repo_introspection` (embedded subdocument, slice 3)
 ```python
@@ -458,55 +463,54 @@ Endpoints are parameterized by `{sandbox_id}` from day one (multi-sandbox forwar
 
 ---
 
-## 10. WebSocket protocol (slice 5+)
+## 10. Transport architecture (slice 5+)
 
-### 10.1 Transport choice — WS, multiple connections per concern
+### 10.1 Two legs, both WebSocket — but the second leg is the Sprites SDK
 
-**Both legs of the system speak WebSocket.** Web↔orchestrator and orchestrator↔bridge share one transport so the codebase has one wire-protocol mental model, one set of reconnect/heartbeat code, and one type-bridge system (Pydantic discriminated unions → TS via codegen).
+The system has two transport legs and they are NOT symmetric:
 
-We **do not** use gRPC, even though HTTP/2 stream multiplexing would give per-channel back-pressure for free. Reasons:
+1. **Web ↔ orchestrator** — our WS endpoint, our Pydantic protocol. We own this wire.
+2. **Orchestrator ↔ sandbox** — the Sprites SDK. We are the *client*. Sprites' Exec/Filesystem/Proxy/Watch endpoints are WSS; we drive them via `sprites-py`. We do NOT define this protocol; Sprites does. See [`docs/sprites/v0.0.1-rc43/python.md`](sprites/v0.0.1-rc43/python.md) for the full surface.
 
-- Browsers don't speak gRPC natively. FE↔BE stays WS regardless. If BE↔bridge were gRPC, the orchestrator would become a transport translator and we'd maintain two type-bridge systems (`.proto`→Python on the bridge link, Pydantic→TS on the web link).
-- AGENTS.md §2.6 locks the stack. Adding `protoc` + `grpcio` is a heavier ask than the back-pressure win justifies for v1.
-- Multi-WS-connections gets ~90% of gRPC's per-channel isolation with infra we already have.
+This shape was decided in slice 4 after the rc43 SDK docs landed. Earlier drafts of this plan envisioned a long-lived "bridge" Python process inside the sandbox that dialed a custom `/ws/bridge/...` orchestrator endpoint with a custom Pydantic protocol (`ClientHello`, `EnsureRepoCloned`, `seq`-replay). That whole layer is **deleted**: Sprites' Exec sessions persist across disconnects with built-in scrollback, the per-sandbox URL provides HTTP preview, the Filesystem API covers slice 8 file ops, and Checkpoints make Reset trivial. Less invented infrastructure, more behaviour delegated to Sprites.
 
-Revisit the decision **only** if production telemetry shows we're routinely running 8+ concurrent streaming channels per sandbox.
+We **do not** use gRPC for the web leg. Browsers don't speak gRPC natively; gRPC-Web is a separate stack we'd have to maintain. Pydantic→TS via OpenAPI codegen handles the only direction of typing we actually need.
 
-### 10.2 The four channels
+Revisit the decision only if Sprites' API materially changes shape or production telemetry shows the SDK can't carry our load.
 
-We split the wire into **four logical channels**, each on its own WS connection. They have very different latency/throughput/durability needs and would clobber each other if multiplexed onto one socket.
+### 10.2 Channels (where they live now)
 
-| Channel | Endpoint | Direction | Wire | Replay-able | Latency budget | Lifetime |
-|---|---|---|---|---|---|---|
-| **Control + events** | `/ws/web/tasks/{task_id}` (web side) and `/ws/bridge/sandboxes/{sandbox_id}` (bridge side) | bidi | JSON (Pydantic union) | yes — `seq`-replay from Mongo | ms | long-lived (sandbox lifetime on bridge side; task page lifetime on web side) |
-| **PTY** | `/ws/web/sandboxes/{sandbox_id}/pty/{terminal_id}` (web) and `/ws/bridge/sandboxes/{sandbox_id}/pty/{terminal_id}` (bridge) | bidi | binary (xterm.js bytes) | no | <50 ms (keystroke→pixel) | terminal session lifetime, opened on demand |
-| **File ops** | REST: `GET/PUT /api/sandboxes/{id}/fs?path=...` | req/resp | HTTP (binary or text body) | n/a | seconds OK for big files | per-request |
-| **HTTP preview** | proxy at `https://sandbox-{id}.preview.<domain>/...` | bidi | HTTP/HTTPS | n/a | normal HTTP | per-request |
+The user-facing channels are the same as before; what changed is **who hosts them**. The orchestrator-side (web-facing) endpoints are ours; the sandbox-side endpoints are Sprites'.
 
-Why split:
+| Channel | Web side (we host) | Sandbox side (Sprites SDK) | Wire | Replay |
+|---|---|---|---|---|
+| **Control + events** (agent task feed, status) | `/ws/web/tasks/{task_id}` — Pydantic discriminated union | n/a — orchestrator generates events from SDK calls and Mongo state | JSON | `seq`-replay from Mongo |
+| **PTY** (terminal) | `/ws/web/sandboxes/{id}/pty/{terminal_id}` — orchestrator brokers | `/v1/sprites/{name}/exec` (WSS, TTY mode) — orchestrator opens with stdin/stdout/stderr stream IDs | binary | Sprites' built-in **scrollback buffer** on attach — see [python.md → Exec → SCROLLBACK BUFFER](sprites/v0.0.1-rc43/python.md) |
+| **File ops** | `GET/PUT /api/sandboxes/{id}/fs?path=...` — thin auth wrapper | `/v1/sprites/{name}/fs/{read,write,list,delete,rename,copy,chmod}` (HTTP) | HTTP body | n/a |
+| **File watch** (live diff while agent edits) | merged into web's control+events channel as `FileEditEvent` | `/v1/sprites/{name}/fs/watch` (WSS) — orchestrator subscribes | JSON envelope | n/a |
+| **HTTP preview** of dev server in sandbox | direct redirect to Sprites' per-sandbox URL | `https://{sprite_name}-{org}.sprites.app` — built into every sandbox | HTTP/HTTPS | n/a |
+| **TCP tunnel** (post-v1, e.g., DB connection) | per-sandbox WSS broker if/when needed | `/v1/sprites/{name}/proxy` (WSS) | binary | n/a |
 
-- A 10 MB `pnpm install` log multiplexed onto the same WS as keystrokes induces head-of-line blocking — terminal feels janky. PTY needs its own socket.
-- Big file reads/writes don't fight terminal traffic when they go REST.
-- HTTP preview is its own concern (forwarding arbitrary localhost:N traffic to the user's browser); shoving it into a WS would force us to build a full HTTP-over-WS proxy.
+Why the orchestrator brokers PTY and FS rather than letting the FE call Sprites directly: **the FE must never see `SPRITES_TOKEN`.** The orchestrator authenticates the user via session cookie, opens its own SDK call to Sprites with the server-side token, and pipes bytes/JSON back to the FE. Costs ~10–20 ms; buys auth + audit + rate-limit + the ability to revoke a user without rotating the Sprites token. Direct FE→Sprites is a v2 latency optimization if anyone ever asks for it.
 
-PTY connections are **opened on demand** (when the user clicks "Open terminal") and closed when the tab/terminal closes — most active sandboxes have zero PTYs open at any moment. Average wire footprint per active sandbox: ~2 WS connections (one control on web, one control on bridge), ~3 if the user has a terminal open.
+PTY connections are **opened on demand** (when the user clicks "Open terminal") and closed when the tab/terminal closes — most active sandboxes have zero PTYs open at any moment. Sprites' Exec sessions also persist across the FE↔orchestrator WS dropping (`max_run_after_disconnect` defaults to forever for TTY), so a user can reload the tab and reattach to the same shell session.
 
-### 10.3 Endpoints + authentication
+### 10.3 Web-side endpoints + authentication
 
 | Endpoint | Who connects | Auth |
 |---|---|---|
 | `/ws/web/tasks/{task_id}` | web client subscribes to a task's event stream | session cookie via FastAPI `Depends` on the WS handshake |
-| `/ws/web/sandboxes/{sandbox_id}/pty/{terminal_id}` | web client opens a terminal | session cookie |
-| `/ws/bridge/sandboxes/{sandbox_id}` | the bridge in a Sprite dials **once per sandbox boot** | long-lived **bridge token** (rotatable; re-issued on every wake) |
-| `/ws/bridge/sandboxes/{sandbox_id}/pty/{terminal_id}` | bridge opens its end of a PTY when the orchestrator instructs it | bridge token |
+| `/ws/web/sandboxes/{sandbox_id}/pty/{terminal_id}` | web client opens a terminal (orchestrator brokers to Sprites Exec) | session cookie |
 
-All messages are Pydantic discriminated unions in `python_packages/shared_models/wire_protocol/`. Discriminator field: `type`.
+That's the entire orchestrator-hosted WS surface. Sprites' Exec/Watch/Proxy WSS are reached from the orchestrator outbound via the SDK — **no incoming WS connection from the sandbox to us.**
 
-### 10.4 Bridge → orchestrator (control + events channel)
+All web-bound messages are Pydantic discriminated unions in `python_packages/shared_models/wire_protocol/`. Discriminator field: `type`.
+
+### 10.4 Web-side message types (control + events channel)
+
+Orchestrator → web (a transcoded UI feed; the source events are produced by the orchestrator from a mix of Mongo state, Sprites Exec stdout parses, and Sprites Watch deltas):
 
 ```
-ClientHello              { type, sandbox_id, bridge_version, cloned_repos: [{full_name, head_sha, last_synced_at}] }
-RunStarted               { type, run_id }                          # bridge ack of StartRun
 ToolCallEvent            { type, run_id, seq, tool_name, args }
 ToolResultEvent          { type, run_id, seq, tool_name, ok, output }
 FileEditEvent            { type, run_id, seq, path, before_sha, after_sha, summary }
@@ -514,139 +518,93 @@ ShellExecEvent           { type, run_id, seq, cmd, exit_code, stdout_tail, stder
 GitOpEvent               { type, run_id, seq, op, branch?, commit_sha?, pr_url? }
 AssistantMessageEvent    { type, run_id, seq, content, finish_reason? }
 StatusChangeEvent        { type, run_id, seq, new_status }
-ErrorEvent               { type, run_id?, seq, kind, message }     # run_id absent for sandbox-level errors
+SandboxStatusEvent       { type, sandbox_id, status, public_url? }   # mirrors Sprites cold/warm/running
 TokenUsageEvent          { type, run_id, seq, input_delta, output_delta }
-RepoCloneStatus          { type, full_name, status, error? }       # ack for EnsureRepoCloned / RemoveRepo
-PtyOpened                { type, terminal_id }                     # bridge ack of OpenPty
-PtyClosed                { type, terminal_id, exit_code? }
-Heartbeat                { type, last_active_at }
+ErrorEvent               { type, run_id?, seq, kind, message }
 Pong                     { type, nonce }
 ```
 
-Orchestrator responsibilities on receive:
-
-1. Persist `*Event` as `AgentEvent` keyed by `run_id` (monotonic `seq`).
-2. Fan out to web subscribers on the same task.
-3. Update parent `AgentRun.status` / `Task.status` on terminal events.
-4. Update `Repo.clone_status` and `Sandbox.last_active_at` on `RepoCloneStatus` / `Heartbeat`.
-
-### 10.5 Orchestrator → bridge (control channel)
-
-```
-ServerHello              { type, tool_allowlist, agent_defaults, resume_after_seq? }
-EnsureRepoCloned         { type, full_name, base_branch, user_token }
-RemoveRepo               { type, full_name }
-StartRun                 { type, run_id, task_id, repo_full_name, base_branch, prompt, follow_up, user_token }
-UserFollowUpMessage      { type, run_id, content }
-AbortRun                 { type, run_id, reason }
-OpenPty                  { type, terminal_id, cwd?, cols, rows }
-ResizePty                { type, terminal_id, cols, rows }
-ClosePty                 { type, terminal_id }
-HibernateSandbox         { type }                                  # bridge flushes, exits cleanly
-Ping                     { type, nonce }
-```
-
-### 10.6 Web → orchestrator (control channel)
-
-The orchestrator transcodes `AgentEvent`s into a UI-friendly schema (`TaskEventForUI`) and pushes them down. Web clients send:
+Web → orchestrator:
 
 ```
 Resume                   { type, after_seq }                       # on (re)connect, request replay
 SendFollowUp             { type, run_id, content }
 CancelTask               { type, task_id }
-RequestOpenPty           { type, terminal_id, cwd?, cols, rows }
+RequestOpenPty           { type, terminal_id, cwd?, cols, rows }   # orchestrator opens Sprites Exec
 RequestClosePty          { type, terminal_id }
 ResizePty                { type, terminal_id, cols, rows }
 Pong                     { type, nonce }
 ```
 
-Everything else is HTTP.
+Everything else is HTTP REST.
 
-### 10.7 PTY channel (binary)
+### 10.5 PTY channel (binary)
 
-Frames are raw bytes — what xterm.js sends/receives. No JSON envelope, no `seq`. Both directions are pure byte streams; the channel dies if either end disconnects, and the user reconnects via `RequestOpenPty` to start fresh (PTY history is *not* replay-able by design — the user got the bytes the first time, and the bridge already wrote them to the terminal subprocess).
+User opens a terminal. The orchestrator's `/ws/web/.../pty/{terminal_id}` handler validates the session, then opens a Sprites Exec WSS via the SDK (`sprite.command(...)` with `tty=True`) and pipes bytes both ways. The SDK handles stdin/stdout/stderr stream framing per [python.md → Exec → BINARY PROTOCOL](sprites/v0.0.1-rc43/python.md). xterm.js on the web side speaks the same byte stream.
 
-PTY frames carry only one out-of-band signal: a **terminal close** (sent as a zero-length WS Close frame with status code `1000`). Resize is on the control channel, not inline.
+Reattach semantics come from Sprites: the Exec session ID survives the FE↔orchestrator WS dropping. On reconnect, the orchestrator looks up the active Sprites session and uses Attach (`/v1/sprites/{name}/exec/{session_id}`) instead of starting a new one — Sprites replays its scrollback buffer so the user sees the output they missed.
 
-### 10.8 Reliability — disconnects must be graceful and robust
+Resize is a Sprites-side `{type: "resize", cols, rows}` JSON message on the same WSS, sent by the orchestrator when the FE asks via `ResizePty`.
 
-The wire is the most-tested surface in production. **Every channel on every leg must survive**: orchestrator restarts, bridge restarts, network blips, NAT timeouts, Fly Sprite hibernate/resume, browser tab sleep, mobile-network handoffs. Rules:
+### 10.6 Reliability — disconnects must be graceful and robust
 
-#### Heartbeat
+The wire is the most-tested surface in production. Rules:
+
+#### Heartbeat (web ↔ orchestrator)
 
 - Application-level `Ping`/`Pong` with `nonce`, every **30 seconds** in both directions.
 - **Two missed pongs (~90 s)** → declare the peer dead and close with code `1011`.
-- WS-protocol-level frames (`websockets` lib does these) run at TCP keepalive frequency; they detect dead TCP, not dead apps.
 
-#### Sequence numbers + replay (control + events only)
+#### Sequence numbers + replay (control + events)
 
-- Server-side: every event the orchestrator persists into `agent_events` gets a monotonic `seq` per `run_id`.
-- Client-side (web + bridge): track `last_seen_seq` per `run_id`; persist in memory only — survives short reconnects but not browser refresh (server replays from Mongo on reconnect anyway).
-- On reconnect: client sends `Resume{after_seq}` as the first message; orchestrator streams missed events from Mongo, then resumes live.
-- Mongo retains the last **24 hours** of events per run hot; older fetches go through the slice 8 S3 archive transparently.
+- Every event the orchestrator persists into `agent_events` gets a monotonic `seq` per `run_id`.
+- Web client tracks `last_seen_seq`; on reconnect sends `Resume{after_seq}` as the first message; orchestrator streams missed events from Mongo, then resumes live.
+- Mongo retains the last **24 hours** of events per run hot; older fetches go through the slice 10 S3 archive transparently.
 
-#### Idempotency
+#### Sprites-leg disconnect handling
 
-- All bridge-bound directives (`EnsureRepoCloned`, `RemoveRepo`, `StartRun`, `OpenPty`, `HibernateSandbox`) are **idempotent**. The bridge re-applying the same directive after a reconnect must be safe.
-  - `EnsureRepoCloned` re-checks disk; `git fetch` if already cloned.
-  - `StartRun` checks `AgentRun.status` in Mongo before re-running; if `completed`, replays the terminal events instead.
-  - `OpenPty` checks if `terminal_id` already exists; reuses if so.
-- Each directive carries a server-issued **`directive_id`**. The bridge tracks the last 100 it acted on; duplicates within that window are ignored (returns the cached ack).
+Sprites' SDK manages reconnects on the orchestrator↔sprite leg. Our concerns:
 
-#### Reconnect flow — bridge side
-
-1. WS closes. Bridge enters **reconnect loop**: exponential backoff `1, 2, 4, 8, 16, 30, 30, 30…` seconds with ±25% jitter, no cap on total retries.
-2. On reconnect: send `ClientHello` with current `cloned_repos` and the bridge's last `seq` per known run.
-3. Orchestrator replies `ServerHello{resume_after_seq}` and re-issues any directives the bridge hadn't acked. Reconciliation runs.
-4. Active runs continue if the bridge still has the agent process alive; if the bridge **process** died and respawned, in-flight runs are marked `failed` with `ErrorEvent{kind: "bridge_restart"}` and the user can retry.
-
-#### Reconnect flow — web side
-
-1. WS closes. Web app shows a small "Reconnecting…" indicator (do not unmount the task page — keep all state).
-2. Reconnect with **exponential backoff `0.5, 1, 2, 4, 8, 16, 30, 30…` seconds with ±25% jitter**. First retry is fast (likely network blip).
-3. On reconnect, send `Resume{after_seq: last_seen_seq}`. Orchestrator replays from Mongo.
-4. If the user is mid-PTY: that connection was binary and stateless, so the web app re-issues `RequestOpenPty` for each terminal that was open. The orchestrator recreates the PTY pair. **Terminal scrollback is the user's view; bridge does not replay PTY bytes.**
+- **Exec session loss** (sprite was destroyed mid-command): the SDK raises `NotFoundError` on next call. The orchestrator emits `ErrorEvent{kind: "exec_session_lost"}` and the web client surfaces it; the user's runs are not auto-retried.
+- **Sprite cold during exec**: Sprites auto-warms on access; the SDK call blocks briefly then proceeds. No app-level intervention needed.
+- **Network failure orchestrator → Sprites**: the SDK raises `NetworkError`; we map to `SpritesError(retriable=True)` (see `sandbox_provider.sprites._is_retriable`). Routes return 502; web client retries via standard backoff.
+- **PTY brokerage interruption** (orchestrator ↔ Sprites Exec WSS dropped mid-stream): we re-attach to the same `session_id` and pipe the scrollback buffer to the FE. The FE doesn't notice unless the gap exceeds the Sprites scrollback window.
 
 #### Backpressure
 
-- Orchestrator buffers up to **1000 events per (run, web subscriber)**. If a slow web client overflows: drop intermediate events with a `BackpressureWarning` event, advance `seq`. Client will catch up via `Resume` on next reconnect. Never grow buffers unbounded.
-- Bridge → orchestrator: bridge buffers up to **5 MB** of pending events; if it overflows (typically because the orchestrator side dropped its WS), the bridge **drops the oldest non-terminal events first**, keeping `StatusChangeEvent` and `ErrorEvent`. These are reconstruction-critical.
-- PTY channel: **drop frames** under back-pressure (slow client). Terminal output may briefly garble; better than freezing keystrokes. Coalesce contiguous output frames bridge-side at ≤100 Hz.
-- File-watch (`FileEditEvent` stream while the agent edits): **coalesce by `path`** — one event per path per ~250 ms window.
+- Orchestrator buffers up to **1000 events per (run, web subscriber)**. If a slow web client overflows: drop intermediate events with a `BackpressureWarning` event, advance `seq`. Client catches up via `Resume` on next reconnect.
+- PTY brokerage: orchestrator forwards bytes pass-through; if the FE WS write buffer fills up, **drop frames** rather than back-pressure into Sprites. Terminal output may briefly garble; better than freezing keystrokes.
+- File-watch (`FileEditEvent`): orchestrator coalesces Sprites' `fs/watch` deltas by `path` at ≤4 Hz before fanning out to web subscribers.
 
 #### Fail-fast vs. fail-soft
 
-- Auth failure on (re)connect: **fail fast** (close `4001`, no retry without manual reauth). Bridge token expired or invalid → orchestrator closes `4002`, bridge stops retrying and exits; the next `wake` will issue a fresh token.
-- Schema mismatch (Pydantic validation fails): **fail soft** for the offending message (drop, log, increment metric); do **not** kill the connection. Schemas evolve.
-- Orchestrator restart mid-task: bridge sees TCP close, reconnects via the exponential-backoff loop; web sees the same. Both replay via `seq`. **No data is lost** because every event was persisted to Mongo before the orchestrator acknowledged it.
+- Auth failure on web (re)connect: **fail fast** (close `4001`, no retry without re-auth).
+- Schema mismatch on web messages (Pydantic validation fails): **fail soft** — drop, log, increment metric. Do not kill the connection. Schemas evolve.
+- Sprites token revoked / expired: orchestrator's startup check catches this; runtime SDK calls returning 401 raise `SpritesError(retriable=False)`. Operator rotates `SPRITES_TOKEN` and restarts.
+- Orchestrator restart mid-task: web sees TCP close → reconnect → `Resume` → catch up. Sprite state is unaffected because Sprites is the sandbox source-of-truth, not us.
 
-### 10.9 Horizontal scale — sticky routing + Redis pub/sub fallback
+### 10.7 Horizontal scale — stateless orchestrator + Redis pub/sub for fan-out
 
-The orchestrator is stateless (per [§4](#4-system-architecture)). Multiple instances run behind Fly's load balancer. WS connections need to land on the **right instance** so directives don't cross-talk.
+The orchestrator is stateless. Multiple instances run behind Fly's load balancer. **What's different from earlier drafts**: there's no incoming bridge connection to route — only web clients. Sticky routing simplifies to "the user's web WS lands on whichever instance the LB picks; if that instance isn't already streaming the relevant Sprites Exec session, it opens its own SDK call."
 
-#### Sticky-by-sandbox
+Two web clients on the same task on different orchestrator instances both want to see the same agent stream. Solution:
 
-- Both the bridge for sandbox X and the web client(s) watching sandbox X get pinned to the same orchestrator instance, keyed by `sandbox_id` hash.
-- Mechanism: Fly `fly-replay` headers. On the WS upgrade request, the LB hashes `sandbox_id` (path param) and routes to a chosen instance; that instance's `instance_id` is recorded in Redis at `sandbox:{id}:owner` with a 60s TTL, refreshed on heartbeat.
-- The web `/ws/web/tasks/{task_id}` handshake reads `task → sandbox_id` and replays the same hash so the web client lands on the same instance as the bridge.
-
-#### Redis pub/sub — slow path fallback
-
-- Channel: `sandbox:{id}`. Any orchestrator instance that receives a message for a sandbox it does **not** currently own (e.g., during a deploy when ownership flips) republishes the message via Redis pub/sub.
-- The owning instance subscribes to `sandbox:{owned_id}` for each sandbox it owns; it picks up the republished message and forwards to the correct connected peer.
-- Pub/sub is the fallback, not the primary path. Hot path stays in-process for ~99% of messages.
+- **Single Sprites Exec stream per active run** — owned by whichever instance picked up the task creation. That instance parses agent events and **publishes to Redis** on `task:{task_id}` channel.
+- Other instances **subscribe** to `task:{task_id}` for any web client connected to that task. They forward published events to their local web subscribers.
+- Mongo retains the truth (`agent_events`); pub/sub is the fan-out, not the source of truth. A late-joining web client uses `Resume{after_seq=0}` and reads from Mongo.
 
 #### Capacity caps + shedding
 
-- Each orchestrator instance advertises its current `(connections, sandboxes_owned)` to a Redis hash `orchestrator_capacity:{instance_id}`. Fly's LB checks before routing new sandboxes.
-- Per-instance soft cap: **5000 WS connections** (control + PTY combined). Hot-shed beyond that — return 503 on new sandbox spawns until an instance with headroom is available. Don't degrade existing connections.
+- Each instance advertises `(connections, runs_owned)` to Redis hash `orchestrator_capacity:{instance_id}` (60s TTL). Fly's LB checks before routing new sandbox-spawn requests.
+- Per-instance soft cap: **5000 web WS connections + 200 active Sprites Exec sessions**. Hot-shed beyond that — return 503 on new sandbox spawn / new task creation. Existing connections aren't degraded.
 
-### 10.10 What we deliberately don't do (yet)
+### 10.8 What we deliberately don't do
 
-- **No FE↔bridge direct connection.** All web traffic to the sandbox goes through the orchestrator. Costs ~10–20 ms per hop, buys auth + audit + rate-limit + transparent reconnect when an orchestrator dies. Direct-to-bridge (e.g., WebRTC data channels) is a v2 latency optimization if PTY genuinely bites.
-- **No multiplexing all four channels onto one WS.** See §10.2 — head-of-line blocking on PTY is the failure mode.
-- **No SSE / long-poll fallback.** WS works on every supported browser and through every supported proxy; one transport is enough.
-- **No protocol versioning beyond Pydantic schema evolution.** When we need a v2, add `version` to `ClientHello`/handshake and branch at the handler. Don't pre-build a versioning system before we need one.
+- **No incoming `bridge` connection from the sandbox to the orchestrator.** Sprites' SDK is outbound-only. The "long-lived bridge process" from earlier drafts is deleted.
+- **No FE↔Sprites direct connection.** Costs ~10–20 ms per orchestrator hop, buys auth (FE never holds `SPRITES_TOKEN`) + audit + rate-limit. Direct path is a v2 optimization if PTY genuinely bites.
+- **No SSE / long-poll fallback.** WS works on every supported browser; one transport is enough.
+- **No protocol versioning beyond Pydantic schema evolution.** When we need a v2, branch at the handler. Don't pre-build a versioning system.
+- **No custom HTTP preview proxy.** Sprites ships a per-sandbox URL — surface it on the dashboard, configure `auth=sprite|public` via `update_url_settings`. Slice 9 is absorbed.
 
 ---
 
@@ -691,125 +649,139 @@ No installation tokens, no token cache (the user token is persisted; githubkit g
 
 ---
 
-## 13. Sandbox lifecycle (slice 4)
+## 13. Sandbox lifecycle (slice 4 — implemented)
 
 **One persistent sandbox per user.** It hosts every connected repo of that user under `/work/<full_name>/` and serves every agent run. It outlives individual tasks; it does not outlive the user account.
 
-[`SandboxProvider` Protocol](../python_packages/sandbox_provider/src/sandbox_provider/interface.py) — currently has TODO methods. To implement:
+The sandbox is provisioned via Sprites (see [docs/sprites/v0.0.1-rc43/python.md](sprites/v0.0.1-rc43/python.md)). The `SandboxProvider` Protocol is intentionally narrow so the backend stays swappable. Slice 4 surface:
 
 ```python
+@dataclass(frozen=True)
+class SandboxHandle:
+    provider: ProviderName       # "sprites" | "mock"
+    payload: dict[str, str]      # opaque; e.g. {"name": "vibe-sbx-...", "id": "sprite-..."}
+
 class SandboxProvider(Protocol):
-    async def spawn(self, *, user_id: PydanticObjectId, env: dict[str,str]) -> SandboxHandle: ...
-    async def resume(self, sprite_id: str) -> SandboxHandle: ...
-    async def hibernate(self, sprite_id: str) -> None: ...
-    async def destroy(self, sprite_id: str) -> None: ...
-    async def exec(self, sprite_id: str, cmd: list[str], cwd: str | None = None) -> ExecResult: ...
-    async def clone_repo(self, sprite_id: str, *, full_name: str, base_branch: str, user_token: str) -> None: ...
-    async def remove_repo(self, sprite_id: str, *, full_name: str) -> None: ...
+    name: ProviderName
+    async def create(self, *, sandbox_id: str, labels: list[str]) -> SandboxHandle
+    async def status(self, handle: SandboxHandle) -> SandboxState   # ProviderStatus + public_url
+    async def destroy(self, handle: SandboxHandle) -> None
+    async def wake(self, handle: SandboxHandle) -> SandboxState     # no-op exec to force warm
 ```
 
-Concrete impl: `FlySpritesProvider`, calling Fly Sprites REST API with `SPRITES_API_KEY`. Sprites are named by `Sandbox._id`: `vibe-sbx-{sandbox_id}`. v1 enforces exactly one Sandbox per user at the orchestrator routing layer; the multi-sandbox future (§4 forward-compat note) simply lifts that enforcement — no naming or schema change needed.
+Slice 5b widens with `fs_*` and `exec_*`; slice 6 with checkpoint helpers. Don't pre-add. Sprite naming: `vibe-sbx-{sandbox_id}` where `sandbox_id` is the Mongo `Sandbox._id`. v1 enforces exactly one alive `Sandbox` per user at the orchestrator routing layer (`SandboxManager.get_or_create`); the multi-sandbox future (§4 forward-compat note) lifts that enforcement — no naming or schema change needed.
 
 ### Per-user state machine
 
 ```
-                         user signs up
-                              │
-                              ▼
-                       ┌────────────┐
-                       │   none     │
-                       └─────┬──────┘
-                             │ first task / explicit /api/sandbox/wake
-                             ▼
-                       ┌────────────┐
-              ┌──────► │  spawning  │
-              │        └─────┬──────┘
-              │              │ bridge dials WS, ClientHello accepted
-              │              ▼
-              │        ┌────────────┐ ◄────── follow-up / new task on any repo
-              │        │  running   │ ─────► run agent in /work/<full_name>/
-              │        └─────┬──────┘
-              │              │ no active run for 10 min
-              │              ▼
-              │        ┌────────────┐
-              │        │ hibernated │
-              │        └─────┬──────┘
-              │              │ next task / /api/sandbox/wake
-              │              ▼
-              │        ┌────────────┐
-              └──────  │  resumed   │  (transient — collapses to running)
-                       └────────────┘
+                       user signs up
+                            │
+                            ▼
+                     ┌──────────────┐
+                     │   no doc     │
+                     └──────┬───────┘
+                            │ POST /api/sandboxes
+                            ▼
+                     ┌──────────────┐
+                     │ provisioning │
+                     └──────┬───────┘
+                            │ provider.create returns
+                            ▼
+        ┌──────────► ┌──────────────┐
+        │            │ cold|warm|   │  ◄── auto-paused after idle (Sprites)
+        │            │   running    │  ◄── auto-warmed on access (Sprites)
+        │            └─┬───┬───┬────┘
+        │   reset      │   │   │  destroy
+        │     ▼        │   │   ▼
+        │  resetting   │   │  destroyed (terminal; doc kept)
+        │     │        │   │
+        │     │        │   │ wake (force-warm via no-op exec)
+        │     ▼        │   ▼
+        └──── provisioning ┘
 
-              explicit /api/sandbox/destroy or fatal error:
-              running | hibernated  ──►  destroyed
-              (Repo rows survive; clone_status flips back to "pending")
+       Provider failure at any point → failed
+                                       │
+                                       │  reset    destroy
+                                       ▼          ▼
+                                   resetting   destroyed
 ```
+
+Mapping to Sprites' status: `cold | warm | running` reflect the SDK's enum directly. Our app-level `provisioning`, `resetting`, `destroyed`, `failed` are added for transitions and audit.
+
+### Reset and Destroy are distinct
+
+- **Reset** (`POST /api/sandboxes/{id}/reset`): destroys the sprite + its filesystem, then provisions a fresh one for the *same* `Sandbox` doc (preserves `_id`, increments `reset_count`, rotates `provider_handle`). Slice 4 implementation is sequential `provider.destroy → provider.create`. Slice 5b will switch to **`restore_checkpoint("clean")`** (see [python.md → Checkpoints](sprites/v0.0.1-rc43/python.md)) — milliseconds vs. recreate, copy-on-write storage means incremental checkpoints are tiny.
+- **Destroy** (`POST /api/sandboxes/{id}/destroy`): tears down the sprite + filesystem and marks the `Sandbox` doc `destroyed` (audit trail). User must `POST /api/sandboxes` again to provision a new one (new `_id`). Sign-out does **not** destroy.
 
 ### Concurrency model inside one sandbox
 
-A user can have multiple tasks. v1 policy: **one active agent run at a time per sandbox**, others queue. Rationale: simpler reasoning about concurrent file system writes, simpler resource caps, simpler UX (one "live" task indicator). Pre-v2 we revisit; the bridge already speaks per-run WS so promoting to N concurrent runs is a code change, not a protocol change.
+A user can have multiple tasks. v1 policy: **one active agent run at a time per sandbox**, others queue. Rationale: simpler reasoning about concurrent file system writes, simpler cost caps, simpler UX (one "live" task indicator).
 
-Queue lives in Redis: `sandbox:{user_id}:queue` (LIST of `run_id`). The bridge dequeues; the orchestrator monitors queue length and exposes it as `Sandbox.queue_depth` for the UI (slice 6 polish).
+Queue lives in Redis: `sandbox:{sandbox_id}:queue` (LIST of `run_id`). The orchestrator dequeues and starts the next agent invocation via Sprites Exec (slice 6). Queue depth surfaces as `Sandbox.queue_depth` for the UI.
 
 ### State storage
 
-- **Mongo `sandboxes`** — durable source of truth: `user_id`, `sprite_id`, `status`, `region`, `bridge_version`, timestamps.
-- **Redis** — hot cache for the orchestrator hot path, so repeated reads on every request don't hit Mongo:
-  - `sandbox:{user_id}` → hash of `{sprite_id, status, last_active_at}`
-  - `sandbox:{user_id}:queue` → list of pending `run_id`s
-  - `sandbox:{user_id}:active_run` → currently-running `run_id` (or unset)
-- Mongo is updated on state transitions; Redis is updated on every heartbeat.
+- **Mongo `sandboxes`** — durable source of truth. Fields: `user_id`, `provider_name` (discriminator), `provider_handle: dict[str, str]` (opaque), `status`, `public_url`, all timestamps + `reset_count`, `failure_reason`. **Not stored**: region, CPU, RAM, disk, bridge_version. Sprites manages those.
+- **Redis** — hot cache for slice 5a's WS hot path, written by `SandboxManager` on every state transition (90s TTL):
+  - `sandbox:{sandbox_id}` → hash of `{status, public_url, last_active_at}`
+  - `sandbox:{sandbox_id}:owner` → orchestrator instance id (60s TTL, refreshed on heartbeat) — for sticky routing of web subscribers when multiple instances are running
+  - `sandbox:{sandbox_id}:queue` → list of pending `run_id`s (slice 6)
+  - `sandbox:{sandbox_id}:active_run` → currently-running `run_id` (slice 6)
 
 ### Idle hibernation
 
-A periodic job (`apps/orchestrator/src/orchestrator/jobs/hibernate_idle.py`) scans `sandboxes` where `status="running"` and `last_active_at < now - 10min` AND no active run; calls `provider.hibernate`. Resume happens lazily on the next task or explicit `/api/sandbox/wake`.
+**Sprites does this server-side** — sandboxes auto-pause to `cold` after idle and auto-warm on the next access (exec, HTTP request to the public URL, fs read). No orchestrator-side cron. The dashboard uses `POST /api/sandboxes/{id}/refresh` to resync live status when needed.
 
 ### Destroy semantics
 
-`POST /api/sandbox/destroy` is destructive: warm caches (`node_modules`, `.venv`) are gone, repos go back to `clone_status="pending"`, but the `repos` collection rows survive. Next wake re-clones them. This is the user's "everything's weird, blow it away" button. Sign-out does **not** destroy.
+`POST /api/sandboxes/{id}/destroy` is destructive: filesystem is gone, all warm caches (`node_modules`, `.venv`, agent run history on disk) are gone. The `Sandbox` doc is **kept** with `status="destroyed"` (audit trail); the user must `POST /api/sandboxes` to get a new one. Repos in the `repos` collection are unaffected — slice 5b will flip their `clone_status` back to `pending` so the next provision re-clones into the fresh filesystem.
 
 ---
 
-## 14. Bridge & agent runtime (slices 5–7)
+## 14. Agent runtime (slices 5b–7)
 
-The bridge is **long-lived per sandbox** — boots once when the Sprite spawns, stays connected to the orchestrator over a single WS, services many tasks across many repos sequentially.
+**There is no long-lived "bridge" process.** Earlier drafts assumed a Python daemon inside the sprite that dialed home over WS; that's deleted. The orchestrator drives agent invocations via Sprites' Exec API (see [docs/sprites/v0.0.1-rc43/python.md](sprites/v0.0.1-rc43/python.md)). The `apps/bridge/` workspace shrinks to **agent-runner code that ships inside the Sprite image** — it's invoked per-run as a subprocess, not as a daemon.
 
-### On Sprite boot (once per sandbox lifetime, until hibernate)
+### Per-run flow (slice 6)
 
-1. Read env: `BRIDGE_TOKEN` (per-sandbox, long-lived but rotatable), `ORCHESTRATOR_BASE_URL`, `USER_ID`, `SANDBOX_ID`.
-2. Connect WS to `/ws/bridge/sandboxes/{sandbox_id}`. Send `ClientHello{bridge_version, cloned_repos: [...]}` listing what's already on disk under `/work/`.
-3. Receive `ServerHello{tool_allowlist, agent_defaults}`.
-4. Reconcile clones: orchestrator compares `cloned_repos` (reported by *this* bridge for *this* sandbox_id) to the `Repo` rows where `sandbox_id == this.sandbox_id`, and issues `EnsureRepoCloned` / `RemoveRepo` directives until the disk matches the desired state. Reconciliation is **per-sandbox**, not per-user — each sandbox owns its own subset of the user's `Repo` rows (multi-sandbox forward-compat per §4).
-5. Enter the run loop.
+1. Orchestrator dequeues a `Task` for the user's sandbox.
+2. Mints a per-repo, per-run install token via the user's GitHub OAuth token (see §19 #12 for token scoping rules).
+3. Calls `client.sprite(name).command("python", "-m", "agent_runner", task_json, env={...})` with `tty=False` and `stdin=False`. The SDK returns an Exec session with stdin/stdout streams.
+4. The orchestrator reads stdout line-by-line — each line is a JSON-encoded `*Event` from the agent. Validates against Pydantic, persists to `agent_events` (with `seq`), fans out to web subscribers via the §10 control+events channel.
+5. Agent process exits with status code → orchestrator emits `StatusChangeEvent{new_status}`. Done.
 
-### Run loop (per agent run)
+The agent-runner process inside the sprite is **stateless across runs**; warm caches live on the persistent filesystem (`/work/.cache`, `node_modules`, `.venv`).
 
-1. Receive `StartRun{run_id, task_id, repo_full_name, base_branch, prompt, follow_up: bool, user_token}` from orchestrator.
-2. `cd /work/<repo_full_name>/`. If missing (race): clone now.
-3. `git fetch origin` + `git checkout -B <work_branch> origin/<base_branch>` — the work branch is `vibe/task-{task_id_short}` for run 1, additional commits go on the same branch for follow-ups.
+### What the agent-runner does (per run, slice 6)
+
+1. Read `task_json` from argv: `{run_id, repo_full_name, base_branch, prompt, follow_up, user_token, tool_allowlist, agent_defaults}`.
+2. `cd /work/<repo_full_name>/`. If missing, clone now (slice 5b's reconciliation should make this rare).
+3. `git fetch origin` + `git checkout -B <work_branch> origin/<base_branch>` — work branch is `vibe/task-{task_id_short}`.
 4. Invoke the Claude Agent SDK with:
-   - System prompt from `agent_config.dev_agent` (templated with repo metadata, language, test command, and any in-repo `CLAUDE.md`)
-   - The user's `initial_prompt` (or `follow_up_prompt`)
-   - Tool allowlist: `read_file`, `write_file`, `apply_patch`, `run_shell` (sandboxed to `/work/<full_name>/`), `run_tests`
-   - Streaming callback emitting `*Event` messages over WS
-5. After the agent finishes (or a tool-budget cap hits): `git add -A && git commit -m "..."`, push to origin. On first run open a PR via githubkit; on follow-ups the PR auto-updates.
-6. Send `StatusChangeEvent{run_id, new_status: "completed"}`. Loop back to (1) for the next `StartRun`.
+   - System prompt from `agent_config.dev_agent` (templated with repo metadata, language, test command, in-repo `CLAUDE.md`).
+   - The user's `initial_prompt` (or `follow_up_prompt`).
+   - Tool allowlist: `read_file`, `write_file`, `apply_patch`, `run_shell` (jailed to `/work/<full_name>/`), `run_tests`.
+   - Streaming callback printing JSON-encoded `*Event` lines to stdout.
+5. After agent finish: `git add -A && git commit -m "..."`, push to origin. On first run, open a PR via githubkit; on follow-ups, the PR auto-updates.
+6. Print final `StatusChangeEvent{new_status: "completed"}` and exit 0.
 
-### Why long-lived
+### Why subprocess-per-run, not a long-lived daemon
 
-- Skip WS reconnect + `ClientHello` round-trip per task.
-- Keep warm caches: `node_modules`, `.venv`, downloaded test fixtures, `pip` and `pnpm` global stores.
-- Single bridge process can short-circuit clones: if `/work/<full_name>/` exists and `last_synced_at` is recent, skip the `git fetch`.
+- **Sprites Exec already handles disconnection / scrollback** ([python.md → Attach to Exec Session](sprites/v0.0.1-rc43/python.md)). Dropping the orchestrator-side connection mid-run does not kill the agent; we reattach on the next request and pick up the stream.
+- **State on disk is shared across runs** via the persistent filesystem; no need for a daemon to hold it in memory.
+- **Crash blast radius** is one run, not the whole sandbox. The next task spawns a fresh process.
+- **Provider abstraction stays clean** — `provider.exec_oneshot(handle, cmd, env)` is one Protocol method; a daemon would need a state-tracking sidecar that's harder to swap.
 
 ### Cross-repo runs (post-v1 hook)
 
-The bridge already has every connected repo on disk, so a future task model that names *multiple* repo paths in one run drops in cleanly: the agent's `read_file`/`write_file` tools accept any path under `/work/`, and the run-finalize step would push to N branches and open N PRs. Not in v1; the v1 task is single-repo and `run_shell` is jailed to one repo subdir.
+Filesystem has every connected repo under `/work/`, so a multi-repo task type drops in cleanly: the agent's `read_file`/`write_file` tools accept any path under `/work/`, and the run-finalize step pushes to N branches and opens N PRs. Not in v1; v1 task is single-repo and `run_shell` is jailed to the run's repo subdir.
 
-### Tools
+### Tools (slice 6)
 
-Tool implementations live in `apps/bridge/src/bridge/agent/tools/`. Each tool:
+Tool implementations live in `apps/bridge/src/bridge/agent/tools/` (the workspace name stays `bridge` for historical continuity even though there's no daemon). Each tool:
+
 - Takes typed args (Pydantic).
-- Emits a `ToolCallEvent` before execution, `ToolResultEvent` after.
+- Emits a `ToolCallEvent` before execution, `ToolResultEvent` after — both as JSON lines on stdout.
 - Has a budget check (`run_shell` capped at 5 minutes wall time, output truncated to 50 KB).
 - Path arguments are validated to live under the run's repo subdir; absolute paths and `..` traversal are rejected.
 
@@ -821,16 +793,16 @@ Tool implementations live in `apps/bridge/src/bridge/agent/tools/`. Each tool:
 
 ---
 
-## 15. Git workflow inside the bridge (slice 7)
+## 15. Git workflow inside the agent-runner (slice 7)
 
-- All git ops happen inside `/work/<repo_full_name>/`. The bridge sets `cwd` per command; never `cd`s globally (so concurrent runs in the future stay isolated).
-- Repo bootstrap (slice 4 onward, on `EnsureRepoCloned`): `git clone --filter=blob:none https://x-access-token:<user_token>@github.com/<full_name>.git /work/<full_name>` — partial clone for fast first-pull on big repos. Then `git remote set-url origin https://github.com/<full_name>.git` to scrub the token.
+- All git ops happen inside `/work/<repo_full_name>/`. Each `provider.exec_oneshot` call sets `dir` per command; never `cd`s globally (so concurrent runs in the future stay isolated).
+- Repo bootstrap (slice 5b clone op): `git clone --filter=blob:none https://x-access-token:<user_token>@github.com/<full_name>.git /work/<full_name>` — partial clone for fast first-pull on big repos. Then `git remote set-url origin https://github.com/<full_name>.git` to scrub the token.
 - Branch naming: `vibe/task-{slug}` where `slug` is 8 chars of the task id. Run 1 creates it; follow-up runs check it out and add commits.
-- Commit messages: agent generates them; bridge appends `Co-Authored-By: vibe-platform <bot@vibe.dev>`.
+- Commit messages: agent generates them; the agent-runner appends `Co-Authored-By: vibe-platform <bot@vibe.dev>`.
 - Push: HTTPS with the user's OAuth access token via `git -c http.extraheader="AUTHORIZATION: bearer <user_token>" push`. Token never written to `.git/config`.
 - PR creation: githubkit `repos.create_pull_request` against `default_branch`. Body includes a deep link back to the platform task page.
 - PR updates on follow-ups: just push more commits to the same branch — GitHub auto-updates the PR diff.
-- Disconnect path: `RemoveRepo` → `rm -rf /work/<full_name>/`. Other repos in `/work/` are untouched.
+- Disconnect path (slice 5b remove op): `provider.exec_oneshot(["rm", "-rf", "/work/<full_name>/"])`. Other repos in `/work/` are untouched.
 
 ---
 
@@ -910,12 +882,11 @@ Before considering work done: `pnpm typecheck && pnpm lint && pnpm test`.
 | `AUTH_SECRET` | orchestrator | 1 |
 | `GITHUB_OAUTH_CLIENT_ID` | orchestrator | 1 |
 | `GITHUB_OAUTH_CLIENT_SECRET` | orchestrator | 1 |
-| `GITHUB_APP_ID` | orchestrator + bridge | 2 |
-| `GITHUB_APP_PRIVATE_KEY` | orchestrator + bridge | 2 |
-| `GITHUB_APP_WEBHOOK_SECRET` | orchestrator | 2 |
-| `SPRITES_API_KEY` | orchestrator | 4 |
-| `ANTHROPIC_API_KEY` | bridge | 6 |
-| `S3_ENDPOINT`, `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` | orchestrator | 8 |
+| `SANDBOX_PROVIDER` | orchestrator (sprites \| mock; default `sprites`) | 4 |
+| `SPRITES_TOKEN` | orchestrator (required when `SANDBOX_PROVIDER=sprites`) | 4 |
+| `SPRITES_BASE_URL` | orchestrator (default `https://api.sprites.dev`) | 4 |
+| `ANTHROPIC_API_KEY` | agent-runner subprocess (passed via Sprites Exec env) | 6 |
+| `S3_ENDPOINT`, `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` | orchestrator | 10 |
 | `ORCHESTRATOR_PORT` | orchestrator | scaffold |
 | `WEB_BASE_URL` | orchestrator (CORS, redirects) | scaffold |
 | `ORCHESTRATOR_BASE_URL` | orchestrator (callback URL) | scaffold |
@@ -957,61 +928,63 @@ Sign-in flow + `User`/`Session` collections + protected route convention. Accept
 **Risk:** filename heuristics miss frameworks that need real file contents (e.g., test command in `package.json` `scripts.test`). Start with tree-based detection; fall back to fetching the manifest blob when the tree match is ambiguous.
 **Acceptance:** connecting a known TS repo populates `primary_language="TypeScript"`, `package_manager="pnpm"`, `test_command="pnpm test"`. Re-introspection updates the row.
 
-### Slice 4 — Sandbox provisioning (the box exists)
+### Slice 4 — Sandbox provisioning (the box exists) ✅ shipped
 
-**Scope-narrow rewrite.** This slice ends at "the box exists, REST endpoints work, idle-hibernation works." It does **not** include WS, bridge runtime, cloning, or reconciliation — those need WS, which lands in slice 5.
+**Scope-narrow.** This slice ends at "the box exists, REST endpoints work, mock + Sprites providers behind one Protocol." It does **not** include cloning, reconciliation, exec, or PTY — those land in 5b/6/8.
 
-**Adds:** `FlySpritesProvider` implementing the `SandboxProvider` Protocol; `Sandbox` Mongo collection (one per user enforced at the orchestrator routing layer, NOT at the index — see §4 forward-compat note); Redis hash for hot state (`sandbox:{id} → {sprite_id, status, last_active_at}` — no queue yet, no active_run); REST endpoints `POST /api/sandboxes`, `GET /api/sandboxes`, `POST /api/sandboxes/{id}/wake`, `POST /api/sandboxes/{id}/hibernate`, `POST /api/sandboxes/{id}/destroy` (all parameterized by id from day one); idle-hibernation job (no active-run check yet — purely time-based for now); deterministic naming `vibe-sbx-{sandbox_id}` with the destroy/respawn collision strategy resolved (see §19 #14).
-**Files:** `python_packages/sandbox_provider/src/sandbox_provider/sprites.py`; orchestrator `services/sandbox_manager.py`; `routes/sandbox.py`; `jobs/hibernate_idle.py`.
-**Risks:** Sprites SDK churn (pin version explicitly — see §19 #9); Sprite naming collisions; per-Sprite cost (cap CPU/RAM/disk early — see §16); Sandbox doc creation timing (lazy on first `POST /api/sandboxes`, not eager at signup, to avoid orphaned docs).
-**Acceptance:** for a fresh user with zero repos, `POST /api/sandboxes` creates a `Sandbox` doc with `status="none"` (or spawns immediately, depending on the brief's call). `POST /api/sandboxes/{id}/wake` calls `provider.spawn`, the Sprite enters `running` in Fly, `Sandbox.status="running"` in Mongo. `POST /api/sandboxes/{id}/hibernate` flips `Sandbox.status="hibernated"`. Idle-hibernation job hibernates a `running` sandbox after 10 minutes of no `last_active_at` updates. `POST /api/sandboxes/{id}/destroy` removes the Sprite and flips status to `destroyed`; existing `Repo` rows for the user are untouched.
-**Out of scope:** any WS endpoint, any bridge runtime work, any cloning, any reconciliation, `Repo.sandbox_id` binding logic. Connect endpoint (slice 2) is unchanged — `clone_status` stays `pending`.
+**Adds:** `SpritesProvider` (real `sprites-py` SDK) and `MockSandboxProvider` behind the `SandboxProvider` Protocol. Opaque `SandboxHandle(provider, payload: dict[str, str])` so the backend stays swappable. `Sandbox` Mongo collection (one alive per user enforced at the routing layer, NOT at the index — see §4 forward-compat note). Redis hash for hot state (`sandbox:{id} → {status, public_url, last_active_at}`, 90s TTL — no queue yet). REST endpoints `POST /api/sandboxes`, `GET /api/sandboxes`, `POST /api/sandboxes/{id}/wake`, `.../refresh`, `.../reset`, `.../destroy`. **No `hibernate` endpoint** — Sprites auto-hibernates after idle, no force-pause API exposed.
+**Files:** `python_packages/sandbox_provider/src/sandbox_provider/{sprites.py,mock.py,interface.py}`; orchestrator `services/sandbox_manager.py`, `routes/sandbox.py`, `lib/provider_factory.py`, `lib/redis_client.py`.
+**Risks:** Sprites SDK rc-only (rc37 on PyPI, rc43 docs at [docs/sprites/v0.0.1-rc43/python.md](sprites/v0.0.1-rc43/python.md); workspace pyproject sets `[tool.uv] prerelease = "allow"` so rc resolves); silent provider fallback (forbidden — empty `SPRITES_TOKEN` aborts startup); reset semantics (slice 4 uses sequential destroy+create; slice 5b switches to checkpoints).
+**Acceptance:** `POST /api/sandboxes` creates a `Sandbox` doc and immediately calls `provider.create()`; the sprite shows up `warm` with a public URL right away. `wake` issues a no-op exec to force `cold→running`. `refresh` resyncs status from the provider. `reset` rotates `provider_handle.id` on the same `Sandbox._id`, increments `reset_count`, returns the sandbox to `warm`. `destroy` marks the doc `destroyed`; user must re-`POST /api/sandboxes` to provision a new one (new `_id`).
+**Out of scope:** WS endpoints (5a), cloning (5b), agent runs (6), PTY/file ops (8 — though Sprites already covers most of it, see §18 below).
 
-### Slice 5 — WebSocket transport + bridge runtime + reconciliation (the wire works, clones land)
+### Slice 5a — Web ↔ orchestrator WS (control + events)
 
-This slice carries the load. It lands the entire wire protocol from §10, the long-lived bridge runtime from §14, and per-sandbox clone reconciliation. Big slice but cohesive: after slice 5, repos are warm-cloned in `/work/`.
+The bridge↔orchestrator WS leg is **gone** — Sprites' SDK is outbound-driven. Only the web↔orchestrator WS remains.
 
-#### Slice 5a — Control + events WS
+**Adds:** `/ws/web/tasks/{task_id}` (Pydantic discriminated unions per §10.4); `seq`-replay from Mongo via `Resume{after_seq}`; 30s/90s `Ping`/`Pong`; web-side reconnect loop with jittered backoff. Redis pub/sub for cross-instance event fan-out (`task:{task_id}` channel) so two orchestrator instances streaming the same agent run can both forward events to their local web subscribers.
+**Files:** `apps/orchestrator/src/orchestrator/ws/web.py` (handler); `python_packages/shared_models/wire_protocol/` (message types + TS codegen).
+**Risks:** keeping schemas in sync — codegen runs on schema change. Cross-instance fan-out via Redis pub/sub must not become the source of truth (Mongo stays canonical; pub/sub is the live broadcast channel).
+**Acceptance:** with no real agent yet, an internal-only test event posted to a fake `Task` shows up on a web subscriber connected to `/ws/web/tasks/{task_id}`. Disconnect the web client mid-stream → reconnect with `Resume{after_seq}` → catches up. Spin up two orchestrator instances; web client on instance A sees an event published by instance B.
 
-**Adds:** WS server in orchestrator: `/ws/web/tasks/{task_id}` and `/ws/bridge/sandboxes/{sandbox_id}` (control + events channel only — see §10.2). Pydantic discriminated unions in `python_packages/shared_models/wire_protocol/` covering the §10.4–§10.6 message types. Bridge token issuance + verification (rotated on every wake; see §19 #10). Bridge `__main__.py` becomes a real long-lived WS client: dial-home, `ClientHello`, `Heartbeat`, replay-on-reconnect via `seq`, exponential-backoff reconnect loop (§10.8). Sticky-by-sandbox routing via `fly-replay` headers + Redis pub/sub fallback for cross-instance (§10.9). Backpressure rules from §10.8.
-**Files:** `apps/orchestrator/src/orchestrator/ws/` (handlers, registry, sticky routing helpers); `apps/bridge/src/bridge/lifecycle/` (boot, dial-home, reconnect loop); `python_packages/shared_models/wire_protocol/` (message types + codegen for TS).
-**Risks:** keeping wire schemas in sync between Pydantic and TS — codegen step on schema change. Sticky routing is the load-bearing operational invariant — a regression here means cross-talk, not just slowness; integration test it explicitly with two orchestrator instances behind a fake LB.
-**Acceptance:** spawned Sprite dials home; `Sandbox.bridge_version` populates; `Heartbeat` updates `last_active_at` every 30s; `ClientHello` is acked with `ServerHello`; killing the bridge process triggers the reconnect loop and a fresh `ClientHello` arrives. Killing the orchestrator instance routing a sandbox triggers `fly-replay` to land the bridge on a new instance, replay catches the web subscriber up via `seq`.
+### Slice 5b — Cloning + reconciliation
 
-#### Slice 5b — Reconciliation + clone
-
-**Adds:** `EnsureRepoCloned` / `RemoveRepo` directives + bridge handlers that clone into `/work/<full_name>/` using a per-repo install token minted at directive time (see §19 #12). Reconciliation logic on `ClientHello`: orchestrator diffs `Repo` rows where `sandbox_id == this.sandbox_id` against the bridge's reported `cloned_repos`, issues directives until convergent. Connect endpoint (slice 2) gains a clone enqueue when the user's sandbox is up; sets `Repo.sandbox_id` to the user's singleton sandbox id; `clone_status` flips `pending → cloning → ready`. Disconnect endpoint issues `RemoveRepo`. Disk-cap + eviction job (§16, §19 #15).
-**Files:** `apps/bridge/src/bridge/clones/` (clone helpers, all path-scoped to `/work/<full_name>/`); `apps/orchestrator/src/orchestrator/services/reconciliation.py`; `apps/orchestrator/src/orchestrator/jobs/disk_eviction.py`.
-**Risks:** reconciliation correctness — test the four-quadrant matrix explicitly (see §19 #13). Token leakage in `.git/config` — extraheader at command time, never persist (§19 #12). Race between connect and bridge boot — `EnsureRepoCloned` queued in Mongo until next `ClientHello`.
-**Acceptance:** connect three repos against a running sandbox; all three end up cloned to `/work/<full_name>/`, `clone_status="ready"`, `Repo.sandbox_id` populated. Disconnect one → directory removed, row deleted. Force-restart the bridge → `ClientHello` reports two cloned repos, no directives issued (already convergent). Manually `rm -rf /work/<full_name>/` inside the Sprite + restart bridge → reconciliation issues `EnsureRepoCloned`, repo re-clones.
+**Adds:** Provider widening — `fs_list`, `fs_read`, `fs_write`, `exec_oneshot` on `SandboxProvider` (Sprites impl wraps the SDK; mock implements an in-memory FS sufficient for tests). On connect-repo, orchestrator calls `provider.exec_oneshot(handle, ["git", "clone", ...], env={GITHUB_TOKEN: ...})` to clone into `/work/<full_name>/`. After successful clone+install, **create a `clean` checkpoint** via `provider.snapshot(handle, comment="clean")`. Reset switches to `provider.restore(handle, "clean")` instead of destroy+create — milliseconds, repo state preserved, see [python.md → Checkpoints](sprites/v0.0.1-rc43/python.md). Reconciliation: orchestrator periodically calls `provider.fs_list(handle, "/work")` and diffs against `Repo` rows where `sandbox_id == this`; issues clone/remove ops to converge.
+**Files:** `python_packages/sandbox_provider/src/sandbox_provider/{sprites.py,mock.py}` (widen the impls); `apps/orchestrator/src/orchestrator/services/reconciliation.py`.
+**Risks:** install-token leakage in `.git/config` (set `extraheader` at command time, never persist — see §19 #12); race between connect-repo and sandbox provision (queue clone op in Mongo until sandbox is `warm` or `running`); clone retries when sprite is `cold` (Sprites auto-warms on exec, so this just-works).
+**Acceptance:** connect three repos against a running sandbox → all three end up cloned to `/work/<full_name>/`, `clone_status="ready"`, `Repo.sandbox_id` populated. After clone+install, a `clean` checkpoint exists. Reset → restore_checkpoint → repos still present, working trees clean. Disconnect one → directory removed via `provider.exec_oneshot(["rm", "-rf", path])`, row deleted.
 
 ### Slice 6 — Tasks + Agent SDK invocation
-**Adds:** `Task` + `AgentRun` + `AgentEvent` collections; task creation (against any connected repo) + follow-up endpoints; orchestrator queues runs into the user's sandbox (one active at a time per sandbox, queue depth surfaced in UI); bridge's real agent loop (`cd /work/<full_name>`, branch, Agent SDK with tool allowlist, stream events); web task page (chat, event stream, status, repo picker).
-**Files:** `apps/orchestrator/src/orchestrator/routes/tasks.py`; `apps/bridge/src/bridge/agent/` (agent invocation + tools); `python_packages/agent_config/dev_agent/` (system prompts).
-**Risks:** agent tool budgets and tight loops; cost cap per run; ensuring `run_shell` truly stays inside the *correct* repo subdir for the run (not the sandbox root); queue starvation if a single run loops forever.
-**Acceptance:** with two connected repos, filing "add a top-level `HELLO.md` saying hi" against repo A produces `AgentEvent`s, a commit on a new branch *in repo A only*, and a `StatusChangeEvent("completed")`. `/work/<repo_b>/` is untouched. Filing a second task while the first is running queues; queue depth shows in the UI.
+
+**Adds:** `Task` + `AgentRun` + `AgentEvent` collections; task creation + follow-up endpoints; orchestrator queues runs into the user's sandbox (one active at a time, queue depth surfaced in UI); orchestrator invokes `provider.exec_oneshot(handle, ["python", "-m", "agent_runner", task_json])` and parses JSON-lines from stdout into `AgentEvent` records. Web task page (chat, event stream, status, repo picker).
+**Files:** `apps/orchestrator/src/orchestrator/routes/tasks.py`, `services/task_runner.py`; `apps/bridge/src/bridge/agent/` (agent-runner subprocess code that ships in the sprite image — see §14); `python_packages/agent_config/dev_agent/` (system prompts).
+**Risks:** agent tool budgets and tight loops; cost cap per run; ensuring `run_shell` stays inside the *correct* repo subdir; queue starvation if a single run loops forever.
+**Acceptance:** with two connected repos, "add a top-level `HELLO.md` saying hi" against repo A produces `AgentEvent`s, a commit on a new branch *in repo A only*, and `StatusChangeEvent("completed")`. `/work/<repo_b>/` is untouched. Second task while the first is running queues; queue depth shows in the UI.
 
 ### Slice 7 — Git ops + PR creation
-**Adds:** `git push` + `repos.create_pull_request` via githubkit; PR URL surfaced in `Task` + UI; subsequent follow-ups push more commits to the same branch in the same repo subdir.
-**Files:** `apps/bridge/src/bridge/git/` (push helpers, all path-scoped to `/work/<full_name>/`); `apps/bridge/src/bridge/agent/finalize.py` (post-agent push + PR open).
-**Risk:** auth token leakage in `.git/config` — set extraheader at command time, never persist. Different repos in the same sandbox can have different installation tokens (different orgs); the orchestrator must mint per-repo tokens at `StartRun` time and pass them in the `StartRun` message, not at sandbox spawn.
+
+**Adds:** `git push` + `repos.create_pull_request` via githubkit (run inside the agent-runner subprocess, not the orchestrator); PR URL surfaced on `Task` + UI; follow-ups push more commits to the same branch in the same repo subdir.
+**Files:** `apps/bridge/src/bridge/git/` (push helpers, path-scoped to `/work/<full_name>/`); `apps/bridge/src/bridge/agent/finalize.py` (post-agent push + PR open).
+**Risk:** auth-token leakage in `.git/config` — extraheader at command time, never persist. Different repos in the same sandbox can have different installation tokens (different orgs); orchestrator mints per-repo tokens at task-start time and passes them in the agent-runner's `task_json`, not at sandbox provision.
 **Acceptance:** the slice 6 task ends with a real PR opened against the connected repo, linked from the task page. A follow-up message produces a second commit on the same PR.
 
-### Slice 8 — Interactive coding surface (PTY + file ops)
+### Slice 8 — Interactive coding surface (PTY + file ops via Sprites)
 
-**New slice — splits "interactive user actions" out of the agent-run loop.** After slice 7 the agent can ship PRs; this slice gives the user the direct-interaction surface that makes the product feel like an editor: open a terminal, edit a file, see live agent edits as they happen.
+**Most of this is already done by Sprites.** This slice surfaces it through the orchestrator with auth.
 
-**Adds:** PTY WS endpoints `/ws/web/sandboxes/{id}/pty/{terminal_id}` + `/ws/bridge/sandboxes/{id}/pty/{terminal_id}` (binary, separate connections per §10.2). Bridge-side PTY spawn (`pty.openpty()` + subprocess in the relevant repo subdir). Web-side xterm.js terminal component. File ops REST endpoints (`GET/PUT /api/sandboxes/{id}/fs?path=...`) with bridge-side handlers. Live `FileEditEvent` stream from the agent's edits, surfaced in a diff view in the web task page (coalesced ≤4 Hz per path per §10.8).
-**Files:** `apps/orchestrator/src/orchestrator/ws/pty.py`, `routes/sandbox_fs.py`; `apps/bridge/src/bridge/pty/`; `apps/web/src/components/Terminal.tsx`, `FileEditor.tsx`.
-**Risks:** PTY back-pressure under bursty logs (drop frames per §10.8); path-traversal in file-ops (validate all paths under `/work/<full_name>/`); large file uploads (cap at 10 MB per request, stream); terminal scrollback expectations (we don't replay PTY history — document this).
-**Acceptance:** open a terminal on a connected repo's subdir; type `pnpm test`, see streaming output at sub-100ms latency; close the tab and reopen — terminal is fresh (no scrollback). Open a file, edit it in the web editor, save → roundtrip works and is reflected on disk in the Sprite. Run an agent task that edits a file → live diff streams to the open file editor.
+**Adds:** PTY WS broker `/ws/web/sandboxes/{id}/pty/{terminal_id}` — orchestrator opens a Sprites Exec WSS (`tty=True`) and pipes bytes both ways. Reattach via `Attach to Exec Session` (Sprites' built-in scrollback) when the FE drops + reconnects. File ops REST endpoints `GET/PUT /api/sandboxes/{id}/fs?path=...` — thin auth wrapper over Sprites' Filesystem API. Live `FileEditEvent` stream from a single Sprites `fs/watch` WSS subscription per active sandbox (orchestrator-side); coalesced ≤4 Hz per path before fanning out.
+**Files:** `apps/orchestrator/src/orchestrator/ws/pty.py` (broker), `routes/sandbox_fs.py` (REST wrapper), `services/file_watcher.py` (single Sprites subscription, web fan-out); `apps/web/src/components/Terminal.tsx` (xterm.js).
+**Risks:** PTY back-pressure under bursty logs (drop frames per §10.6); path-traversal in file-ops (validate all paths under `/work/<full_name>/`); large file uploads (cap at 10 MB per request, stream).
+**Acceptance:** open a terminal on a connected repo's subdir; type `pnpm test`, see streaming output at sub-100ms latency. Close the tab + reopen → orchestrator re-attaches to the same Sprites session, scrollback shows up. Run an agent task that edits a file → live diff streams to an open file editor.
 
-### Slice 9 — HTTP preview proxy
+### Slice 9 — HTTP preview (use Sprites' built-in URL)
 
-**Adds:** subdomain-based HTTP forwarder so a dev server running inside a Sprite at `localhost:3000` is reachable at `https://sandbox-{id}.preview.<domain>/...` from the user's browser. Auth-gated (only the sandbox's owner can reach the preview). Falls back to the orchestrator on demand for sandboxes whose Sprites aren't directly reachable from the public internet.
-**Files:** `apps/orchestrator/src/orchestrator/routes/preview.py` (proxy handler); a small DNS / Fly route shim.
-**Risks:** secrets in dev-server output; CSP/iframe issues if we want to embed the preview in our UI; cookie-domain leakage. Probably ship preview-in-new-tab first, embed later.
-**Acceptance:** user runs `pnpm dev` in a sandbox terminal; clicks "Open preview" in the UI; new tab loads the dev server on the preview subdomain.
+**No proxy to build.** Sprites already gives every sandbox `https://{name}-{org}.sprites.app`. Slice 9 is just surfacing it correctly.
+
+**Adds:** UI affordance "Open preview" linking to `Sandbox.public_url`. Auth posture configurable via `provider.update_url_settings(handle, auth="sprite"|"public")`; default is `"sprite"` (requires the user's Sprites session). Optional: an orchestrator-side redirect at `/api/sandboxes/{id}/preview` that 302s to the URL, so we control link sharing centrally.
+**Files:** `apps/web/src/components/SandboxPanel.tsx` (already exposes the URL; widen with explicit "Open preview" button).
+**Risks:** secrets in dev-server output; CSP/iframe issues if we want to embed in our UI; cookie-domain leakage. Ship preview-in-new-tab first; embed later.
+**Acceptance:** user runs `pnpm dev` in a sandbox terminal; clicks "Open preview"; new tab loads the dev server on the Sprites URL.
 
 ### Slice 10 — Event log persistence (S3)
 
@@ -1042,41 +1015,51 @@ This slice carries the load. It lands the entire wire protocol from §10, the lo
 5. **`datetime.utcnow()`** — deprecated in Python 3.12, fails Pyright strict. Use `datetime.now(UTC)` via a `_now()` helper. ([engineering.md:99](engineering.md#L99))
 6. **DB shape vs API shape** — never reuse a Beanie `Document` as a FastAPI `response_model`. The split is intentional. ([engineering.md:33-38](engineering.md#L33-L38))
 7. **`pytest` event loop** — DB-touching tests must use the `httpx.AsyncClient + ASGITransport` fixture, not FastAPI's `TestClient`. ([TESTING.md:165](TESTING.md#L165))
-8. **Webhook delivery in local dev** — slice 2 needs a public URL for GitHub webhooks. Use smee.io or ngrok. Document in the slice 2 brief.
-9. **Sprites SDK pinning** — slice 4 should pin the Sprites SDK version explicitly; SDK churn is a known supply-chain risk on early-stage providers.
-10. **Bridge token (slice 5a)** — long-lived per sandbox, not per run. Rotate on every wake; bridge re-auths after every hibernate/resume. Treat as signed JWTs with TTL ≤ sandbox idle window.
-11. **Per-user sandbox = noisy-neighbor surface** — all of one user's tasks share one Sprite. v1 limits this to one active run at a time per sandbox (queue the rest). Hard cap Sprite CPU/RAM/disk early so a single user can't cost-spiral.
-12. **Multi-repo install token scoping** — different repos in the same sandbox can be on different GitHub App installations (different orgs). Mint **per-repo, per-run** install tokens at `StartRun` time; never share a token across repos or persist it on the sandbox disk.
-13. **Reconciliation correctness on `ClientHello`** — the diff between `Repo` rows where `sandbox_id == this.sandbox_id` and `cloned_repos` reported by the bridge must converge: missing on disk → `EnsureRepoCloned`; on disk but not bound to this sandbox → `RemoveRepo`. Reconciliation is per-sandbox, never per-user. Test the four-quadrant matrix explicitly in slice 4.
-14. **Sandbox name collisions** — `vibe-sbx-{user_id}` is deterministic; if `/api/sandbox/destroy` is called and a new spawn happens immediately, Sprites may still hold the old name. Either wait for full destroy or include a salt suffix; decide in slice 4.
-15. **`/work` quota and warm-cache bloat** — `node_modules` per repo plus `.venv` plus pip cache will grow. Slice 5b sets a per-sandbox disk cap and a `du`-based eviction job; don't ship without it or the first heavy user wedges their own sandbox.
+8. **Webhook delivery in local dev** — slice 2's GitHub redesign deleted webhooks; this risk is moot. Listed for historical context.
+9. **Sprites SDK is rc-only** — `sprites-py` ships only as `0.0.1rcN` versions on PyPI. Workspace pyproject sets `[tool.uv] prerelease = "allow"` so the resolver picks them up. rc43 docs at [docs/sprites/v0.0.1-rc43/python.md](sprites/v0.0.1-rc43/python.md); rc37 is the current installable. Pin floor to whatever's been validated in tests.
+10. **Sprites token discipline** — `SPRITES_TOKEN` is server-side only; **never** flows to the FE. Orchestrator brokers all sprite traffic. Empty `SPRITES_TOKEN` with `SANDBOX_PROVIDER=sprites` aborts startup; CI must assert prod manifests don't carry `SANDBOX_PROVIDER=mock`.
+11. **Per-user sandbox = noisy-neighbor surface** — all of one user's tasks share one sprite. v1 limits to one active run at a time per sandbox (queue the rest). Sprites manages CPU/RAM/disk; if cost-spiral becomes real, contact Sprites about per-sprite limits.
+12. **Multi-repo install token scoping** — different repos in the same sandbox can be on different GitHub App installations (different orgs). Mint **per-repo, per-run** install tokens at task-start time and pass via the agent-runner's `task_json`; never share a token across repos or persist on the sandbox filesystem.
+13. **Reconciliation correctness (slice 5b)** — the diff between `Repo` rows where `sandbox_id == this.sandbox_id` and the sprite's `/work` listing (via `provider.fs_list`) must converge: missing on disk → clone; on disk but not bound to this sandbox → remove. Reconciliation is per-sandbox, never per-user. Test the four-quadrant matrix explicitly.
+14. **Sandbox name reuse on Reset** — `vibe-sbx-{sandbox_id}` is deterministic and reused across resets (same `Sandbox._id`). The `provider.destroy → provider.create` sequence in `SandboxManager.reset` is sequential, so Sprites finishes destroying the old sprite before the new one is created. Don't parallelize.
+15. **No disk-cap eviction yet** — Sprites manages storage; we don't run our own `du`-based eviction. If real users blow past the underlying quota, Reset (which clears the filesystem) is the escape hatch and slice 5b's `clean` checkpoint makes it cheap.
 
-16. **Transport choice — WS, not gRPC** — locked in §10.1. Don't reach for gRPC unless production telemetry shows ≥8 concurrent streaming channels per sandbox. The "obvious" gRPC win (HTTP/2 stream multiplexing) is dwarfed by the cost of running two type-bridge systems.
+16. **Transport choice — WS for the web leg only** — Sprites' SDK handles the orchestrator↔sandbox leg over WSS; we don't operate a custom protocol there. gRPC stays off the table for the web leg (browsers don't speak it natively, gRPC-Web is more cost than benefit). See §10.1.
 
-17. **One transport, multiple connections per concern** — control + events on a single WS; PTY on its own WS per terminal; file ops via REST. **Don't** multiplex PTY onto the control WS — head-of-line blocking on a 10 MB log will freeze keystrokes. See §10.2.
+17. **No incoming bridge connection** — there is no daemon inside the sandbox dialing back to us. The orchestrator drives sprites outbound via the SDK. Anything you read in older drafts about `ClientHello`, bridge tokens, or `/ws/bridge/...` is deleted; see §10 and §14.
 
-18. **Heartbeat is application-level, not TCP-level** — 30s `Ping`/`Pong` with `nonce` on every WS, 90s timeout. TCP keepalive only detects dead TCP, not dead app event loops. See §10.8.
+18. **PTY brokerage, not direct FE→Sprites** — orchestrator brokers the PTY WS so the FE never sees `SPRITES_TOKEN`. Use Sprites' `Attach to Exec Session` on reconnect to get scrollback replay. See §10.5.
 
-19. **Idempotent directives or pain** — every bridge-bound directive (`EnsureRepoCloned`, `RemoveRepo`, `StartRun`, `OpenPty`, `HibernateSandbox`) carries a `directive_id` and is safe to re-deliver after reconnect. The bridge tracks the last 100 it processed and returns the cached ack on duplicates. See §10.8.
+19. **Sprites Exec sessions persist across orchestrator restarts** — `max_run_after_disconnect` defaults to forever for TTY. After a restart, look up the active `session_id` from Mongo or Sprites' `list_sessions`, and re-attach instead of killing.
 
-20. **Sticky-by-sandbox routing is load-bearing** — at multi-instance scale, both the bridge for sandbox X and the web client(s) watching X must land on the same orchestrator instance. Use Fly `fly-replay` keyed on `sandbox_id` hash; Redis pub/sub on `sandbox:{id}` is the slow-path fallback only. Test with two orchestrator instances behind a fake LB. See §10.9.
+20. **Cross-instance event fan-out via Redis pub/sub** — at multi-orchestrator-instance scale, an active agent run is owned by one instance (it holds the Sprites Exec stream). Other instances with web subscribers on the same task pick up events via Redis pub/sub on `task:{task_id}`. Mongo retains the truth; pub/sub is the live broadcast channel. See §10.7.
 
-21. **Backpressure has explicit caps and an explicit drop policy** — orchestrator buffers ≤1000 events per (run, web subscriber); bridge buffers ≤5 MB pending events; PTY drops frames under back-pressure (terminals can drop, agent events can't because of `seq`-replay). Never grow buffers unbounded; alert on drops. See §10.8.
+21. **Backpressure caps + drop policy** — orchestrator buffers ≤1000 events per (run, web subscriber); PTY drops frames under back-pressure (terminals can drop, agent events can't because of `seq`-replay); file-watch coalesces by path at ≤4 Hz. Never grow buffers unbounded; alert on drops. See §10.6.
 
-22. **Reconnect backoff has jitter** — bridge: `1, 2, 4, 8, 16, 30, 30…` seconds with ±25%; web: `0.5, 1, 2, 4, 8, 16, 30…` with ±25%. Without jitter, an orchestrator restart causes a thundering-herd reconnect spike. See §10.8.
+22. **Reconnect backoff has jitter** — web reconnect: `0.5, 1, 2, 4, 8, 16, 30…` seconds with ±25%. Without jitter, an orchestrator restart causes a thundering-herd reconnect spike.
 
-23. **Capacity caps + hot-shedding** — each orchestrator instance soft-caps at 5000 WS connections. New sandbox spawns get 503 if no instance has headroom; existing connections aren't degraded. See §10.9.
+23. **Capacity caps + hot-shedding** — each orchestrator instance soft-caps at 5000 web WS + 200 active Sprites Exec sessions. New sandbox spawns get 503 if no instance has headroom; existing connections aren't degraded. See §10.7.
+
+24. **Reset preserves repo connections; Destroy doesn't preserve the `Sandbox` doc id** — `POST /api/sandboxes/{id}/reset` keeps `Sandbox._id` and `Repo.sandbox_id` references, just rotates `provider_handle`. `POST /api/sandboxes/{id}/destroy` marks the doc destroyed; the user's next `POST /api/sandboxes` creates a *new* doc with a *new* id, and slice 5b will re-bind `Repo.sandbox_id` accordingly.
 
 ---
 
-## 20. Status snapshot (as of 2026-05-01)
+## 20. Status snapshot (as of 2026-05-02)
 
 - **Slice 0** ✅ scaffolding shipped
 - **Slice 1** ✅ shipped (GitHub OAuth + user persistence)
 - **Slice 2** ✅ shipped (OAuth `repo` scope + repo connection)
 - **Slice 3** ✅ shipped (repo introspection — Trees + Contents detection, dev_command, per-field user overrides)
-- **Slice 4** ⬜ next — sandbox provisioning (the box exists; no WS yet)
-- **Slices 5a / 5b / 6 – 10** ⬜ not started; briefs to be authored slice-by-slice. Note the new split: §18 was rewritten on 2026-05-01 to peel transport+clone (slice 5a/5b) apart from provisioning (slice 4) and to add slice 8 (PTY + file ops) and slice 9 (HTTP preview proxy). The old slice 8 (event-log persistence) is now slice 10.
+- **Slice 4** 🟡 code shipped, awaiting sign-off (sandbox provisioning on Sprites SDK; opaque `SandboxHandle`; reset/destroy distinct; auto-hibernation delegated to Sprites)
+- **Slices 5a / 5b / 6 – 10** ⬜ not started; briefs to be authored slice-by-slice.
+
+**Plan rewrites on 2026-05-02** following the rc43 SDK docs:
+
+- §10 transport: dropped the bridge↔orchestrator WS leg (Sprites' SDK is outbound-only); web↔orchestrator WS is the only custom protocol.
+- §13 sandbox lifecycle: state machine maps onto Sprites' `cold | warm | running` enum directly; no idle-hibernation job; reset uses checkpoints (slice 5b).
+- §14 agent runtime: no daemon/long-lived bridge process; agent invoked per-run via Sprites Exec subprocess.
+- §18 slice plan: 5a is web-WS-only; 5b adds clone+reconciliation+checkpoints; 8 (PTY + file ops) is mostly Sprites already; 9 (HTTP preview) collapses to surfacing Sprites' built-in URL.
+- §19 risks: replaced bridge-WS-specific gotchas with Sprites SDK realities.
 
 Repo metrics (from latest [`/graphify`](../graphify-out/GRAPH_REPORT.md) run, 2026-05-01): **107 files (~75k words) · 443 nodes · 633 edges · 89 communities**. Extraction quality: 76% EXTRACTED · 24% INFERRED (avg confidence 0.71) · 0% AMBIGUOUS. Top community hubs reflect the shipped slices 0–3: *Repo Introspection Architecture / Tests*, *Command Detection*, *Package Manager Detection*, *Primary Language Detection*, *FastAPI App & Health*, *GitHub OAuth Wrapper*, *Mongo Lifecycle & Collections*, *Repo Models & Sandbox API*, *Type Bridges (Pydantic→TS)*, *Frontend Repo API Client / Query Hooks*, *Project Docs & Slice Discipline*, *Risks & Gotchas*. Use `/graphify --update` (incremental, cheap) after every shipped slice; full rebuild only when the user asks. See [AGENTS.md §2.7](../AGENTS.md) for query workflow and verification rules.
 
@@ -1084,10 +1067,11 @@ Repo metrics (from latest [`/graphify`](../graphify-out/GRAPH_REPORT.md) run, 20
 
 ## 21. Concrete next steps (do these in order)
 
-1. **Close slice 1 verification** — punch list under §18 / Slice 1.
-2. **Author `slice2.md`** following the same shape as [slice1.md](slice/slice1.md): context, scope, what to build, hard rules, acceptance criteria, when-done summary template.
-3. **Register the GitHub App** (manual) on GitHub developer settings; copy `GITHUB_APP_ID`, generate and store the private key, set the webhook secret. Add to `.env`.
-4. **Implement slice 2** per the brief.
-5. Repeat for slices 3 → 8.
+1. **Sign off slice 4** — exercise the dashboard with `SANDBOX_PROVIDER=mock` end-to-end, then with a real `SPRITES_TOKEN`. Brief at [slice/slice4.md](slice/slice4.md). After sign-off, freeze the brief; corrections move to [progress.md](progress.md).
+2. **Author `slice5a.md`** — web↔orchestrator WS for control + events; cross-instance fan-out via Redis pub/sub. Use the slice 4 brief structure.
+3. **Implement slice 5a**, ship, sign off.
+4. **Author `slice5b.md`** — clone + reconciliation + checkpoint-based Reset; Provider Protocol widens with `fs_*` and `exec_*`.
+5. **Implement slice 5b.** After this, repos are warm-cloned in `/work/` and a `clean` checkpoint exists per sandbox.
+6. Repeat author-then-ship for slices 6 → 10.
 
-Do **not** start slice 2 implementation before the brief exists and the user reviews it. The hard rule from [slice1.md:665](slice/slice1.md#L665) — "do not start the next task automatically" — applies for every slice transition.
+Do **not** start slice N+1 implementation before the slice N brief is signed off and the slice N+1 brief is reviewed. Hard rule from every prior slice brief — "do not start the next task automatically" — applies for every slice transition.

@@ -7,6 +7,9 @@ resolution-markers = [
     "python_full_version < '3.13'",
 ]
 
+[options]
+prerelease-mode = "allow"
+
 [manifest]
 members = [
     "agent-config",
@@ -1548,10 +1551,14 @@ version = "0.1.0"
 source = { editable = "python_packages/sandbox_provider" }
 dependencies = [
     { name = "pydantic" },
+    { name = "sprites-py" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "pydantic", specifier = ">=2.9" }]
+requires-dist = [
+    { name = "pydantic", specifier = ">=2.9" },
+    { name = "sprites-py", specifier = ">=0.0.1rc37" },
+]
 
 [[package]]
 name = "sentry-sdk"
@@ -1602,6 +1609,19 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/a2/87/a6771e1546d97e7e041b6ae58d80074f81b7d5121207425c964ddf5cfdbd/sniffio-1.3.1.tar.gz", hash = "sha256:f4324edc670a0f49750a81b895f35c3adb843cca46f0530f79fc1babb23789dc", size = 20372, upload-time = "2024-02-25T23:20:04.057Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/e9/44/75a9c9421471a6c4805dbf2356f7c181a29c1879239abab1ea2cc8f38b40/sniffio-1.3.1-py3-none-any.whl", hash = "sha256:2f6da418d1f1e0fddd844478f41680e794e6051915791a034ff65e5f100525a2", size = 10235, upload-time = "2024-02-25T23:20:01.196Z" },
+]
+
+[[package]]
+name = "sprites-py"
+version = "0.0.1rc37"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "httpx" },
+    { name = "websockets" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/88/cd/24bbca8438fdc8a89e3365b927b20f511e1c4529a8574ea252e967f8071c/sprites_py-0.0.1rc37.tar.gz", hash = "sha256:2fc58aa80a9a99c1a12cb17725d13675d5e25dc2a33f245f21486473aede05b9", size = 35226, upload-time = "2026-02-19T21:38:51.643Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b6/8b/87c87887ae3bde72425134efea163fdbdef610765a8db7244c7b4adeab46/sprites_py-0.0.1rc37-py3-none-any.whl", hash = "sha256:d032b0059e2881b16a35349c0f01adafa99143671103a43a79d7e39a0c1ef6c9", size = 39424, upload-time = "2026-02-19T21:38:49.9Z" },
 ]
 
 [[package]]

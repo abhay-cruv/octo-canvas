@@ -11,6 +11,7 @@ from shared_models.introspection import (
     PackageManager,
     RepoIntrospection,
 )
+from shared_models.sandbox import ProviderName, SandboxResponse, SandboxStatus
 from shared_models.user import UserResponse
 
 __all__ = [
@@ -20,6 +21,9 @@ __all__ = [
     "ConnectedRepo",
     "IntrospectionOverrides",
     "PackageManager",
+    "ProviderName",
     "RepoIntrospection",
+    "SandboxResponse",
+    "SandboxStatus",
     "UserResponse",
 ]

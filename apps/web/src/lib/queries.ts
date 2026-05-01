@@ -57,3 +57,12 @@ export const connectedReposQueryOptions = queryOptions({
     return data ?? [];
   },
 });
+
+export const sandboxesQueryOptions = queryOptions({
+  queryKey: ['sandboxes'],
+  queryFn: async () => {
+    const { data, error } = await api.GET('/api/sandboxes');
+    if (error) throw error;
+    return data ?? [];
+  },
+});

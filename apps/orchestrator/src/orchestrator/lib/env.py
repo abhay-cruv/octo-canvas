@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -22,6 +23,15 @@ class Settings(BaseSettings):
     github_oauth_client_id: str = Field(alias="GITHUB_OAUTH_CLIENT_ID")
     github_oauth_client_secret: str = Field(alias="GITHUB_OAUTH_CLIENT_SECRET")
     orchestrator_base_url: str = Field(alias="ORCHESTRATOR_BASE_URL")
+
+    # Sandbox provisioning (slice 4) — uses Sprites SDK; resources, regions,
+    # idle hibernation, and bridge image are all managed by Sprites itself.
+    sandbox_provider: Literal["sprites", "mock"] = Field(
+        default="sprites", alias="SANDBOX_PROVIDER"
+    )
+    sprites_token: str = Field(default="", alias="SPRITES_TOKEN")
+    sprites_base_url: str = Field(default="https://api.sprites.dev", alias="SPRITES_BASE_URL")
+    redis_url: str = Field(default="redis://localhost:6379", alias="REDIS_URL")
 
     @property
     def is_production(self) -> bool:

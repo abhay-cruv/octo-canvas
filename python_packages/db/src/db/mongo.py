@@ -28,7 +28,7 @@ from pymongo.errors import PyMongoError
 
 from db.collections import ALL as ALL_COLLECTIONS
 from db.collections import Collections
-from db.models import Repo, Session, User
+from db.models import Repo, Sandbox, Session, User
 
 __all__ = ["ALL_COLLECTIONS", "Collections", "Mongo", "connect", "disconnect", "mongo"]
 
@@ -40,7 +40,7 @@ _logger = structlog.get_logger("db")
 _DEFAULT_DB_NAME = "vibe_platform"
 
 # Every Beanie Document must appear here or it silently fails to query.
-_DOCUMENT_MODELS: list[type] = [User, Session, Repo]
+_DOCUMENT_MODELS: list[type] = [User, Session, Repo, Sandbox]
 
 
 def _database_name(uri: str) -> str:
@@ -88,6 +88,10 @@ class Mongo:
     @property
     def repos(self) -> "AsyncCollection[dict[str, object]]":
         return self.db[Collections.REPOS]
+
+    @property
+    def sandboxes(self) -> "AsyncCollection[dict[str, object]]":
+        return self.db[Collections.SANDBOXES]
 
     def collection(self, name: str) -> "AsyncCollection[dict[str, object]]":
         """Escape hatch for migrations / one-off scripts that need to touch a

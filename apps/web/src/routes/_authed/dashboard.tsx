@@ -13,6 +13,7 @@ import {
   reintrospectRepo,
   updateIntrospectionOverrides,
 } from '../../lib/repos';
+import { SandboxPanel } from '../../components/SandboxPanel';
 
 export const Route = createFileRoute('/_authed/dashboard')({
   component: DashboardPage,
@@ -91,7 +92,9 @@ function DashboardPage() {
           {me.needs_github_reauth ? (
             <ReconnectCard />
           ) : (
-            <ReposCenter
+            <>
+              <SandboxPanel />
+              <ReposCenter
               repos={connected.data ?? null}
               isLoading={connected.isLoading}
               onDisconnect={(id) => disconnectMutation.mutate(id)}
@@ -113,6 +116,7 @@ function DashboardPage() {
                   : null
               }
             />
+            </>
           )}
         </div>
       </main>

@@ -5,19 +5,46 @@ from db import mongo
 from fastapi import FastAPI, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from sandbox_provider import SpritesProvider
 
 from .lib.env import settings
 from .lib.logger import logger
-from .routes import auth, me, repos
+from .lib.provider_factory import build_sandbox_provider
+from .lib.redis_client import redis_client
+from .routes import auth, me, repos, sandbox
+from .services.sandbox_manager import SandboxManager
 
 
 @asynccontextmanager
-async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
+async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     await mongo.connect(settings.mongodb_uri)
+
+    # Redis is optional in slice 4 — failures are logged but don't kill the
+    # orchestrator; the manager's redis_write helpers tolerate `None`.
+    redis_handle = None
+    try:
+        await redis_client.connect(settings.redis_url)
+        redis_handle = redis_client.client
+    except Exception as exc:
+        logger.warning("redis.connect_failed", url=settings.redis_url, error=str(exc))
+
+    provider = build_sandbox_provider()
+    manager = SandboxManager(provider=provider, redis=redis_handle)
+    app.state.sandbox_manager = manager
+    app.state.sandbox_provider = provider
+
     logger.info("orchestrator.startup_complete")
+
     try:
         yield
     finally:
+        if isinstance(provider, SpritesProvider):
+            try:
+                await provider.aclose()
+            except Exception as exc:
+                logger.warning("provider.close_failed", error=str(exc))
+
+        await redis_client.disconnect()
         await mongo.disconnect()
         logger.info("orchestrator.shutdown_complete")
 
@@ -35,6 +62,7 @@ app.add_middleware(
 app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
 app.include_router(me.router, prefix="/api", tags=["me"])
 app.include_router(repos.router, prefix="/api/repos", tags=["repos"])
+app.include_router(sandbox.router, prefix="/api/sandboxes", tags=["sandboxes"])
 
 
 @app.get("/health")

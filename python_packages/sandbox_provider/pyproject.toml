@@ -4,7 +4,11 @@ version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
     "pydantic>=2.9",
-    # TODO: add the Sprites SDK dependency in the sandbox slice.
+    # Sprites SDK — installed via --pre because rc tags don't satisfy the
+    # default resolver. rc43 docs in docs/sprites/v0.0.1-rc43/python.md describe the
+    # API; rc37 (latest on PyPI as of 2026-05-01) has the same surface for
+    # everything slice 4 touches.
+    "sprites-py>=0.0.1rc37",
 ]
 
 [build-system]

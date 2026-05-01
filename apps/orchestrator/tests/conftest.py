@@ -10,11 +10,15 @@ os.environ.setdefault("AUTH_SECRET", "test-secret")
 os.environ.setdefault("GITHUB_OAUTH_CLIENT_ID", "test-client-id")
 os.environ.setdefault("GITHUB_OAUTH_CLIENT_SECRET", "test-client-secret")
 os.environ.setdefault("MONGODB_URI", "mongodb://localhost:27017/vibe_platform_test")
+os.environ.setdefault("REDIS_URL", "redis://localhost:6379/15")
+os.environ.setdefault("SANDBOX_PROVIDER", "mock")
 
-import httpx  # noqa: E402
+import httpx
+from sandbox_provider import MockSandboxProvider
 
-from db import mongo  # noqa: E402
-from orchestrator.app import app  # noqa: E402
+from db import mongo
+from orchestrator.app import app
+from orchestrator.services.sandbox_manager import SandboxManager
 
 TEST_DB_NAME = "vibe_platform_test"
 
@@ -30,6 +34,14 @@ async def client() -> AsyncIterator[httpx.AsyncClient]:
     await mongo.drop_all_collections()
     await mongo.disconnect()
     await mongo.connect(os.environ["MONGODB_URI"], database=TEST_DB_NAME)
+
+    # Inject a fresh Mock provider per test so state doesn't leak between
+    # tests. ASGITransport doesn't run app.lifespan, so we wire the manager
+    # onto app.state ourselves. Redis is None — slice 4 tolerates it.
+    provider = MockSandboxProvider()
+    manager = SandboxManager(provider=provider, redis=None)
+    app.state.sandbox_manager = manager
+    app.state.sandbox_provider = provider
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as c:

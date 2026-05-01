@@ -7,6 +7,7 @@ Canonical rules for any AI coding agent (Claude Code, Codex, Copilot, Antigravit
 > **Active state** lives in [docs/progress.md](docs/progress.md). Update it.
 > **Quick-start for agents** is [docs/agent_context.md](docs/agent_context.md). Read it first.
 > **Entry point for Claude Code** is [CLAUDE.md](CLAUDE.md) — a thin pointer to this file and the docs above.
+> **Sprites SDK reference** (sandbox provider) [docs/sprites/v0.0.1-rc43/python.md](docs/sprites/v0.0.1-rc43/python.md) (Python) · [http.md](docs/sprites/v0.0.1-rc43/http.md) (raw HTTP/WSS)
 
 ---
 

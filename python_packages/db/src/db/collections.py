@@ -38,4 +38,5 @@ ALL: Final[tuple[str, ...]] = (
     Collections.USERS,
     Collections.SESSIONS,
     Collections.REPOS,
+    Collections.SANDBOXES,
 )
