@@ -1,0 +1,13 @@
+{
+  "compilerOptions": {
+    "composite": true,
+    "skipLibCheck": true,
+    "noEmit": true
+  },
+  "files": [],
+  "references": [
+    { "path": "./apps/web" },
+    { "path": "./packages/api-types" },
+    { "path": "./packages/tsconfig" }
+  ]
+}

@@ -1,0 +1,13 @@
+{
+  "name": "@vibe-platform/bridge",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "uv run python -m bridge",
+    "build": "uv build",
+    "test": "uv run pytest tests",
+    "typecheck": "uv run pyright src/",
+    "lint": "uv run ruff check src/ && uv run ruff format --check src/",
+    "format": "uv run ruff format src/"
+  }
+}

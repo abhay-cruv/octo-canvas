@@ -1,0 +1,11 @@
+{
+  "name": "@vibe-platform/agent-config",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "test": "uv run pytest tests/",
+    "typecheck": "uv run pyright src/",
+    "lint": "uv run ruff check src/ && uv run ruff format --check src/",
+    "format": "uv run ruff format src/"
+  }
+}

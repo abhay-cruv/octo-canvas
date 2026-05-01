@@ -1,0 +1,15 @@
+[project]
+name = "github_integration"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "githubkit>=0.11",
+    "pydantic>=2.9",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/github_integration"]

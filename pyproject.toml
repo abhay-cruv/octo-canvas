@@ -1,0 +1,16 @@
+[project]
+name = "vibe-platform"
+version = "0.1.0"
+description = "Monorepo root"
+requires-python = ">=3.12"
+
+[tool.uv.workspace]
+members = ["apps/orchestrator", "apps/bridge", "python_packages/*"]
+
+[tool.uv.sources]
+shared_models = { workspace = true }
+db = { workspace = true }
+sandbox_provider = { workspace = true }
+github_integration = { workspace = true }
+repo_introspection = { workspace = true }
+agent_config = { workspace = true }

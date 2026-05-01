@@ -1,0 +1,9 @@
+{
+  "extends": "@vibe-platform/tsconfig/library.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "outDir": "dist",
+    "noEmit": false
+  },
+  "include": ["src/**/*.ts", "generated/**/*.d.ts"]
+}
