@@ -243,7 +243,7 @@ Same principle for WebSocket: messages are Pydantic discriminated unions in `sha
 
 Collections in `vibe_platform` Mongo database, each Beanie `Document`. Slice annotation in parens.
 
-### `users` (slice 1 — done)
+### `users` (slice 1 — done; user-agent prefs added in slice 6b)
 ```python
 class User(Document):
     github_user_id: Annotated[int, Indexed(unique=True)]
@@ -251,6 +251,14 @@ class User(Document):
     github_avatar_url: str | None
     email: str
     display_name: str | None
+    github_access_token: str | None    # slice 2
+    # User-agent preferences (slice 6b). Default off — user opts in.
+    user_agent_enabled: bool = False
+    # When enabled, controls whether the user-agent tries to answer the
+    # sandbox agent's clarification questions itself or escalates every
+    # one to the user. Prompt enhancement is on regardless when
+    # user_agent_enabled is True.
+    user_agent_mode: Literal["user_answers_all", "agent_handles"] = "agent_handles"
     created_at: datetime
     updated_at: datetime
     last_signed_in_at: datetime
@@ -402,10 +410,11 @@ All under `/api`. Auth via `vibe_session` cookie except where noted. Bodies and 
 | POST | `/api/auth/logout` | Deletes Session, clears cookie, 204. |
 | GET | `/api/auth/session` | Returns user (200) or 401 if no/invalid session. Uses `get_user_optional`. |
 
-### User (slice 1 — done)
+### User (slice 1 — done; user-agent prefs added in slice 6b)
 | Method | Path | Notes |
 |---|---|---|
-| GET | `/api/me` | `UserResponse`. 401 if unauthenticated. |
+| GET | `/api/me` | `UserResponse` includes `user_agent_enabled` + `user_agent_mode`. 401 if unauthenticated. |
+| PATCH | `/api/me/user-agent` | Body: `{enabled?: bool, mode?: "user_answers_all" \| "agent_handles"}`. Both fields optional; partial update. Returns the updated `UserResponse`. (slice 6b) |
 
 ### Repos (slice 2 + 3)
 
@@ -511,30 +520,41 @@ All web-bound messages are Pydantic discriminated unions in `python_packages/sha
 Orchestrator → web (a transcoded UI feed; the source events are produced by the orchestrator from a mix of Mongo state, Sprites Exec stdout parses, and Sprites Watch deltas):
 
 ```
-ToolCallEvent            { type, run_id, seq, tool_name, args }
-ToolResultEvent          { type, run_id, seq, tool_name, ok, output }
-FileEditEvent            { type, run_id, seq, path, before_sha, after_sha, summary }
-ShellExecEvent           { type, run_id, seq, cmd, exit_code, stdout_tail, stderr_tail }
-GitOpEvent               { type, run_id, seq, op, branch?, commit_sha?, pr_url? }
-AssistantMessageEvent    { type, run_id, seq, content, finish_reason? }
-StatusChangeEvent        { type, run_id, seq, new_status }
-SandboxStatusEvent       { type, sandbox_id, status, public_url? }   # mirrors Sprites cold/warm/running
-TokenUsageEvent          { type, run_id, seq, input_delta, output_delta }
-ErrorEvent               { type, run_id?, seq, kind, message }
-Pong                     { type, nonce }
+ToolCallEvent              { type, run_id, seq, tool_name, args }
+ToolResultEvent            { type, run_id, seq, tool_name, ok, output }
+FileEditEvent              { type, run_id, seq, path, before_sha, after_sha, summary }
+ShellExecEvent             { type, run_id, seq, cmd, exit_code, stdout_tail, stderr_tail }
+GitOpEvent                 { type, run_id, seq, op, branch?, commit_sha?, pr_url? }
+AssistantMessageEvent      { type, run_id, seq, content, finish_reason? }
+StatusChangeEvent          { type, run_id, seq, new_status }
+SandboxStatusEvent         { type, sandbox_id, status, public_url? }   # mirrors Sprites cold/warm/running
+TokenUsageEvent            { type, run_id, seq, input_delta, output_delta }
+ErrorEvent                 { type, run_id?, seq, kind, message }
+# User-agent events (slice 6b — only when Sandbox.user_agent_enabled is True for this user)
+PromptEnhancedEvent        { type, run_id, seq, original, enhanced, applied: bool }
+AskUserClarification       { type, run_id, seq, clarification_id, question, agent_attempted?: AgentAttempt }
+AgentAnsweredClarification { type, run_id, seq, clarification_id, question, answer, reasoning?, override_window_ms }
+Pong                       { type, nonce }
 ```
 
 Web → orchestrator:
 
 ```
-Resume                   { type, after_seq }                       # on (re)connect, request replay
-SendFollowUp             { type, run_id, content }
-CancelTask               { type, task_id }
-RequestOpenPty           { type, terminal_id, cwd?, cols, rows }   # orchestrator opens Sprites Exec
-RequestClosePty          { type, terminal_id }
-ResizePty                { type, terminal_id, cols, rows }
-Pong                     { type, nonce }
+Resume                       { type, after_seq }                       # on (re)connect, request replay
+SendFollowUp                 { type, run_id, content }
+CancelTask                   { type, task_id }
+RequestOpenPty               { type, terminal_id, cwd?, cols, rows }   # orchestrator opens Sprites Exec
+RequestClosePty              { type, terminal_id }
+ResizePty                    { type, terminal_id, cols, rows }
+# User-agent (slice 6b)
+AnswerClarification          { type, run_id, clarification_id, answer }   # user types reply when agent escalated
+OverrideAgentAnswer          { type, run_id, clarification_id, new_answer? } # user disagrees with auto-answer; if new_answer omitted, treat as "ask the agent again with no preset"
+Pong                         { type, nonce }
 ```
+
+`PromptEnhancedEvent` is informational — it fires after the user-agent has already written the enhanced prompt to the sandbox stdin. The FE renders both `original` and `enhanced` collapsibly so the user can see what happened. `applied: false` means the user-agent decided enhancement wasn't useful and forwarded the raw prompt.
+
+`AgentAnsweredClarification` carries an `override_window_ms` (default `8000`). The FE renders an "Override" affordance for that long; if the user clicks within the window, the FE sends `OverrideAgentAnswer` and the orchestrator interrupts the sandbox agent (writes a correction to stdin, since by then the auto-answer has already been forwarded). After the window closes, the override button is disabled — at that point the sandbox agent has already acted.
 
 Everything else is HTTP REST.
 
@@ -738,11 +758,81 @@ Queue lives in Redis: `sandbox:{sandbox_id}:queue` (LIST of `run_id`). The orche
 
 ---
 
-## 14. Agent runtime (slices 5b–7)
+## 14. Agent runtime — two-agent architecture (slices 6 / 6b)
 
-**There is no long-lived "bridge" process.** Earlier drafts assumed a Python daemon inside the sprite that dialed home over WS; that's deleted. The orchestrator drives agent invocations via Sprites' Exec API (see [docs/sprites/v0.0.1-rc43/python.md](sprites/v0.0.1-rc43/python.md)). The `apps/bridge/` workspace shrinks to **agent-runner code that ships inside the Sprite image** — it's invoked per-run as a subprocess, not as a daemon.
+**Two agents, one transport.** v1 ships two distinct agent processes:
 
-### Per-run flow (slice 6)
+- **Sandbox Agent** (slice 6) — runs *inside the sprite* via Sprites Exec. Holds tools (read_file/write_file/run_shell/git). Does the actual coding work. Stateful only via the persistent filesystem and its own LLM context for the active run. **The sandbox agent never talks to the FE directly** — all its output is JSON-lines on stdout, parsed by the orchestrator.
+- **User Agent** (slice 6b — *opt-in*, off by default) — runs *inside the orchestrator* as an Anthropic SDK call with its own system prompt and small set of tools (read user prefs, read connected repos, read introspection data, look up past answers, surface to FE). Sits as a man-in-the-middle between FE and Sandbox Agent. Toggle + mode are persisted on the `User` doc (see §8).
+
+There is no long-lived "bridge" daemon inside the sprite — the sandbox agent is invoked per-run as a subprocess via Sprites Exec. Earlier drafts assumed a Python daemon dialing home over WS; deleted. See `apps/bridge/src/bridge/agent/` for the sandbox-agent code that ships in the Sprite image.
+
+### 14.1 User Agent — toggle + modes (slice 6b)
+
+Stored on `User` (see §8):
+
+| Field | Values | Effect |
+|---|---|---|
+| `user_agent_enabled` | `true` / `false` (default `false`) | Master toggle. **Off** = orchestrator is a pure passthrough; user types go to sandbox stdin verbatim, sandbox questions surface to FE verbatim. **On** = User Agent is in the path. |
+| `user_agent_mode` | `"agent_handles"` / `"user_answers_all"` (only meaningful when enabled) | Controls clarification routing. Default `agent_handles`. |
+
+When `user_agent_enabled=true`, **prompt enhancement is always on** — the User Agent rewrites every user message before it hits the sandbox stdin, surfacing the original + enhanced via `PromptEnhancedEvent` so the user sees what was sent. Enhancement is informational, not gated; if the User Agent decides enhancement adds nothing it forwards the raw text and emits `PromptEnhancedEvent{applied: false}`.
+
+Clarification routing (Sandbox Agent emits `AskUserClarification` on its stdout — see §14.3):
+
+- **Off**: forwarded to FE verbatim. User types reply on FE; orchestrator writes to sandbox stdin.
+- **On + `user_answers_all`**: User Agent does NOT try to answer. It still surfaces the question to FE (possibly with annotations like "I think the answer is X but you said you'd handle these") and forwards the user's reply to sandbox stdin.
+- **On + `agent_handles`**: User Agent attempts to answer using its tools (read user prefs, repos, introspection). Two paths:
+  - **Confident** → write answer to sandbox stdin immediately AND emit `AgentAnsweredClarification` to FE with an 8-second `override_window_ms`. User can click Override; FE emits `OverrideAgentAnswer`; orchestrator writes a correction to stdin (or aborts the answer if the sandbox hasn't acted on it yet).
+  - **Not confident / question is genuinely user-only ("which color theme?")** → emit `AskUserClarification` to FE with `agent_attempted={attempted: true, reasoning: "..."}` so the user sees what the agent tried.
+
+The User Agent's "confidence" is a self-reported flag in its tool's structured output; we don't try to infer it. If a tool the user-agent calls returns low-quality or conflicting data, the agent escalates.
+
+### 14.2 Per-task data flow (combined)
+
+```
+[FE]         user types in chat   ──► SendFollowUp{run_id, content}  ──► [Orchestrator]
+                                                                              │
+                          if user_agent_enabled = true                        │
+                                  │                                           │
+                                  ▼                                           │
+                          [User Agent — orchestrator]                         │
+                          • enhance prompt                                    │
+                          • PromptEnhancedEvent{original, enhanced} → FE      │
+                          • write enhanced text to stdin                      │
+                                  │                                           │
+                                  ▼ (or just write raw text if toggle off)    │
+                          Sprites Exec WSS — stdin stream  ──►  [Sandbox Agent]
+                                                                  │
+                                       Sandbox Agent stdout JSON  │
+                                       lines (ToolCallEvent,      │
+                                       FileEditEvent, …,          │
+                                       AskUserClarification)      │
+                                                                  ▼
+                          [User Agent decides per event:]   ◄─── parsed by orchestrator
+                          • passthrough? → web WS
+                          • coalesce/summarize? → summarized event → web WS
+                          • AskUserClarification?
+                              ├─ try to answer (mode == agent_handles, confident)
+                              │     → write answer to stdin
+                              │     → emit AgentAnsweredClarification with override window
+                              └─ surface to user
+                                    → emit AskUserClarification → web WS
+                                    ◄── AnswerClarification from FE
+                                    → write user's answer to stdin
+                                                                  ▼
+                                                         [back to Sandbox Agent]
+```
+
+### 14.3 Sandbox Agent's `AskUserClarification` protocol
+
+Sandbox Agent emits a JSON line with a stable `clarification_id` and **blocks reading stdin until that id is answered**. The orchestrator (User Agent on or off) sends `{clarification_id, answer}` on stdin. The sandbox-agent's tool implementation sets a `wait_for_clarification(clarification_id)` future per outstanding question.
+
+Multiple in-flight clarifications are allowed (sandbox agent can ask 2 at once and block on `gather`); each gets its own id, answers come back in any order.
+
+If the user closes the FE tab while a clarification is pending: orchestrator does NOT auto-answer. The clarification stays open in Mongo (`agent_events` row with `kind="awaiting_clarification"`); next time the user opens the task page, the FE renders it again. User Agent (when on, `agent_handles`) gets a second chance to answer if its confidence has changed (e.g. tools return new data).
+
+### 14.4 Sandbox Agent: per-run flow
 
 1. Orchestrator dequeues a `Task` for the user's sandbox.
 2. Mints a per-repo, per-run install token via the user's GitHub OAuth token (see §19 #12 for token scoping rules).
@@ -752,31 +842,31 @@ Queue lives in Redis: `sandbox:{sandbox_id}:queue` (LIST of `run_id`). The orche
 
 The agent-runner process inside the sprite is **stateless across runs**; warm caches live on the persistent filesystem (`/work/.cache`, `node_modules`, `.venv`).
 
-### What the agent-runner does (per run, slice 6)
+### 14.5 Sandbox Agent: what the agent-runner does per run
 
-1. Read `task_json` from argv: `{run_id, repo_full_name, base_branch, prompt, follow_up, user_token, tool_allowlist, agent_defaults}`.
+1. Read `task_json` from argv: `{run_id, repo_full_name, base_branch, prompt, follow_up, user_token, tool_allowlist, agent_defaults}`. The `prompt` is post-enhancement when User Agent is on; pre-enhancement when off.
 2. `cd /work/<repo_full_name>/`. If missing, clone now (slice 5b's reconciliation should make this rare).
 3. `git fetch origin` + `git checkout -B <work_branch> origin/<base_branch>` — work branch is `vibe/task-{task_id_short}`.
 4. Invoke the Claude Agent SDK with:
    - System prompt from `agent_config.dev_agent` (templated with repo metadata, language, test command, in-repo `CLAUDE.md`).
    - The user's `initial_prompt` (or `follow_up_prompt`).
-   - Tool allowlist: `read_file`, `write_file`, `apply_patch`, `run_shell` (jailed to `/work/<full_name>/`), `run_tests`.
+   - Tool allowlist: `read_file`, `write_file`, `apply_patch`, `run_shell` (jailed to `/work/<full_name>/`), `run_tests`, `ask_user_clarification` (emits `AskUserClarification` to stdout, blocks until answer arrives on stdin).
    - Streaming callback printing JSON-encoded `*Event` lines to stdout.
 5. After agent finish: `git add -A && git commit -m "..."`, push to origin. On first run, open a PR via githubkit; on follow-ups, the PR auto-updates.
 6. Print final `StatusChangeEvent{new_status: "completed"}` and exit 0.
 
-### Why subprocess-per-run, not a long-lived daemon
+### 14.6 Why subprocess-per-run, not a long-lived daemon
 
 - **Sprites Exec already handles disconnection / scrollback** ([python.md → Attach to Exec Session](sprites/v0.0.1-rc43/python.md)). Dropping the orchestrator-side connection mid-run does not kill the agent; we reattach on the next request and pick up the stream.
 - **State on disk is shared across runs** via the persistent filesystem; no need for a daemon to hold it in memory.
 - **Crash blast radius** is one run, not the whole sandbox. The next task spawns a fresh process.
 - **Provider abstraction stays clean** — `provider.exec_oneshot(handle, cmd, env)` is one Protocol method; a daemon would need a state-tracking sidecar that's harder to swap.
 
-### Cross-repo runs (post-v1 hook)
+### 14.7 Cross-repo runs (post-v1 hook)
 
 Filesystem has every connected repo under `/work/`, so a multi-repo task type drops in cleanly: the agent's `read_file`/`write_file` tools accept any path under `/work/`, and the run-finalize step pushes to N branches and opens N PRs. Not in v1; v1 task is single-repo and `run_shell` is jailed to the run's repo subdir.
 
-### Tools (slice 6)
+### 14.8 Sandbox-Agent tools (slice 6)
 
 Tool implementations live in `apps/bridge/src/bridge/agent/tools/` (the workspace name stays `bridge` for historical continuity even though there's no daemon). Each tool:
 
@@ -785,11 +875,23 @@ Tool implementations live in `apps/bridge/src/bridge/agent/tools/` (the workspac
 - Has a budget check (`run_shell` capped at 5 minutes wall time, output truncated to 50 KB).
 - Path arguments are validated to live under the run's repo subdir; absolute paths and `..` traversal are rejected.
 
-### System prompt design (`python_packages/agent_config/`)
+`ask_user_clarification(question, context?)` is the bridge between agents — sandbox-agent calls it, the JSON line goes out on stdout, the User Agent (if on) or the orchestrator (if off) routes it to the right place, and the answer comes back on stdin. The tool blocks until answered.
 
-- Repo metadata injected (full_name, default_branch, language, test command).
-- Project conventions injected if a `CLAUDE.md` exists in the repo.
-- Hard rules: don't `rm -rf /`, don't push to base branch, don't expose secrets in commits, never reach outside the current repo subdir.
+### 14.9 User-Agent tools (slice 6b)
+
+The User Agent calls these synchronously inside the orchestrator process. Each is a Python function the User Agent's Anthropic SDK invocation can call:
+
+- `get_user_profile()` → returns user prefs, github_username, mode flags
+- `list_user_repos()` → connected repos with introspection (language, package_manager, test_command, build_command, dev_command)
+- `read_past_clarification(repo_id, question_summary)` → recall the last similar clarification's answer for this user (Mongo lookup; ~v1.1 personalization, may stub in slice 6b and fill in slice 11)
+- `ask_user(question)` → emits `AskUserClarification` to FE, awaits `AnswerClarification`. Used when the User Agent decides "I genuinely cannot answer this."
+
+The User Agent does **not** have direct access to the sandbox filesystem or to the Sandbox Agent's tools. By design, it sits *outside* the sandbox; if it needs sandbox state, it asks the Sandbox Agent (via stdin) or surfaces the question to the user.
+
+### 14.10 System prompt design (`python_packages/agent_config/`)
+
+- **Sandbox Agent** prompt: repo metadata injected (full_name, default_branch, language, test command). Project conventions injected if a `CLAUDE.md` exists in the repo. Hard rules: don't `rm -rf /`, don't push to base branch, don't expose secrets in commits, never reach outside the current repo subdir. Instructed to call `ask_user_clarification` when truly blocked rather than guessing.
+- **User Agent** prompt: explains the user-agent's role (orchestrator-side, mediates between user and sandbox-agent). Lists the user's prefs + connected repos + introspection inline. Hard rules: never invent answers — only respond confidently when grounded in tool output; default to escalating ambiguous questions; preserve the user's intent in prompt enhancement (don't change requirements, only clarify them).
 
 ---
 
@@ -885,7 +987,8 @@ Before considering work done: `pnpm typecheck && pnpm lint && pnpm test`.
 | `SANDBOX_PROVIDER` | orchestrator (sprites \| mock; default `sprites`) | 4 |
 | `SPRITES_TOKEN` | orchestrator (required when `SANDBOX_PROVIDER=sprites`) | 4 |
 | `SPRITES_BASE_URL` | orchestrator (default `https://api.sprites.dev`) | 4 |
-| `ANTHROPIC_API_KEY` | agent-runner subprocess (passed via Sprites Exec env) | 6 |
+| `ANTHROPIC_API_KEY` | sandbox-agent subprocess (via Sprites Exec env) AND orchestrator-hosted user-agent | 6 / 6b |
+| `USER_AGENT_DAILY_USD_CAP` | orchestrator (per-user spend cap on user-agent LLM calls; default `5`) | 6b |
 | `S3_ENDPOINT`, `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` | orchestrator | 10 |
 | `ORCHESTRATOR_PORT` | orchestrator | scaffold |
 | `WEB_BASE_URL` | orchestrator (CORS, redirects) | scaffold |
@@ -954,12 +1057,26 @@ The bridge↔orchestrator WS leg is **gone** — Sprites' SDK is outbound-driven
 **Risks:** install-token leakage in `.git/config` (set `extraheader` at command time, never persist — see §19 #12); race between connect-repo and sandbox provision (queue clone op in Mongo until sandbox is `warm` or `running`); clone retries when sprite is `cold` (Sprites auto-warms on exec, so this just-works).
 **Acceptance:** connect three repos against a running sandbox → all three end up cloned to `/work/<full_name>/`, `clone_status="ready"`, `Repo.sandbox_id` populated. After clone+install, a `clean` checkpoint exists. Reset → restore_checkpoint → repos still present, working trees clean. Disconnect one → directory removed via `provider.exec_oneshot(["rm", "-rf", path])`, row deleted.
 
-### Slice 6 — Tasks + Agent SDK invocation
+### Slice 6 — Tasks + Sandbox-Agent invocation (passthrough)
 
-**Adds:** `Task` + `AgentRun` + `AgentEvent` collections; task creation + follow-up endpoints; orchestrator queues runs into the user's sandbox (one active at a time, queue depth surfaced in UI); orchestrator invokes `provider.exec_oneshot(handle, ["python", "-m", "agent_runner", task_json])` and parses JSON-lines from stdout into `AgentEvent` records. Web task page (chat, event stream, status, repo picker).
-**Files:** `apps/orchestrator/src/orchestrator/routes/tasks.py`, `services/task_runner.py`; `apps/bridge/src/bridge/agent/` (agent-runner subprocess code that ships in the sprite image — see §14); `python_packages/agent_config/dev_agent/` (system prompts).
-**Risks:** agent tool budgets and tight loops; cost cap per run; ensuring `run_shell` stays inside the *correct* repo subdir; queue starvation if a single run loops forever.
-**Acceptance:** with two connected repos, "add a top-level `HELLO.md` saying hi" against repo A produces `AgentEvent`s, a commit on a new branch *in repo A only*, and `StatusChangeEvent("completed")`. `/work/<repo_b>/` is untouched. Second task while the first is running queues; queue depth shows in the UI.
+**Adds:** `Task` + `AgentRun` + `AgentEvent` collections; task creation + follow-up endpoints; orchestrator queues runs into the user's sandbox (one active at a time, queue depth surfaced in UI); orchestrator invokes `provider.exec_oneshot(handle, ["python", "-m", "agent_runner", task_json])` and parses JSON-lines from stdout into `AgentEvent` records. `ask_user_clarification` tool on the sandbox-agent: emits the JSON line to stdout, blocks until orchestrator writes the answer to stdin. Web task page (chat, event stream, status, repo picker, clarification dialog). **No User Agent yet** — passthrough only; user types go to sandbox stdin verbatim, sandbox questions surface to FE verbatim.
+**Files:** `apps/orchestrator/src/orchestrator/routes/tasks.py`, `services/task_runner.py`; `apps/bridge/src/bridge/agent/` (agent-runner subprocess code that ships in the sprite image — see §14.4–§14.8); `python_packages/agent_config/dev_agent/` (system prompts).
+**Risks:** agent tool budgets and tight loops; cost cap per run; ensuring `run_shell` stays inside the *correct* repo subdir; queue starvation if a single run loops forever; deadlock if sandbox-agent waits forever for an answer the user never sends (cap clarification wait at 5 min, abort run with `ErrorEvent`).
+**Acceptance:** with two connected repos, "add a top-level `HELLO.md` saying hi" against repo A produces `AgentEvent`s, a commit on a new branch *in repo A only*, and `StatusChangeEvent("completed")`. `/work/<repo_b>/` is untouched. Sandbox agent calling `ask_user_clarification` shows up on the FE; user types answer; sandbox agent unblocks and continues. Second task while the first is running queues; queue depth shows in the UI.
+
+### Slice 6b — User Agent layer (toggle + prompt enhancement + clarification routing)
+
+Builds the orchestrator-hosted User Agent on top of slice 6. Off-by-default; user opts in.
+
+**Adds:** `User.user_agent_enabled` + `user_agent_mode` fields (see §8); `PATCH /api/me/user-agent` endpoint; new web message types `PromptEnhancedEvent`, `AgentAnsweredClarification`, `OverrideAgentAnswer`, `AnswerClarification` (see §10.4). User-Agent process inside the orchestrator: an Anthropic SDK invocation per user message and per sandbox-agent clarification, with the tools listed in §14.9. UI: a settings panel with the master toggle + mode radio (on dashboard or `/settings`); inline indicator on the task page showing "User-agent: on (handles)" / "off"; per-event display of `PromptEnhancedEvent` (collapsible original/enhanced); `AgentAnsweredClarification` rendered with an Override button + countdown until `override_window_ms` closes.
+**Files:** `apps/orchestrator/src/orchestrator/services/user_agent.py` (Anthropic SDK invocation + tool implementations); `routes/me_user_agent.py` (PATCH endpoint); web `components/UserAgentToggle.tsx`, `components/PromptEnhancedDisplay.tsx`, `components/AgentAnswerWithOverride.tsx`.
+**Risks:** **two-LLM coherence** — User Agent and Sandbox Agent must not contradict each other; the User Agent's system prompt forbids inventing answers and instructs it to escalate when unsure. **Override race** — between User Agent emitting `AgentAnsweredClarification` and the user clicking Override, the sandbox-agent has already received the answer on stdin and may have started acting; the orchestrator must write a correction message (e.g. `# CORRECTION: previous answer was incorrect, do not act on it`) and the sandbox-agent's prompt must instruct it to handle corrections gracefully. **Per-event LLM cost** — User Agent runs on every user message and every clarification; budget so a chatty agent doesn't 10x our LLM bill. **Toggle race** — if the user flips the toggle mid-run, the orchestrator finishes the current event with the prior setting and applies the new one to the next event (no mid-flight mode change).
+**Acceptance:** with `user_agent_enabled=false`, slice 6 behaviour is unchanged. With `user_agent_enabled=true`, all four of these must work:
+
+- User types "fix the failing tests" → orchestrator emits `PromptEnhancedEvent{original, enhanced}` to FE before the sandbox sees anything; the sandbox receives the enhanced prompt.
+- With `mode=agent_handles`, sandbox-agent asking "which test command should I use?" → User Agent looks up `Repo.introspection.test_command`, writes that to sandbox stdin, emits `AgentAnsweredClarification{question, answer, override_window_ms: 8000}` to FE. User does nothing → sandbox-agent runs the command. User clicks Override within 8s → FE sends `OverrideAgentAnswer`; orchestrator writes the correction; sandbox-agent re-prompts the user.
+- With `mode=user_answers_all`, the same clarification surfaces to FE as `AskUserClarification` with `agent_attempted={attempted: true, reasoning: "test_command from introspection is 'pnpm test'"}`. The User Agent does *not* answer it, but annotates so the user can decide.
+- Toggle the agent off mid-task → next user message and next clarification go through as raw passthrough.
 
 ### Slice 7 — Git ops + PR creation
 
@@ -1042,9 +1159,15 @@ The bridge↔orchestrator WS leg is **gone** — Sprites' SDK is outbound-driven
 
 24. **Reset preserves repo connections; Destroy doesn't preserve the `Sandbox` doc id** — `POST /api/sandboxes/{id}/reset` keeps `Sandbox._id` and `Repo.sandbox_id` references, just rotates `provider_handle`. `POST /api/sandboxes/{id}/destroy` marks the doc destroyed; the user's next `POST /api/sandboxes` creates a *new* doc with a *new* id, and slice 5b will re-bind `Repo.sandbox_id` accordingly.
 
----
+25. **User Agent is opt-in and visible** (slice 6b) — `User.user_agent_enabled` defaults to `false`. When enabled, **every** action the User Agent takes is surfaced to the FE: `PromptEnhancedEvent` shows original vs enhanced; `AgentAnsweredClarification` shows the answer with an 8s override countdown. Users must always be able to see what was answered on their behalf and override it. No silent decisions. See §14.1.
 
-## 20. Status snapshot (as of 2026-05-02)
+26. **Override race in slice 6b** — by the time the User Agent emits `AgentAnsweredClarification`, the answer has already been written to the sandbox-agent's stdin and the sandbox-agent may have started acting on it. Override is therefore an **interrupt + correct**, not a "withhold the answer." The orchestrator writes a correction line to stdin (`# CORRECTION: previous answer was incorrect, do not act on it; awaiting new answer`); the sandbox-agent's prompt instructs it to honor corrections. Don't try to gate the answer behind the override window — the latency would be terrible.
+
+27. **Two-LLM coherence** — User Agent and Sandbox Agent must not contradict each other. The User Agent's system prompt forbids inventing answers and instructs it to escalate when its tool data doesn't directly answer the question. The Sandbox Agent treats answers from stdin as ground truth (because the User Agent grounded them in user prefs / introspection); but it must also detect contradictions ("the user said pnpm but the lockfile is yarn.lock") and escalate via `ask_user_clarification` rather than guessing.
+
+28. **User-Agent LLM cost** — slice 6b runs a User-Agent invocation on every user message and every sandbox-agent clarification. Budget caps: per-user spend cap (configurable, default $X/day) enforced before each User-Agent call; if exceeded, fall back to passthrough mode and surface a banner. Monitor average User-Agent calls per task; if it >5x's the Sandbox-Agent's call count, something is misrouted.
+
+29. **Sandbox-agent clarification timeout** — `ask_user_clarification` blocks reading stdin. v1 caps that wait at **5 minutes**; if no answer arrives, the sandbox-agent emits `ErrorEvent{kind: "clarification_timeout"}` and the run aborts. Otherwise a closed FE tab + dropped User Agent could deadlock the sandbox forever.
 
 - **Slice 0** ✅ scaffolding shipped
 - **Slice 1** ✅ shipped (GitHub OAuth + user persistence)
@@ -1055,11 +1178,11 @@ The bridge↔orchestrator WS leg is **gone** — Sprites' SDK is outbound-driven
 
 **Plan rewrites on 2026-05-02** following the rc43 SDK docs:
 
-- §10 transport: dropped the bridge↔orchestrator WS leg (Sprites' SDK is outbound-only); web↔orchestrator WS is the only custom protocol.
+- §10 transport: dropped the bridge↔orchestrator WS leg (Sprites' SDK is outbound-only — but Exec WSS is bidirectional once opened, like SSH); web↔orchestrator WS is the only custom protocol.
 - §13 sandbox lifecycle: state machine maps onto Sprites' `cold | warm | running` enum directly; no idle-hibernation job; reset uses checkpoints (slice 5b).
-- §14 agent runtime: no daemon/long-lived bridge process; agent invoked per-run via Sprites Exec subprocess.
-- §18 slice plan: 5a is web-WS-only; 5b adds clone+reconciliation+checkpoints; 8 (PTY + file ops) is mostly Sprites already; 9 (HTTP preview) collapses to surfacing Sprites' built-in URL.
-- §19 risks: replaced bridge-WS-specific gotchas with Sprites SDK realities.
+- §14 agent runtime: **two-agent architecture** — Sandbox Agent runs per-run via Sprites Exec subprocess (slice 6); orchestrator-hosted User Agent (slice 6b, opt-in) sits as MITM doing prompt enhancement and clarification routing.
+- §18 slice plan: slice 6 = sandbox-agent passthrough; slice 6b = User Agent layer with toggle/mode + override flow. 5a is web-WS-only; 5b adds clone+reconciliation+checkpoints; 8 (PTY + file ops) is mostly Sprites already; 9 (HTTP preview) collapses to surfacing Sprites' built-in URL.
+- §19 risks: replaced bridge-WS-specific gotchas with Sprites SDK realities; added user-agent risks (#25–#29: visible-by-default, override race, two-LLM coherence, LLM cost cap, clarification timeout).
 
 Repo metrics (from latest [`/graphify`](../graphify-out/GRAPH_REPORT.md) run, 2026-05-01): **107 files (~75k words) · 443 nodes · 633 edges · 89 communities**. Extraction quality: 76% EXTRACTED · 24% INFERRED (avg confidence 0.71) · 0% AMBIGUOUS. Top community hubs reflect the shipped slices 0–3: *Repo Introspection Architecture / Tests*, *Command Detection*, *Package Manager Detection*, *Primary Language Detection*, *FastAPI App & Health*, *GitHub OAuth Wrapper*, *Mongo Lifecycle & Collections*, *Repo Models & Sandbox API*, *Type Bridges (Pydantic→TS)*, *Frontend Repo API Client / Query Hooks*, *Project Docs & Slice Discipline*, *Risks & Gotchas*. Use `/graphify --update` (incremental, cheap) after every shipped slice; full rebuild only when the user asks. See [AGENTS.md §2.7](../AGENTS.md) for query workflow and verification rules.
 

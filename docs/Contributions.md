@@ -40,6 +40,12 @@ For *what changed structurally*, read [progress.md](progress.md). For *who and w
 
 ## Log
 
+### 2026-05-02 — Claude Opus 4.7 via Claude Code (Plan.md — User Agent two-agent design)
+
+- Added the **User Agent** (orchestrator-side, opt-in MITM between FE and Sandbox Agent) to [Plan.md](../docs/Plan.md): §8 `User` doc gains `user_agent_enabled` + `user_agent_mode`; §9 adds `PATCH /api/me/user-agent`; §10 web protocol gains `PromptEnhancedEvent` / `AskUserClarification` / `AgentAnsweredClarification` (with `override_window_ms`) / `AnswerClarification` / `OverrideAgentAnswer`; §14 rewritten as two-agent architecture with combined data-flow diagram, the `AskUserClarification` blocking-stdin protocol, User Agent tool list + system-prompt rules; §17 adds `USER_AGENT_DAILY_USD_CAP`; §18 splits old slice 6 into slice 6 (sandbox-agent passthrough) + slice 6b (User Agent layer); §19 adds risks #25–29 (visibility, override race, two-LLM coherence, LLM cost cap, clarification timeout); §20 snapshot updated.
+- Three-position user control: **toggle** (off by default), **mode** when on (`user_answers_all` vs `agent_handles`), **always-on prompt enhancement** when toggle is on. Every User-Agent action is surfaced to the FE with override affordance — no silent decisions.
+- No code yet. Implementation lands in slice 6 (passthrough) followed by slice 6b (User Agent layer with toggle UI + override flow).
+
 ### 2026-05-02 — Claude Opus 4.7 via Claude Code (Plan.md rewrite + Sprites docs converted to Markdown)
 
 - Replaced the Sprites SDK PDFs in [docs/sprites/v0.0.1-rc43/](../docs/sprites/v0.0.1-rc43/) with [python.md](../docs/sprites/v0.0.1-rc43/python.md) + [http.md](../docs/sprites/v0.0.1-rc43/http.md). Deleted the `python/` and `http/` PDF subdirs. Updated all references — slice4.md, agent_context.md, progress.md, sprites.py module docstring, sandbox_provider/pyproject.toml — to point at the markdown files.

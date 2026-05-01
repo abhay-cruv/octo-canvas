@@ -52,6 +52,19 @@ Next: slice 4 (sandbox provider — Sprites, per-user, multi-repo). **Brief must
 
 ## Recent changes (newest first)
 
+### 2026-05-02 (Plan.md — User Agent design landed)
+
+- **§8 User doc**: added `user_agent_enabled: bool = False` and `user_agent_mode: Literal["user_answers_all","agent_handles"] = "agent_handles"`. Default off — opt-in.
+- **§9 HTTP API**: new `PATCH /api/me/user-agent` for partial updates of toggle + mode.
+- **§10 web protocol**: new event types `PromptEnhancedEvent`, `AskUserClarification`, `AgentAnsweredClarification`; new web→orchestrator messages `AnswerClarification`, `OverrideAgentAnswer`. `AgentAnsweredClarification` carries an `override_window_ms` (default 8000) — FE renders an Override countdown.
+- **§14 agent runtime**: rewritten as two-agent architecture. §14.1 documents the toggle + the two modes. §14.2 has the combined data-flow diagram (FE ↔ User Agent ↔ Sandbox Agent). §14.3 specifies the `AskUserClarification` blocking-stdin protocol (clarification_id + 5-min timeout). §14.4–14.8 cover the Sandbox Agent. §14.9 lists the User Agent's tools (`get_user_profile`, `list_user_repos`, `read_past_clarification`, `ask_user`). §14.10 splits system prompt design into Sandbox Agent prompt + User Agent prompt with hard rules (don't invent answers; preserve user intent in enhancement).
+- **§17 env vars**: added `USER_AGENT_DAILY_USD_CAP` (per-user budget cap on user-agent LLM calls).
+- **§18 slice plan**: split slice 6 into **slice 6** (passthrough — sandbox-agent only, no User Agent) and **slice 6b** (User Agent layer — opt-in, settings UI, prompt-enhancement display, override countdown). Slice 6 stays shippable on its own; 6b is a UX upgrade.
+- **§19 risks**: added #25 (User Agent is opt-in and every action is visible/overridable), #26 (override race — answers are interrupt+correct, not gated), #27 (two-LLM coherence — sandbox-agent treats stdin as ground truth but escalates contradictions), #28 (per-user LLM cost cap with passthrough fallback when exceeded), #29 (5-min clarification timeout to prevent deadlocks).
+- **§20 status snapshot**: noted the design addition.
+
+Implementation will land in slice 6 (passthrough first) → slice 6b (User Agent). Per [AGENTS.md §3.3](../AGENTS.md), this Plan.md edit is permitted by explicit user direction.
+
 ### 2026-05-02 (Plan.md rewrite — Sprites SDK reality + .pdf → .md docs)
 
 - **Sprites docs are now markdown.** Replaced [docs/sprites/v0.0.1-rc43/](sprites/v0.0.1-rc43/) PDFs with [python.md](sprites/v0.0.1-rc43/python.md) (Python SDK examples) and [http.md](sprites/v0.0.1-rc43/http.md) (raw HTTP/WSS). Deleted the `python/` and `http/` PDF subdirs. Future agents have grep-friendly docs in-repo.
