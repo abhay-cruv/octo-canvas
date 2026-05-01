@@ -4,7 +4,7 @@ import structlog
 from beanie import init_beanie
 from motor.motor_asyncio import AsyncIOMotorClient
 
-from db.models import Session, User
+from db.models import Repo, Session, User
 
 _logger = structlog.get_logger("db")
 _client: AsyncIOMotorClient[dict[str, object]] | None = None
@@ -25,7 +25,7 @@ async def connect(uri: str) -> None:
         await _client.admin.command("ping")
         await init_beanie(
             database=_client[db_name],
-            document_models=[User, Session],
+            document_models=[User, Session, Repo],
         )
         _logger.info("db.connected", database=db_name)
     except Exception as exc:

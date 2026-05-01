@@ -12,7 +12,7 @@ A bilingual monorepo with a Python backend (FastAPI orchestrator + bridge) and a
 
 ## Setting up GitHub OAuth (local dev)
 
-Slice 1 ships GitHub OAuth sign-in. You need to register an OAuth App once:
+You register **one** GitHub OAuth App. It's used for both sign-in (slice 1) and repo access (slice 2). There is **no separate GitHub App** and no webhook tunnel.
 
 1. Go to GitHub Settings → Developer settings → OAuth Apps → **New OAuth App**.
 2. **Application name:** `vibe-platform (local dev)`.
@@ -21,18 +21,33 @@ Slice 1 ships GitHub OAuth sign-in. You need to register an OAuth App once:
 5. Click **Register application**, copy the **Client ID**, generate a **Client Secret**, copy that.
 6. Put both in `.env`:
 
-   ```
+   ```dotenv
    GITHUB_OAUTH_CLIENT_ID=<paste>
    GITHUB_OAUTH_CLIENT_SECRET=<paste>
    ```
 
 7. Generate a session secret and put it in `.env`:
 
-   ```
+   ```bash
    AUTH_SECRET=$(openssl rand -base64 32)
    ```
 
-The OAuth scope requested is `read:user user:email`. Do not register a GitHub App — that's a different concept used in a later slice.
+The OAuth scope requested is `read:user user:email repo`. The `repo` scope lets the orchestrator clone, branch, and push to repos you grant — using your OAuth token via `githubkit.TokenAuthStrategy`. Tradeoffs: commits/PRs from the agent are attributed to you (no bot identity), and access is all-or-nothing at consent time. See [docs/Plan.md §12](docs/Plan.md) for why we chose this over a separate GitHub App.
+
+## Connecting repositories
+
+After signing in:
+
+1. Dashboard → **Connect repositories** → `/repos` shows your already-connected repos (initially empty).
+2. Click **Browse repositories** → `/repos/connect` lists every repo your OAuth token can read.
+3. Click **Connect** on any → the repo lands with `clone_status: pending` (slice 4 will provision a sandbox and clone it).
+4. Click **Disconnect** to remove a connection.
+
+### When your token expires or is revoked
+
+If you revoke the OAuth grant on GitHub (Settings → Applications → Authorized OAuth Apps → Revoke), the next repo call returns `403 github_reauth_required`. The dashboard shows a **Reconnect GitHub** banner; clicking it re-runs the OAuth flow with the same scopes. Already-connected repo rows are preserved across reconnects.
+
+> Org SSO note: personal OAuth tokens are often blocked from accessing org repos until you click "Authorize" per-org on GitHub. If you don't see an org's repos in the list, visit GitHub → Settings → Applications → your OAuth app → "Organization access" and authorize the org.
 
 ## Running the app
 
@@ -59,7 +74,7 @@ pnpm dev
 - orchestrator on http://localhost:3001 (try `/health`, `/openapi.json`, `/api/auth/github/login`)
 - bridge (placeholder — logs `bridge.started` and exits)
 
-Visit http://localhost:5173 → you'll be redirected to `/login`. Click **Sign in with GitHub**, authorize the app, and you'll land on `/dashboard`.
+Visit http://localhost:5173 → you'll be redirected to `/login`. Click **Sign in with GitHub**, authorize `read:user user:email repo`, and you'll land on `/dashboard`.
 
 ## Regenerating API types
 

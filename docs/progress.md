@@ -11,8 +11,8 @@ Sibling docs: [agent_context.md](agent_context.md) (quick-start) · [engineering
 | # | Slice | Status | Notes |
 |---|---|---|---|
 | 0 | Scaffolding | ✅ shipped | Skeleton repo, placeholders, build/dev/test plumbing across both langs |
-| 1 | GitHub OAuth + user persistence | ✅ code shipped, ⬜ verifying | `User` + `Session` collections, `/login` → `/dashboard` flow, `require_user` dependency |
-| 2 | GitHub App + repo connection | ⬜ not started | Brief not yet written; awaiting slice 1 sign-off |
+| 1 | GitHub OAuth + user persistence | ✅ shipped | `User` + `Session` collections, `/login` → `/dashboard` flow, `require_user` dependency. UI redesigned to profile view. |
+| 2 | OAuth `repo` scope + repo connection | ✅ code shipped, ⬜ verifying | OAuth scope expanded to include `repo`; access token persisted on `User`; `Repo` collection; list/connect/disconnect endpoints; **401 → clear token + 403 `github_reauth_required`**; UI Reconnect flow. **No GitHub App, no smee, no webhooks** (rejected design). **No clone, no introspection, no sandbox** (slices 3 + 4). |
 | 3 | Repo introspection | ⬜ not started | |
 | 4 | Sandbox provider (Sprites) — per-user, multi-repo | ⬜ not started | |
 | 5 | WebSocket transport | ⬜ not started | |
@@ -22,23 +22,23 @@ Sibling docs: [agent_context.md](agent_context.md) (quick-start) · [engineering
 
 ---
 
-## Active slice — Slice 1 verification
+## Active slice — Slice 2 verification
 
 ### Punch list
 
-1. ⬜ `uv sync --all-packages --all-extras` (Python deps install)
-2. ⬜ `docker compose up -d` (Mongo running)
-3. ⬜ `.env` populated with real `GITHUB_OAUTH_CLIENT_ID`, `GITHUB_OAUTH_CLIENT_SECRET`, `AUTH_SECRET`, plus `MONGODB_URI`, `WEB_BASE_URL`, `ORCHESTRATOR_BASE_URL`, `VITE_ORCHESTRATOR_BASE_URL`
-4. ⬜ Restart `pnpm dev` (picks up the Vite `envDir` fix and the OAuth credentials)
-5. ⬜ Walk the sign-in flow at http://localhost:5173 → `/login` → GitHub → `/dashboard` → "Sign out"
-6. ⬜ Verify `users` and `sessions` documents land in Mongo and clear correctly on sign-out
-7. ⬜ `pnpm typecheck && pnpm lint && pnpm test` all green
-8. ⬜ `pnpm --filter @vibe-platform/api-types gen:api-types` so [../packages/api-types/generated/schema.d.ts](../packages/api-types/generated/schema.d.ts) reflects the live OpenAPI schema (currently the scaffolding stub)
-9. ⬜ User reviews and approves slice 1; *only then* author `slice2.md`
+1. ✅ `pnpm typecheck && pnpm lint && pnpm test && pnpm build` all green (28 pytest tests)
+2. ✅ `pnpm --filter @vibe-platform/api-types gen:api-types` regenerated against live orchestrator
+3. ⬜ Update GitHub OAuth App on github.com to advertise the **`repo` scope** (no other config change — same Client ID/Secret, same callback URL)
+4. ⬜ Sign out + sign in again so the new token (with `repo` scope) lands in `users.github_access_token`
+5. ⬜ Walk: dashboard (now shows repos in center, profile in left collapsible panel) → "Browse repositories" → `/repos/connect` → connect 3 → disconnect 1. The standalone `/repos` route now redirects to `/dashboard`.
+6. ⬜ Mongo: confirm `repos` rows have `clone_status="pending"`, `clone_path=null`, **no `installation_id`**; `users` doc has `github_access_token` populated
+7. ⬜ Token-revocation walk: revoke the OAuth grant on github.com → refresh `/repos` → sees Reconnect prompt; `users.github_access_token=null`. Click Reconnect → through OAuth → token restored, prior `Repo` rows still present
+8. ⬜ User reviews and approves slice 2; *only then* author `slice3.md`
 
 ### Known issues / blockers
 
-- _none currently_
+- v1.1 followup: encrypt `User.github_access_token` at rest (currently plaintext in Mongo for dev simplicity)
+- Org SSO requires per-org "Authorize" click on github.com before personal OAuth tokens can list/clone org repos — surfaced as 404s on individual repos, no auto-detection in the UI yet
 
 ---
 
@@ -46,6 +46,8 @@ Sibling docs: [agent_context.md](agent_context.md) (quick-start) · [engineering
 
 ### 2026-05-01
 
+- **Dashboard redesign** — [../apps/web/src/routes/_authed/dashboard.tsx](../apps/web/src/routes/_authed/dashboard.tsx) is now a 2-column layout: left collapsible profile panel triggered by a GitHub icon (avatar, username, email, member-since, last-signed-in, account fields, Sign out — persisted via localStorage), center area shows the connected repos list with Disconnect actions and a "Browse repositories" CTA, or the Reconnect card when `needs_github_reauth`. Reused existing data via `meQueryOptions` / `connectedReposQueryOptions` / `disconnectRepo`. The standalone `/repos` route now redirects to `/dashboard` (kept `/repos/connect` as the picker page). Adheres to [../AGENTS.md §2.8](../AGENTS.md) light theme (`bg-white/80 backdrop-blur` panel, `bg-black text-white` CTAs, `border-gray-200`). `pnpm --filter @vibe-platform/web typecheck && lint` clean.
+- **Plan.md ↔ slice2.md deviation surfaced** — [Plan.md §18](Plan.md) still describes slice 2 as "GitHub App + repo connection" with installations/webhooks/smee. Reality (per [slice/slice2.md](slice/slice2.md) and shipped code) chose OAuth `repo` scope expansion + per-user persisted token + Reconnect flow. Plan.md §8 (data model) and §18 should be updated to match — flagged to user; not yet actioned, awaiting explicit approval.
 - Expanded [../AGENTS.md](../AGENTS.md) §2.7 with: (a) **Step 0 install check** — if `graphify` isn't installed, ask the user before installing, fall back to grep/Read if they decline; same for first-touch agents in fresh clones with no `graphify-out/`; and (b) a second usage table of **less-common-but-useful capabilities**: `/graphify add <url>` (ingest external docs/papers/tweets/YouTube), `/graphify --wiki` (agent-crawlable Markdown), `/graphify --mcp` (live MCP server), `graphify hook install` (auto-rebuild on commit), `--watch`, `--cluster-only`, `--mode deep`, `--directed`, `--svg`/`--graphml`/`--neo4j[-push]`. Mirrored the install-check rule + new capabilities in [agent_context.md](agent_context.md), [../.github/copilot-instructions.md](../.github/copilot-instructions.md), [../.antigravity/instructions.md](../.antigravity/instructions.md).
 - Added **§2.7 Use graphify-out first** to [../AGENTS.md](../AGENTS.md): rules + table for using the pre-built knowledge graph in [../graphify-out/](../graphify-out/) as a low-token map for relationship/architecture questions, with strict verification rules (treat as hypotheses, read the actual file before acting, run `/graphify --update` if stale, never load `graph.json` directly into context).
 - Added **§2.8 Frontend theme — light mode only** to [../AGENTS.md](../AGENTS.md): canonical Tailwind palette (white/`bg-gray-50` surfaces, `bg-white/80 backdrop-blur` overlays, `bg-black text-white` CTAs, `border-gray-200` borders) and explicit bans (no `dark:` variants, no saturated colors on backgrounds, no gradients, no custom hex in component code). Existing CTAs in [../apps/web/src/routes/login.tsx](../apps/web/src/routes/login.tsx) already match this convention.

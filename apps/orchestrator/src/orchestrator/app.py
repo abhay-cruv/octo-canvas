@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .lib.env import settings
 from .lib.logger import logger
-from .routes import auth, me
+from .routes import auth, me, repos
 
 
 @asynccontextmanager
@@ -33,6 +33,7 @@ app.add_middleware(
 
 app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
 app.include_router(me.router, prefix="/api", tags=["me"])
+app.include_router(repos.router, prefix="/api/repos", tags=["repos"])
 
 
 @app.get("/health")

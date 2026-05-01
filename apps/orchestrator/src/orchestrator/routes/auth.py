@@ -21,7 +21,7 @@ GITHUB_USER_URL = "https://api.github.com/user"
 GITHUB_EMAILS_URL = "https://api.github.com/user/emails"
 
 OAUTH_STATE_COOKIE = "vibe_oauth_state"
-OAUTH_SCOPE = "read:user user:email"
+OAUTH_SCOPE = "read:user user:email repo"
 OAUTH_STATE_MAX_AGE = 10 * 60
 SESSION_MAX_AGE = 7 * 24 * 60 * 60
 
@@ -131,6 +131,14 @@ async def _create_session(user: User) -> str:
     return session_id
 
 
+@router.get("/github/manage")
+async def github_manage() -> RedirectResponse:
+    """Send the user to the GitHub OAuth-app settings page where they can grant
+    or request access for orgs that previously denied/restricted this app."""
+    url = f"https://github.com/settings/connections/applications/{settings.github_oauth_client_id}"
+    return RedirectResponse(url=url, status_code=status.HTTP_302_FOUND)
+
+
 @router.get("/github/login")
 async def github_login() -> RedirectResponse:
     state = secrets.token_urlsafe(32)
@@ -197,6 +205,8 @@ async def github_callback(request: Request, code: str, state: str) -> RedirectRe
         ) from exc
 
     user = await _upsert_user(profile)
+    user.github_access_token = access_token
+    await user.save()
 
     if user.id is not None:
         await Session.find(
@@ -248,4 +258,5 @@ async def session_info(user: User | None = Depends(get_user_optional)) -> UserRe
         display_name=user.display_name,
         created_at=user.created_at,
         last_signed_in_at=user.last_signed_in_at,
+        needs_github_reauth=user.github_access_token is None,
     )

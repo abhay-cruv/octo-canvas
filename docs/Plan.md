@@ -41,8 +41,8 @@ Anti-personas (out of scope): teams with shared workspaces, enterprise SSO users
 A signed-in user can:
 
 - ✅ Sign in with GitHub OAuth (read profile, primary email)
-- ⬜ Install the **vibe-platform GitHub App** on one or more accounts/orgs
-- ⬜ See repos the App has access to and **connect any number of them** to their personal sandbox
+- ⬜ Authorize the OAuth App's `repo` scope (during slice 1 sign-in or via a "Reconnect GitHub" prompt for legacy sessions)
+- ⬜ See repos accessible via that token and **connect any number of them** to their personal sandbox
 - ⬜ See per-repo basic introspection (language, package manager, test command)
 - ⬜ Have all connected repos cloned and kept warm in their **single per-user sandbox** under `/work/<repo_full_name>/`
 - ⬜ Start a new **task** against any connected repo by chatting in plain English
@@ -67,7 +67,7 @@ Three apps, three shared boundaries, one Pydantic source-of-truth.
                         ┌───────────────────────────────┐
                         │       MongoDB (Atlas)         │
                         │  users · sessions · repos     │
-                        │  github_installations · tasks │
+                        │  sandboxes · tasks            │
                         │  agent_runs · agent_events    │
                         └──────────────┬────────────────┘
                                        │ Beanie (Motor async)
@@ -77,7 +77,7 @@ Three apps, three shared boundaries, one Pydantic source-of-truth.
 │  Vite SPA    │               │  FastAPI + uvicorn    │   (REST)       │   (one per user)       │
 │  React 18    │               │                       │                │                        │
 │  TanStack    │               │  - Auth (Authlib)     │                │  /work/                │
-│  Tailwind    │               │  - GitHub App +       │ ◄── WSS ────►  │   ├── repo-a/  (clone) │
+│  Tailwind    │               │  - GitHub OAuth +     │ ◄── WSS ────►  │   ├── repo-a/  (clone) │
 │              │               │    githubkit          │                │   ├── repo-b/  (clone) │
 └──────────────┘               │  - Sandbox manager    │                │   └── repo-c/  (clone) │
                                │  - WebSocket gateway  │                │                        │
@@ -103,6 +103,8 @@ Each user gets exactly **one** persistent sandbox. When the user connects a repo
 Lifecycle: `none → spawning → running → idle → hibernated → resumed → running …` (per user, not per task). Idle hibernation kicks in after 10 minutes of no active task; resume on next task. Destroyed only on explicit user action (sign-out does **not** destroy — connected repos and warm caches survive).
 
 > **Alternative considered, not chosen:** sandbox-per-task with on-demand `git clone` each time. Simpler isolation, but cold-start cost (clone + dependency install) on every task. Per-user warm sandbox amortizes that cost across N tasks across N repos. If you wanted the simpler model, this is the section to flip.
+>
+> **Forward-compat note (current limitation, not a permanent constraint):** today the product enforces exactly one sandbox per user — the UI, API surface (`/api/sandbox` with no `{sandbox_id}`), and `Sandbox` collection (one doc per user) all assume singleton. The architecture should be built so this can grow to **multiple sandboxes per user** later (e.g. per-environment, per-team, or to isolate heavy/long-running workloads) without a rewrite. Practically: keep `sandbox_id` on `Task` / `AgentRun` (already the case — see §10), avoid hard-coding "the user's sandbox" in domain logic that could equally accept a sandbox handle, and treat the singleton as a routing/UI choice in the orchestrator rather than a data-model invariant. When we lift the limit, the change should be: add sandbox selection to the task-create flow + repo-connect flow, parameterize the sandbox endpoints by id, and drop the "one per user" uniqueness assumption — not reshape `Task`/`AgentRun`/`Repo`.
 
 Why this shape:
 
@@ -267,26 +269,12 @@ class Session(Document):
     class Settings: name = "sessions"
 ```
 
-### `github_installations` (slice 2)
-One per (user, GitHub App installation). Lets us hit the GitHub API on the user's behalf via the App.
-```python
-class GithubInstallation(Document):
-    user_id: PydanticObjectId
-    installation_id: Annotated[int, Indexed(unique=True)]
-    account_login: str            # "torvalds" or "octo-org"
-    account_type: Literal["User", "Organization"]
-    repository_selection: Literal["all", "selected"]
-    created_at: datetime
-    updated_at: datetime
-    class Settings: name = "github_installations"
-```
-
 ### `repos` (slice 2)
+
 A repo the user has connected. Lives inside their sandbox under `/work/<full_name>/` once cloned.
 ```python
 class Repo(Document):
     user_id: PydanticObjectId
-    installation_id: int          # → GithubInstallation.installation_id
     github_repo_id: Annotated[int, Indexed(unique=True)]
     full_name: str                # "octo-org/repo-name"
     default_branch: str
@@ -298,6 +286,8 @@ class Repo(Document):
     connected_at: datetime
     class Settings: name = "repos"
 ```
+
+> **Note on auth:** there is no `github_installations` collection. Repo access uses the user's OAuth access token (`User.github_access_token` from §11), not a GitHub App installation token. Cloning, fetching, and pushing all run with that single token.
 
 ### `sandboxes` (slice 4)
 
@@ -402,20 +392,15 @@ All under `/api`. Auth via `vibe_session` cookie except where noted. Bodies and 
 |---|---|---|
 | GET | `/api/me` | `UserResponse`. 401 if unauthenticated. |
 
-### GitHub installation (slice 2)
-| Method | Path | Notes |
-|---|---|---|
-| GET | `/api/github/install-url` | Returns the GitHub App install URL with state. |
-| POST | `/api/github/installations/refresh` | Re-fetches installations from GitHub for this user, upserts. |
-| GET | `/api/github/installations` | `list[InstallationResponse]`. |
-| POST | `/api/github/webhook` | Webhook endpoint for App events (installation, installation_repositories). HMAC-verified via `GITHUB_APP_WEBHOOK_SECRET`. **Public, signature-checked.** |
-
 ### Repos (slice 2 + 3)
+
+All repo endpoints use the user's stored OAuth access token (`User.github_access_token`). On any 401 from GitHub, the orchestrator clears the token and returns `403 {"detail": "github_reauth_required"}` — the web app uses that signal to send the user back through the OAuth flow.
+
 | Method | Path | Notes |
 |---|---|---|
-| GET | `/api/repos/available` | Repos accessible via any installation, not yet connected. |
+| GET | `/api/repos/available` | Repos accessible to the user via their OAuth token, minus those already connected. Backed by `GET /user/repos`. |
 | GET | `/api/repos` | Connected repos for this user (with `clone_status` per repo). |
-| POST | `/api/repos/connect` | Body `{installation_id, github_repo_id}`. Creates `Repo`, ensures sandbox is up, **enqueues clone into the user's sandbox**, kicks off introspection (slice 3). |
+| POST | `/api/repos/connect` | Body `{github_repo_id, full_name}`. Verifies access via `GET /repos/{owner}/{repo}` with the user token, creates `Repo`, ensures sandbox is up (slice 4), enqueues clone (slice 4), kicks off introspection (slice 3). |
 | DELETE | `/api/repos/{repo_id}` | Disconnect: removes the clone from the sandbox (`rm -rf /work/<full_name>/`), deletes `Repo`, leaves the sandbox + other repos untouched. |
 | POST | `/api/repos/{repo_id}/reintrospect` | Re-run introspection. (slice 3) |
 | POST | `/api/repos/{repo_id}/sync` | `git fetch` against origin in the sandbox; updates `last_synced_at`. |
@@ -496,9 +481,9 @@ Orchestrator responsibilities on receive:
 
 ```
 ServerHello              { type, tool_allowlist, agent_defaults }
-EnsureRepoCloned         { type, full_name, base_branch, install_token }
+EnsureRepoCloned         { type, full_name, base_branch, user_token }
 RemoveRepo               { type, full_name }
-StartRun                 { type, run_id, task_id, repo_full_name, base_branch, prompt, follow_up, install_token }
+StartRun                 { type, run_id, task_id, repo_full_name, base_branch, prompt, follow_up, user_token }
 UserFollowUpMessage      { type, run_id, content }
 AbortRun                 { type, run_id, reason }
 HibernateSandbox         { type }                                  # bridge flushes, exits cleanly
@@ -523,7 +508,8 @@ The orchestrator transcodes `AgentEvent`s into a UI-friendly schema (`TaskEventF
 - **Session ID**: `secrets.token_urlsafe(32)`. Stored in `Session.session_id` and as the `vibe_session` cookie value. Nothing else in the cookie.
 - **Cookie**: `httponly=True`, `secure=is_production`, `samesite="lax"`, `max_age=7d`, `path="/"`.
 - **CSRF for OAuth flow**: a second short-lived cookie `vibe_oauth_state` (10 min, samesite=lax) holds a `secrets.token_urlsafe(32)` state token. Verified and cleared on callback.
-- **Scope**: `read:user user:email`. **Not** `repo` — repo access comes via the GitHub App, not the OAuth App.
+- **Scope**: `read:user user:email repo`. The `repo` scope (added in slice 2) lets the orchestrator clone, fetch, and push on the user's behalf using their OAuth token. (We deliberately do **not** use a separate GitHub App — see §12.)
+- **Token persistence**: the OAuth access token is stored on `User.github_access_token` (encrypted at rest in v1.1; plain in v1 dev — flagged as a followup). It is refreshed on every successful OAuth callback. On a 401 from GitHub the orchestrator clears it and the user must re-auth via the OAuth flow.
 - **Lookup path**: every request → read cookie → load `Session` → check `expires_at` → load `User` → bump `last_used_at`. Implemented as the FastAPI dependency `require_user` in [apps/orchestrator/src/orchestrator/middleware/auth.py](../apps/orchestrator/src/orchestrator/middleware/auth.py). Optional variant `get_user_optional` returns `None` instead of raising.
 
 Hard rules (from [slice1.md:643-651](slice/slice1.md#L643-L651)):
@@ -537,25 +523,22 @@ Hard rules (from [slice1.md:643-651](slice/slice1.md#L643-L651)):
 
 ## 12. GitHub integration (slice 2)
 
-Two distinct GitHub artifacts, easy to confuse:
+**One GitHub-side artifact: the OAuth App from slice 1**, with the `repo` scope added. There is no separate GitHub App, no installation flow, no webhook server, no smee tunnel.
 
-| | OAuth App (slice 1) | GitHub App (slice 2) |
-|---|---|---|
-| Purpose | Identify the human | Act on repos |
-| Scope | `read:user user:email` | Per-installation repo permissions |
-| Install where | Auto on auth | User clicks "Install" per account/org |
-| Acts as | The user (with their token) | The App itself (installation token) |
+The decision: `repo` scope on the OAuth App gives the orchestrator everything it needs to clone, branch, push, and open PRs on the user's behalf using `githubkit.TokenAuthStrategy(user.github_access_token)`. We accept the tradeoffs (commits attributed to the user, all-or-nothing repo access at consent time, org SSO friction on enterprise orgs) for a much simpler setup story.
+
+> **Alternative considered, not chosen:** a separate GitHub App with installation tokens. Pros: per-repo access selection, bot identity on commits, short-lived tokens. Cons: second GitHub-side registration, private key management, smee.io tunnel for local webhooks, two parallel auth code paths. We may revisit if/when org admins ask for "install per repo" granularity. To flip back, restore the App + installation model from `git log` around the slice 2 redesign.
 
 Slice 2 work:
 
-1. Register a single platform-wide GitHub App with the user (manual, README docs the steps). Required permissions: **Contents (read/write), Pull requests (read/write), Metadata (read)**. Subscribe to `installation`, `installation_repositories` events.
-2. Place credentials in `.env`: `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY`, `GITHUB_APP_WEBHOOK_SECRET`.
-3. Install URL = `https://github.com/apps/<slug>/installations/new?state=<csrf>`.
-4. Webhook handler validates HMAC, upserts `GithubInstallation` rows.
-5. List "available repos" by minting an installation token per installation, calling `GET /installation/repositories`.
-6. Connect: persist `Repo`, fire off introspection.
+1. Expand slice 1's OAuth scope to `read:user user:email repo`. Existing users who signed in before the change have a token without `repo`; the web app shows a "Reconnect GitHub" CTA that re-runs the OAuth flow.
+2. Persist the access token on `User.github_access_token` in the OAuth callback.
+3. List "available repos" by calling `GET /user/repos?affiliation=owner,collaborator,organization_member` with the user's token (paginated via githubkit). Filter out repos already in `repos`.
+4. Connect: re-fetch via `GET /repos/{owner}/{repo}` to verify access, persist `Repo`.
+5. Disconnect: delete the `Repo` doc.
+6. **401 handling**: any GitHub call returning 401 → clear `User.github_access_token`, return `403 {"detail":"github_reauth_required"}`. Web maps that to the reconnect CTA.
 
-Tokens are never persisted long-term — installation tokens are 1-hour, minted per request via githubkit.
+No installation tokens, no token cache (the user token is persisted; githubkit gets it directly), no webhook handler.
 
 ---
 
@@ -572,7 +555,7 @@ class SandboxProvider(Protocol):
     async def hibernate(self, sprite_id: str) -> None: ...
     async def destroy(self, sprite_id: str) -> None: ...
     async def exec(self, sprite_id: str, cmd: list[str], cwd: str | None = None) -> ExecResult: ...
-    async def clone_repo(self, sprite_id: str, *, full_name: str, base_branch: str, install_token: str) -> None: ...
+    async def clone_repo(self, sprite_id: str, *, full_name: str, base_branch: str, user_token: str) -> None: ...
     async def remove_repo(self, sprite_id: str, *, full_name: str) -> None: ...
 ```
 
@@ -652,7 +635,7 @@ The bridge is **long-lived per sandbox** — boots once when the Sprite spawns, 
 
 ### Run loop (per agent run)
 
-1. Receive `StartRun{run_id, task_id, repo_full_name, base_branch, prompt, follow_up: bool, install_token}` from orchestrator.
+1. Receive `StartRun{run_id, task_id, repo_full_name, base_branch, prompt, follow_up: bool, user_token}` from orchestrator.
 2. `cd /work/<repo_full_name>/`. If missing (race): clone now.
 3. `git fetch origin` + `git checkout -B <work_branch> origin/<base_branch>` — the work branch is `vibe/task-{task_id_short}` for run 1, additional commits go on the same branch for follow-ups.
 4. Invoke the Claude Agent SDK with:
@@ -692,10 +675,10 @@ Tool implementations live in `apps/bridge/src/bridge/agent/tools/`. Each tool:
 ## 15. Git workflow inside the bridge (slice 7)
 
 - All git ops happen inside `/work/<repo_full_name>/`. The bridge sets `cwd` per command; never `cd`s globally (so concurrent runs in the future stay isolated).
-- Repo bootstrap (slice 4 onward, on `EnsureRepoCloned`): `git clone --filter=blob:none https://x-access-token:<install_token>@github.com/<full_name>.git /work/<full_name>` — partial clone for fast first-pull on big repos. Then `git remote set-url origin https://github.com/<full_name>.git` to scrub the token.
+- Repo bootstrap (slice 4 onward, on `EnsureRepoCloned`): `git clone --filter=blob:none https://x-access-token:<user_token>@github.com/<full_name>.git /work/<full_name>` — partial clone for fast first-pull on big repos. Then `git remote set-url origin https://github.com/<full_name>.git` to scrub the token.
 - Branch naming: `vibe/task-{slug}` where `slug` is 8 chars of the task id. Run 1 creates it; follow-up runs check it out and add commits.
 - Commit messages: agent generates them; bridge appends `Co-Authored-By: vibe-platform <bot@vibe.dev>`.
-- Push: HTTPS with installation token via `git -c http.extraheader="AUTHORIZATION: bearer <install_token>" push`. Token never written to `.git/config`.
+- Push: HTTPS with the user's OAuth access token via `git -c http.extraheader="AUTHORIZATION: bearer <user_token>" push`. Token never written to `.git/config`.
 - PR creation: githubkit `repos.create_pull_request` against `default_branch`. Body includes a deep link back to the platform task page.
 - PR updates on follow-ups: just push more commits to the same branch — GitHub auto-updates the PR diff.
 - Disconnect path: `RemoveRepo` → `rm -rf /work/<full_name>/`. Other repos in `/work/` are untouched.
@@ -813,11 +796,11 @@ Sign-in flow + `User`/`Session` collections + protected route convention. Accept
 7. `pnpm --filter @vibe-platform/api-types gen:api-types` so [packages/api-types/generated/schema.d.ts](../packages/api-types/generated/schema.d.ts) is real, not the stub.
 8. User reviews and approves; *only then* slice 2 brief is written.
 
-### Slice 2 — GitHub App + repo connection
-**Adds:** GitHub App registration (manual), `GithubInstallation` + `Repo` documents, install/list/connect/disconnect endpoints, webhook handler with HMAC verification, web UI to install + pick **multiple** repos. Repos are persisted but not yet cloned anywhere — connection is a logical state, not yet a sandbox state.
-**Files:** routes `repos.py`, `github.py`; `python_packages/github_integration/` filled in (App JWT minting, installation token cache, webhook signature verifier); web pages `/_authed/repos.tsx`, `/_authed/repos/connect.tsx`.
-**Risks:** webhook delivery in local dev (use `smee.io` or ngrok; doc this in README). N-to-1 between repos and the user's eventual sandbox needs UI affordance — show "(connected, awaiting sandbox)" until slice 4 lands.
-**Acceptance:** install App → see installation → see available repos → connect three → refresh → all three persist; webhook event for installation arrives and is logged; disconnect removes one without affecting the others.
+### Slice 2 — OAuth `repo` scope + repo connection
+**Adds:** expand slice 1's OAuth scope to include `repo`; persist the access token on `User`; `Repo` document; list-available / connect / disconnect endpoints backed by the user's OAuth token; web UI to pick repos and reconnect when the token is invalid. Repos are persisted but not cloned — connection is a logical state, not yet a sandbox state.
+**Files:** route `repos.py`; `python_packages/github_integration/` filled in (thin OAuth-token client helper + `GithubReauthRequired` exception); web pages `/_authed/repos.tsx`, `/_authed/repos/connect.tsx` and a "Reconnect GitHub" affordance on the dashboard.
+**Risks:** existing slice-1 sessions hold tokens without `repo` scope — must drive them through reconnect. Org SSO will block the user's token from accessing org repos until the user clicks "Authorize" per-org on GitHub. Storing the OAuth token in plain text in dev is a v1.1 followup (encrypt at rest).
+**Acceptance:** signed-in user sees available repos → connects three → refresh → all three persist with `clone_status="pending"`; revoking the OAuth grant on GitHub causes the next repo call to return `403 github_reauth_required` and the UI surfaces a Reconnect button; reconnecting restores the list without losing already-connected `Repo` rows.
 
 ### Slice 3 — Repo introspection
 **Adds:** on connect (and on `/reintrospect`), the orchestrator hits the GitHub Trees API for the repo and detects language/package manager/test command from filename heuristics, embeds `RepoIntrospection` on the `Repo` doc.

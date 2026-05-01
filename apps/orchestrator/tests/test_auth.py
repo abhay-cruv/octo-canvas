@@ -112,6 +112,7 @@ async def test_github_callback_creates_user_and_session(
     assert user is not None
     assert user.github_username == "ada"
     assert user.email == "ada@example.com"
+    assert user.github_access_token == "gh-token"
 
     sessions = await Session.find_all().to_list()
     assert len(sessions) == 1
@@ -143,3 +144,18 @@ async def test_me_returns_user_with_valid_session(client: httpx.AsyncClient) -> 
     body = response.json()
     assert body["github_username"] == "octocat"
     assert body["email"] == "octocat@example.com"
+    # Seeded user has no github_access_token → reauth required.
+    assert body["needs_github_reauth"] is True
+
+
+@pytest.mark.asyncio
+async def test_me_reports_no_reauth_when_token_set(
+    client: httpx.AsyncClient,
+) -> None:
+    user, session = await _seed_user_and_session()
+    user.github_access_token = "stored-token"
+    await user.save()
+    client.cookies.set(SESSION_COOKIE_NAME, session.session_id)
+    response = await client.get("/api/me")
+    assert response.status_code == 200
+    assert response.json()["needs_github_reauth"] is False

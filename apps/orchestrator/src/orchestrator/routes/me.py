@@ -18,4 +18,5 @@ async def get_me(user: User = Depends(require_user)) -> UserResponse:
         display_name=user.display_name,
         created_at=user.created_at,
         last_signed_in_at=user.last_signed_in_at,
+        needs_github_reauth=user.github_access_token is None,
     )

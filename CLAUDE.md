@@ -22,7 +22,7 @@ Entry point for Claude Code sessions in this repository. The actual rules live e
 | Type bridges (Pydantic → OpenAPI → TS) | [docs/Plan.md §7](docs/Plan.md) |
 | Where reusable code lives (`python_packages/` vs `packages/` vs app `src/`) | [AGENTS.md §2.2](AGENTS.md) |
 | Use graphify-out as your map (efficiently, verify findings) | [AGENTS.md §2.7](AGENTS.md) |
-| Frontend theme rules (light mode only, light/transparent surfaces, black accents) | [AGENTS.md §2.8](AGENTS.md) |
+| Frontend theme + responsiveness rules (light mode only, light/transparent surfaces, black accents, mobile-first) | [AGENTS.md §2.8](AGENTS.md) |
 | Engineering change-flow recipes | [docs/engineering.md](docs/engineering.md) |
 | Test strategy | [docs/TESTING.md](docs/TESTING.md) |
 

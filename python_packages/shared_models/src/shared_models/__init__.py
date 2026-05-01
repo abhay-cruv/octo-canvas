@@ -1,5 +1,17 @@
 """Shared Pydantic models used by both orchestrator and bridge."""
 
+from shared_models.github import (
+    AvailableRepo,
+    AvailableReposPage,
+    ConnectedRepo,
+    ConnectRepoRequest,
+)
 from shared_models.user import UserResponse
 
-__all__ = ["UserResponse"]
+__all__ = [
+    "AvailableRepo",
+    "AvailableReposPage",
+    "ConnectRepoRequest",
+    "ConnectedRepo",
+    "UserResponse",
+]

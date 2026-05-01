@@ -12,3 +12,4 @@ class UserResponse(BaseModel):
     display_name: str | None
     created_at: datetime
     last_signed_in_at: datetime
+    needs_github_reauth: bool

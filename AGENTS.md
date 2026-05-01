@@ -235,6 +235,21 @@ The web app is **light-mode only** in v1 and beyond. There is no dark-mode toggl
 
 If a design need genuinely doesn't fit this palette, surface it to the user before deviating (per §3.5 deviation protocol).
 
+#### Responsiveness
+
+The web app must work across mobile, tablet, and desktop. Every UI component is responsive by default — there is no separate mobile build.
+
+- **Mobile-first**: write base styles for the smallest viewport (~320px), then layer up with Tailwind breakpoints (`sm:`, `md:`, `lg:`, `xl:`). Don't write desktop-first and patch mobile after.
+- **Test at three widths** before declaring a UI task done: ~375px (phone), ~768px (tablet), ≥1280px (desktop). Resize the browser or use devtools device emulation.
+- **Layout**: prefer flex/grid with `flex-wrap`, `gap-*`, and responsive column counts (`grid-cols-1 md:grid-cols-2 lg:grid-cols-3`) over fixed widths. Avoid hardcoded `w-[...]px` for containers — use `max-w-*` + `w-full`.
+- **Touch targets**: interactive elements ≥ 44×44px on mobile. Use `py-3 px-4` minimums on buttons; don't shrink them at small breakpoints.
+- **Typography**: scale with breakpoints where it matters (`text-2xl md:text-4xl`). Never let headings overflow their container — use `break-words` / `truncate` deliberately.
+- **No horizontal scroll** at any supported width. If content overflows, fix the layout, don't add `overflow-x-auto` as a band-aid (tables and code blocks are the legitimate exceptions).
+- **Navigation**: long horizontal nav must collapse to a menu on mobile. Sidebars become drawers or stack above content.
+- **Images & media**: `max-w-full h-auto` by default; use `object-cover` / `object-contain` purposefully.
+
+If a layout genuinely can't be made responsive (e.g. a complex data viz), surface it to the user before shipping a desktop-only screen.
+
 ---
 
 ## 3. Documentation rules
