@@ -40,6 +40,13 @@ For *what changed structurally*, read [progress.md](progress.md). For *who and w
 
 ## Log
 
+### 2026-05-01 — Claude Opus 4.7 via Claude Code (slice 2 sign-off + collection registry)
+
+- **User signed off slice 2.** [slice/slice2.md](slice/slice2.md) is now frozen per AGENTS.md §3.2/§5; corrections move to [progress.md](progress.md). Slice status table flipped 2 → ✅ shipped, 3 → ⬜ awaiting brief.
+- **Centralized collection-name registry** [db/collections.py](../python_packages/db/src/db/collections.py): single `Collections` class with `USERS` / `SESSIONS` / `REPOS` constants (plus reserved `SANDBOXES` / `TASKS` / `AGENT_RUNS` / `AGENT_EVENTS` for slice 4+) and an `ALL` tuple. Imports nothing from models — no circular-import risk.
+- All Beanie models now read `Settings.name = Collections.X` instead of literal strings ([user.py](../python_packages/db/src/db/models/user.py), [session.py](../python_packages/db/src/db/models/session.py), [repo.py](../python_packages/db/src/db/models/repo.py)). `Mongo` typed accessors (`mongo.users`, `mongo.sessions`, `mongo.repos`) use `Collections.X` too. Added `mongo.drop_all_collections()` and `mongo.collection(name)` escape hatch. Re-exported `Collections` + `ALL_COLLECTIONS` from `db/__init__.py`.
+- Test conftest reduced to `connect → drop_all_collections → reconnect` — no more hand-listed model tuples drifting out of sync. 22 pytest tests still green; pyright + ruff + tsc + eslint all clean.
+
 ### 2026-05-01 — Claude Opus 4.7 via Claude Code (motor → pymongo migration + Mongo singleton)
 
 - **Driver swap.** Beanie 1.30 (motor-based) → Beanie 2.1 (pymongo's new `AsyncMongoClient`). Motor uninstalled. Pinned `beanie>=2.0,<3.0`, `pymongo>=4.11,<5.0` in [python_packages/db/pyproject.toml](../python_packages/db/pyproject.toml) and the orchestrator's pyproject.

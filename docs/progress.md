@@ -12,8 +12,8 @@ Sibling docs: [agent_context.md](agent_context.md) (quick-start) · [engineering
 |---|---|---|---|
 | 0 | Scaffolding | ✅ shipped | Skeleton repo, placeholders, build/dev/test plumbing across both langs |
 | 1 | GitHub OAuth + user persistence | ✅ shipped | `User` + `Session` collections, `/login` → `/dashboard` flow, `require_user` dependency. UI redesigned to profile view. |
-| 2 | OAuth `repo` scope + repo connection | ✅ code shipped, ⬜ verifying | OAuth scope expanded to include `repo`; access token persisted on `User`; `Repo` collection; list/connect/disconnect endpoints; **401 → clear token + 403 `github_reauth_required`**; UI Reconnect flow. **No GitHub App, no smee, no webhooks** (rejected design). **No clone, no introspection, no sandbox** (slices 3 + 4). |
-| 3 | Repo introspection | ⬜ not started | |
+| 2 | OAuth `repo` scope + repo connection | ✅ shipped | OAuth scope expanded to include `repo`; access token persisted on `User`; `Repo` collection; list/connect/disconnect endpoints; **401 → clear token + 403 `github_reauth_required`**; UI Reconnect flow. **No GitHub App, no smee, no webhooks** (rejected design). **No clone, no introspection, no sandbox** (slices 3 + 4). [slice2.md](slice/slice2.md) is now frozen — corrections live below. |
+| 3 | Repo introspection | ⬜ not started | Brief not yet written; awaiting authoring before code |
 | 4 | Sandbox provider (Sprites) — per-user, multi-repo | ⬜ not started | |
 | 5 | WebSocket transport | ⬜ not started | |
 | 6 | Tasks + Agent SDK invocation | ⬜ not started | |
@@ -22,26 +22,23 @@ Sibling docs: [agent_context.md](agent_context.md) (quick-start) · [engineering
 
 ---
 
-## Active slice — Slice 2 verification
+## Active slice — none
 
-### Punch list
+Slice 2 signed off **2026-05-01**. [slice2.md](slice/slice2.md) is frozen. Corrections / followups live in this file from now on.
 
-1. ✅ `pnpm typecheck && pnpm lint && pnpm test && pnpm build` all green (21 pytest tests)
-2. ✅ `pnpm --filter @vibe-platform/api-types gen:api-types` regenerated against live orchestrator
-3. ✅ Sign-in walk verified end-to-end (OAuth scope `read:user user:email repo`, token persisted to `users.github_access_token`)
-4. ✅ Browse + connect + disconnect verified manually (with the route-pattern fix moving `repos.tsx` → `repos/index.tsx`)
-5. ✅ `/api/repos/available` paginates server-side (`page`, `per_page`); search switched from client-side filter to GitHub `/search/repositories` server-side; `scope_mine` toggle (default true) scopes via `user:`/`org:` qualifiers
-6. ✅ Token-revocation walk: revoke OAuth grant on github.com → Reconnect banner appears + `users.github_access_token=null` → Reconnect via in-page CTA → token restored, prior `Repo` rows preserved
-7. ✅ Manage-orgs walk: "Manage GitHub org access" panel link → grant a previously-restricted org → org repos appear in `/repos/connect`. (The always-visible "Reconnect GitHub" button in the panel was removed — redundant given that the contextual ReconnectCard appears when actually needed and the panel link covers org-grant.)
-8. ⬜ User reviews and approves slice 2; *only then* author `slice3.md`
+Next: slice 3 (repo introspection). **Brief must be authored before any code** ([AGENTS.md §3.2](../AGENTS.md), [CLAUDE.md](../CLAUDE.md)).
 
-### Known issues / blockers
+### Open followups (not blockers; flag at slice-3 kickoff)
 
 - **Dev Mongo has a stale `github_repo_id_1` unique index** from the pre-fix schema — drop it once with `docker exec vibe-mongo mongosh vibe_platform --eval 'db.repos.dropIndex("github_repo_id_1")'` so cross-user repo connects work. Test DB rebuilds indexes per run (see conftest), so tests are unaffected.
-- v1.1 followup: encrypt `User.github_access_token` at rest (currently plaintext in Mongo for dev simplicity)
-- Org SSO requires per-org "Authorize" click on github.com before personal OAuth tokens can list/clone org repos. Mitigation: "Manage GitHub org access" button in the dashboard panel deep-links to the OAuth-app settings page; no auto-detection yet
-- Server-side search via `/search/repositories` doesn't include repos the user has *only* collaborator access to on someone else's personal account (we can't enumerate "who you collaborate with"). The non-search browse path covers them via `/user/repos?affiliation=collaborator`. Acceptable for v1; flag if it bites
-- `apps/web/` has no Vitest tests yet (still `--passWithNoTests`); UI verification is manual
+- v1.1 followup: encrypt `User.github_access_token` at rest (currently plaintext in Mongo for dev simplicity).
+- Org SSO requires per-org "Authorize" click on github.com before personal OAuth tokens can list/clone org repos. Mitigation: "Manage GitHub org access" button in the dashboard panel deep-links to the OAuth-app settings page; no auto-detection yet.
+- Server-side search via `/search/repositories` doesn't include repos the user has *only* collaborator access to on someone else's personal account (we can't enumerate "who you collaborate with"). The non-search browse path covers them via `/user/repos?affiliation=collaborator`. Acceptable for v1; flag if it bites.
+- `apps/web/` has no Vitest tests yet (still `--passWithNoTests`); UI verification is manual.
+
+### Slice-2 corrections (post-freeze)
+
+*None yet — record any here as discovered.*
 
 ---
 
