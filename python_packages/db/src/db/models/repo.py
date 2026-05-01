@@ -4,6 +4,7 @@ from typing import ClassVar, Literal
 from beanie import Document, PydanticObjectId
 from pydantic import Field
 from pymongo import ASCENDING, IndexModel
+from shared_models.introspection import IntrospectionOverrides, RepoIntrospection
 
 from db.collections import Collections
 
@@ -23,8 +24,10 @@ class Repo(Document):
     full_name: str
     default_branch: str
     private: bool
-    # Slice 3 widens this to RepoIntrospection | None — keep typed as None for now.
-    introspection: None = None
+    # What introspection detected. Refreshed on connect + every reintrospect.
+    introspection_detected: RepoIntrospection | None = None
+    # Sparse user overrides — non-None fields take precedence over detected.
+    introspection_overrides: IntrospectionOverrides | None = None
     clone_status: Literal["pending", "cloning", "ready", "failed"] = "pending"
     clone_path: str | None = None
     last_synced_at: datetime | None = None

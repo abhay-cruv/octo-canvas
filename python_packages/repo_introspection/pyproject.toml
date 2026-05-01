@@ -4,7 +4,14 @@ version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
     "pydantic>=2.9",
+    "githubkit>=0.11",
+    "github_integration",
+    "shared_models",
 ]
+
+[tool.uv.sources]
+github_integration = { workspace = true }
+shared_models = { workspace = true }
 
 [build-system]
 requires = ["hatchling"]

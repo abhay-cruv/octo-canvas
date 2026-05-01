@@ -3,6 +3,8 @@ from typing import Literal
 
 from pydantic import BaseModel
 
+from shared_models.introspection import IntrospectionOverrides, RepoIntrospection
+
 
 class AvailableRepo(BaseModel):
     github_repo_id: int
@@ -28,6 +30,15 @@ class ConnectedRepo(BaseModel):
     private: bool
     clone_status: Literal["pending", "cloning", "ready", "failed"]
     connected_at: datetime
+    # Effective values: detected merged with user overrides. Slice 4+ callers
+    # (bridge, agent runs) read this — they don't care which fields were user-set.
+    introspection: RepoIntrospection | None
+    # Raw detection. Exposed so the UI can show "detected was X" alongside an
+    # override and so a "Reset" action knows what the field would revert to.
+    introspection_detected: RepoIntrospection | None
+    # Sparse — only the fields the user explicitly overrode. The UI uses this
+    # to render a "(custom)" badge per overridden field.
+    introspection_overrides: IntrospectionOverrides | None
 
 
 class ConnectRepoRequest(BaseModel):

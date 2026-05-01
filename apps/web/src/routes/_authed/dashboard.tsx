@@ -6,7 +6,13 @@ import {
   meQueryOptions,
 } from '../../lib/queries';
 import { logout, manageGithubAccessUrl, startGithubLogin } from '../../lib/auth';
-import { disconnectRepo, GithubReauthRequiredError } from '../../lib/repos';
+import {
+  disconnectRepo,
+  GithubReauthRequiredError,
+  type IntrospectionOverrides,
+  reintrospectRepo,
+  updateIntrospectionOverrides,
+} from '../../lib/repos';
 
 export const Route = createFileRoute('/_authed/dashboard')({
   component: DashboardPage,
@@ -44,6 +50,25 @@ function DashboardPage() {
     },
   });
 
+  const reintrospectMutation = useMutation({
+    mutationFn: reintrospectRepo,
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['repos', 'connected'] });
+    },
+    onError: (err) => {
+      if (err instanceof GithubReauthRequiredError) {
+        void queryClient.invalidateQueries({ queryKey: ['me'] });
+      }
+    },
+  });
+
+  const overridesMutation = useMutation({
+    mutationFn: updateIntrospectionOverrides,
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['repos', 'connected'] });
+    },
+  });
+
   if (!me) return null;
 
   async function handleSignOut() {
@@ -72,6 +97,20 @@ function DashboardPage() {
               onDisconnect={(id) => disconnectMutation.mutate(id)}
               disconnectingId={
                 disconnectMutation.isPending ? disconnectMutation.variables : null
+              }
+              onReintrospect={(id) => reintrospectMutation.mutate(id)}
+              reintrospectingId={
+                reintrospectMutation.isPending
+                  ? reintrospectMutation.variables
+                  : null
+              }
+              onSaveOverrides={(repoId, overrides) =>
+                overridesMutation.mutateAsync({ repoId, overrides })
+              }
+              savingOverridesId={
+                overridesMutation.isPending
+                  ? overridesMutation.variables.repoId
+                  : null
               }
             />
           )}
@@ -218,11 +257,22 @@ function ReposCenter({
   isLoading,
   onDisconnect,
   disconnectingId,
+  onReintrospect,
+  reintrospectingId,
+  onSaveOverrides,
+  savingOverridesId,
 }: {
   repos: ReadonlyArray<Repo> | null;
   isLoading: boolean;
   onDisconnect: (id: string) => void;
   disconnectingId: string | null;
+  onReintrospect: (id: string) => void;
+  reintrospectingId: string | null;
+  onSaveOverrides: (
+    repoId: string,
+    overrides: IntrospectionOverrides,
+  ) => Promise<unknown>;
+  savingOverridesId: string | null;
 }) {
   return (
     <>
@@ -251,28 +301,16 @@ function ReposCenter({
         ) : (
           <ul className="divide-y divide-gray-200">
             {repos.map((repo) => (
-              <li
+              <RepoRow
                 key={repo.id}
-                className="flex items-center justify-between gap-4 py-3 px-5"
-              >
-                <div className="min-w-0">
-                  <div className="font-medium text-gray-900 truncate">
-                    {repo.full_name}
-                  </div>
-                  <div className="text-xs text-gray-600 mt-0.5">
-                    {repo.private ? 'Private' : 'Public'} ·{' '}
-                    <CloneStatusLabel status={repo.clone_status} />
-                  </div>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => onDisconnect(repo.id)}
-                  disabled={disconnectingId === repo.id}
-                  className="shrink-0 text-sm px-3 py-1.5 rounded-lg bg-white border border-gray-300 text-gray-900 hover:bg-gray-100 disabled:opacity-60"
-                >
-                  Disconnect
-                </button>
-              </li>
+                repo={repo}
+                onDisconnect={onDisconnect}
+                isDisconnecting={disconnectingId === repo.id}
+                onReintrospect={onReintrospect}
+                isReintrospecting={reintrospectingId === repo.id}
+                onSaveOverrides={onSaveOverrides}
+                isSavingOverrides={savingOverridesId === repo.id}
+              />
             ))}
           </ul>
         )}
@@ -284,6 +322,249 @@ function ReposCenter({
 type Repo = Awaited<
   ReturnType<NonNullable<typeof connectedReposQueryOptions.queryFn>>
 >[number];
+
+type Introspection = NonNullable<Repo['introspection']>;
+
+const OVERRIDE_FIELDS: ReadonlyArray<{
+  key: keyof IntrospectionOverrides;
+  label: string;
+  placeholder: string;
+}> = [
+  { key: 'primary_language', label: 'Language', placeholder: 'TypeScript' },
+  { key: 'package_manager', label: 'Package manager', placeholder: 'pnpm' },
+  { key: 'test_command', label: 'Test', placeholder: 'pnpm test' },
+  { key: 'build_command', label: 'Build', placeholder: 'pnpm build' },
+  { key: 'dev_command', label: 'Dev', placeholder: 'pnpm dev' },
+];
+
+function RepoRow({
+  repo,
+  onDisconnect,
+  isDisconnecting,
+  onReintrospect,
+  isReintrospecting,
+  onSaveOverrides,
+  isSavingOverrides,
+}: {
+  repo: Repo;
+  onDisconnect: (id: string) => void;
+  isDisconnecting: boolean;
+  onReintrospect: (id: string) => void;
+  isReintrospecting: boolean;
+  onSaveOverrides: (
+    repoId: string,
+    overrides: IntrospectionOverrides,
+  ) => Promise<unknown>;
+  isSavingOverrides: boolean;
+}) {
+  const [editing, setEditing] = useState(false);
+  const overrides = repo.introspection_overrides ?? null;
+  const detected = repo.introspection_detected ?? null;
+  const effective = repo.introspection ?? null;
+
+  return (
+    <li className="flex flex-col gap-3 py-3 px-5">
+      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+        <div className="min-w-0 flex-1">
+          <div className="font-medium text-gray-900 truncate">
+            {repo.full_name}
+          </div>
+          <div className="text-xs text-gray-600 mt-0.5">
+            {repo.private ? 'Private' : 'Public'} ·{' '}
+            <CloneStatusLabel status={repo.clone_status} />
+          </div>
+          <IntrospectionPills
+            effective={effective}
+            overrides={overrides}
+            isLoading={isReintrospecting}
+          />
+        </div>
+        <div className="shrink-0 flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={() => setEditing((v) => !v)}
+            className="text-sm px-3 py-1.5 rounded-lg bg-white border border-gray-300 text-gray-900 hover:bg-gray-50"
+          >
+            {editing ? 'Close' : 'Edit fields'}
+          </button>
+          <button
+            type="button"
+            onClick={() => onReintrospect(repo.id)}
+            disabled={isReintrospecting}
+            className="text-sm px-3 py-1.5 rounded-lg bg-white border border-gray-300 text-gray-900 hover:bg-gray-50 disabled:opacity-60"
+          >
+            {isReintrospecting
+              ? 'Detecting…'
+              : detected
+                ? 'Re-introspect'
+                : 'Detect repo info'}
+          </button>
+          <button
+            type="button"
+            onClick={() => onDisconnect(repo.id)}
+            disabled={isDisconnecting}
+            className="text-sm px-3 py-1.5 rounded-lg bg-white border border-gray-300 text-gray-900 hover:bg-gray-100 disabled:opacity-60"
+          >
+            Disconnect
+          </button>
+        </div>
+      </div>
+      {editing ? (
+        <OverrideEditor
+          overrides={overrides}
+          detected={detected}
+          isSaving={isSavingOverrides}
+          onCancel={() => setEditing(false)}
+          onSave={async (next) => {
+            await onSaveOverrides(repo.id, next);
+            setEditing(false);
+          }}
+        />
+      ) : null}
+    </li>
+  );
+}
+
+function OverrideEditor({
+  overrides,
+  detected,
+  isSaving,
+  onCancel,
+  onSave,
+}: {
+  overrides: IntrospectionOverrides | null;
+  detected: Introspection | null;
+  isSaving: boolean;
+  onCancel: () => void;
+  onSave: (next: IntrospectionOverrides) => Promise<unknown>;
+}) {
+  const [draft, setDraft] = useState<Record<string, string>>(() => {
+    const initial: Record<string, string> = {};
+    if (overrides) {
+      for (const { key } of OVERRIDE_FIELDS) {
+        const value = overrides[key];
+        if (typeof value === 'string') initial[key] = value;
+      }
+    }
+    return initial;
+  });
+
+  function buildPayload(): IntrospectionOverrides {
+    const out: Record<string, string | null> = {};
+    for (const { key } of OVERRIDE_FIELDS) {
+      const v = draft[key]?.trim() ?? '';
+      out[key] = v === '' ? null : v;
+    }
+    return out as IntrospectionOverrides;
+  }
+
+  return (
+    <div className="rounded-lg border border-gray-200 bg-gray-50/50 p-4 space-y-3">
+      <div className="text-xs text-gray-600">
+        Override what introspection detected. Leave a field empty to fall back to the detected value.
+      </div>
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+        {OVERRIDE_FIELDS.map(({ key, label, placeholder }) => {
+          const detectedValue =
+            detected !== null
+              ? (detected[key as keyof Introspection] as string | null | undefined)
+              : null;
+          return (
+            <label key={key} className="flex flex-col gap-1 min-w-0">
+              <span className="text-[11px] uppercase tracking-wider text-gray-500">
+                {label}
+              </span>
+              <input
+                type="text"
+                value={draft[key] ?? ''}
+                onChange={(e) =>
+                  setDraft((d) => ({ ...d, [key]: e.target.value }))
+                }
+                placeholder={detectedValue ?? placeholder}
+                className="px-2 py-1.5 text-sm rounded-md border border-gray-300 bg-white focus:outline-none focus:border-black"
+              />
+              {detectedValue ? (
+                <span className="text-[11px] text-gray-500 truncate">
+                  Detected: <span className="font-mono">{detectedValue}</span>
+                </span>
+              ) : null}
+            </label>
+          );
+        })}
+      </div>
+      <div className="flex flex-wrap items-center gap-2 justify-end">
+        <button
+          type="button"
+          onClick={() => setDraft({})}
+          disabled={isSaving}
+          className="text-sm px-3 py-1.5 rounded-lg bg-white border border-gray-300 text-gray-900 hover:bg-gray-50 disabled:opacity-60"
+        >
+          Clear all
+        </button>
+        <button
+          type="button"
+          onClick={onCancel}
+          disabled={isSaving}
+          className="text-sm px-3 py-1.5 rounded-lg bg-white border border-gray-300 text-gray-900 hover:bg-gray-50 disabled:opacity-60"
+        >
+          Cancel
+        </button>
+        <button
+          type="button"
+          onClick={() => void onSave(buildPayload())}
+          disabled={isSaving}
+          className="text-sm px-3 py-1.5 rounded-lg bg-black text-white hover:bg-gray-800 disabled:opacity-60"
+        >
+          {isSaving ? 'Saving…' : 'Save overrides'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function IntrospectionPills({
+  effective,
+  overrides,
+  isLoading,
+}: {
+  effective: Introspection | null;
+  overrides: IntrospectionOverrides | null;
+  isLoading: boolean;
+}) {
+  if (effective === null && overrides === null) {
+    return (
+      <div
+        className={`mt-2 text-xs text-gray-500 italic ${isLoading ? 'opacity-60' : ''}`}
+      >
+        No introspection yet — click “Detect repo info” or “Edit fields”.
+      </div>
+    );
+  }
+  function pillFor(key: keyof Introspection & keyof IntrospectionOverrides) {
+    const value = effective ? (effective[key] as string | null) : null;
+    const isOverridden =
+      overrides !== null && (overrides[key] as string | null) !== null;
+    return (
+      <Pill
+        key={key}
+        label={value}
+        mono={key !== 'primary_language' && key !== 'package_manager'}
+        overridden={isOverridden}
+      />
+    );
+  }
+  return (
+    <div
+      className={`mt-2 flex flex-wrap items-center gap-1.5 ${isLoading ? 'opacity-60' : ''}`}
+    >
+      {pillFor('primary_language')}
+      {pillFor('package_manager')}
+      {pillFor('test_command')}
+      {pillFor('build_command')}
+      {pillFor('dev_command')}
+    </div>
+  );
+}
 
 function ReconnectCard() {
   return (
@@ -325,6 +606,37 @@ function EmptyConnected() {
 
 function Empty({ children }: { children: React.ReactNode }) {
   return <div className="px-5 py-6 text-sm text-gray-600">{children}</div>;
+}
+
+function Pill({
+  label,
+  mono,
+  overridden,
+}: {
+  label: string | null;
+  mono?: boolean;
+  overridden?: boolean;
+}) {
+  if (label === null) {
+    return (
+      <span className="px-1.5 py-0.5 text-[11px] rounded-md bg-gray-50 text-gray-400 border border-gray-200">
+        —
+      </span>
+    );
+  }
+  return (
+    <span
+      className={`px-1.5 py-0.5 text-[11px] rounded-md border inline-flex items-center gap-1 ${
+        overridden
+          ? 'bg-black text-white border-black'
+          : 'bg-gray-100 text-gray-800 border-gray-200'
+      } ${mono ? 'font-mono' : ''}`}
+      title={overridden ? 'Overridden by you' : undefined}
+    >
+      {label}
+      {overridden ? <span aria-hidden>•</span> : null}
+    </span>
+  );
 }
 
 function CloneStatusLabel({ status }: { status: string }) {

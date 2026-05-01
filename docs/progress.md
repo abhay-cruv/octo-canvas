@@ -13,7 +13,7 @@ Sibling docs: [agent_context.md](agent_context.md) (quick-start) · [engineering
 | 0 | Scaffolding | ✅ shipped | Skeleton repo, placeholders, build/dev/test plumbing across both langs |
 | 1 | GitHub OAuth + user persistence | ✅ shipped | `User` + `Session` collections, `/login` → `/dashboard` flow, `require_user` dependency. UI redesigned to profile view. |
 | 2 | OAuth `repo` scope + repo connection | ✅ shipped | OAuth scope expanded to include `repo`; access token persisted on `User`; `Repo` collection; list/connect/disconnect endpoints; **401 → clear token + 403 `github_reauth_required`**; UI Reconnect flow. **No GitHub App, no smee, no webhooks** (rejected design). **No clone, no introspection, no sandbox** (slices 3 + 4). [slice2.md](slice/slice2.md) is now frozen — corrections live below. |
-| 3 | Repo introspection | ⬜ not started | Brief not yet written; awaiting authoring before code |
+| 3 | Repo introspection | 🟡 active — code shipped (incl. scope amendment), awaiting sign-off | Brief at [slice3.md](slice/slice3.md). Trees + Contents API, no clone. Five fields incl. `dev_command`. Per-field user overrides via `PATCH /api/repos/{id}/introspection`. |
 | 4 | Sandbox provider (Sprites) — per-user, multi-repo | ⬜ not started | |
 | 5 | WebSocket transport | ⬜ not started | |
 | 6 | Tasks + Agent SDK invocation | ⬜ not started | |
@@ -43,6 +43,22 @@ Next: slice 3 (repo introspection). **Brief must be authored before any code** (
 ---
 
 ## Recent changes (newest first)
+
+### 2026-05-01 (slice 3 — repo introspection, code shipped + scope amendment)
+
+- **Scope amendment (in-flight)**: added `dev_command` field + per-field user overrides. `Repo` doc now stores `introspection_detected` and `introspection_overrides` separately; the wire shape `ConnectedRepo` exposes both raw fields plus an `introspection` field carrying the merged-effective values. New `PATCH /api/repos/{repo_id}/introspection` endpoint (full replacement of overrides; send `{}` to clear). Re-introspect preserves overrides — only `detected` refreshes. Five new override-endpoint tests + dev_command coverage in `test_commands.py`. Brief updated in-flight (allowed per [AGENTS.md §3.2](../AGENTS.md)) — see [slice3.md §0](slice/slice3.md). Total tests now: orchestrator 35, introspection 50.
+- UI: pills row gained a fifth (`dev_command`) entry; overridden fields render as a black-filled pill with a `•` glyph. New "Edit fields" button per row toggles an inline panel with five text inputs (placeholder = detected value, helper text "Detected: …" below the input), Clear all / Cancel / Save buttons. Save calls `PATCH`; query invalidates on success. Disabled while saving.
+
+### 2026-05-01 (slice 3 — repo introspection, code shipped)
+
+- **Slice 3 brief authored** at [slice/slice3.md](slice/slice3.md) — GitHub-API-only detection (Trees + Contents), no clone. Adapter pattern in [../python_packages/repo_introspection/src/repo_introspection/github_source.py](../python_packages/repo_introspection/src/repo_introspection/github_source.py) so slice 4 can swap to a filesystem source.
+- **`shared_models.RepoIntrospection`** added at [../python_packages/shared_models/src/shared_models/introspection.py](../python_packages/shared_models/src/shared_models/introspection.py) — embedded on `Repo` and surfaced on `ConnectedRepo`. `PackageManager` literal extended to include `bun`, `maven`, `gradle`, `other` (user-edited during draft).
+- **`repo_introspection` package** filled in: `language.py` (extension-counting with vendor-dir filter), `package_manager.py` (lockfile-priority + `pyproject.toml` blob disambiguation for uv/poetry), `commands.py` (per-pm test/build with `package.json scripts` parsing for JS, `[tool.pytest]` signal for pip), `orchestrate.py` (single `introspect_via_github` entry point).
+- **Routes** ([../apps/orchestrator/src/orchestrator/routes/repos.py](../apps/orchestrator/src/orchestrator/routes/repos.py)): `_introspect_into` runs inline on connect (best-effort — non-401 failures logged + swallowed, 401 propagates as `github_reauth_required`); new `POST /api/repos/{repo_id}/reintrospect` endpoint with the same reauth discipline.
+- **Web UI** ([../apps/web/src/routes/_authed/dashboard.tsx](../apps/web/src/routes/_authed/dashboard.tsx)): four-pill row per connected repo (`primary_language`, `package_manager`, `test_command`, `build_command`; `null` renders as muted `—`); per-row "Re-introspect" / "Detect repo info" button; dim during pending mutation. `apps/web/src/lib/repos.ts` gains `reintrospectRepo` with the same 403-reauth pattern.
+- **Tests**: 46 unit tests in [../python_packages/repo_introspection/tests/](../python_packages/repo_introspection/tests/) (language, package_manager, commands — pure functions, no network); 8 new integration tests in [../apps/orchestrator/tests/test_repos.py](../apps/orchestrator/tests/test_repos.py) covering connect-with-introspection, swallow-non-401-failure, propagate-reauth, and the four reintrospect cases. Total orchestrator tests: 29 passed.
+- **API types regenerated** — [../packages/api-types/generated/schema.d.ts](../packages/api-types/generated/schema.d.ts) now exposes `RepoIntrospection`, `ConnectedRepo.introspection`, and the reintrospect path. Verification: dumped `app.openapi()` → `/tmp/openapi.json` → `openapi-typescript` (running orchestrator not required).
+- **Verification**: `pnpm typecheck && pnpm lint && pnpm test && pnpm build` all green. Pyright strict + TS strict zero errors.
 
 ### 2026-05-01
 

@@ -12,7 +12,7 @@ Distilled context for any AI coding agent picking up work in this repo. Read thi
 - **Sandbox model**: **one persistent Sprite per user**, holding *all* of that user's connected repos under `/work/<full_name>/`. One active agent run at a time per sandbox; rest queue.
 - **Stack**: Python 3.12 + FastAPI + Beanie 2.x on `pymongo.AsyncMongoClient` (motor was retired) on the backend; Vite + React 18 + TanStack on the frontend; Turborepo across uv (Python) and pnpm (TS) workspaces.
 - **Mongo access**: `from db import mongo` gives you the process singleton — `mongo.users`, `mongo.repos`, `mongo.sessions` for raw collection ops; Beanie ORM still works (`Repo.find_one(...)`). Lifecycle: `await mongo.connect(uri)` / `await mongo.disconnect()` (idempotent on same DB). `await mongo.ping()` for readiness checks. See [python_packages/db/src/db/mongo.py](../python_packages/db/src/db/mongo.py).
-- **Status**: Slices 0 + 1 (scaffolding + GitHub OAuth) and Slice 2 (OAuth `repo` scope + repo connection) shipped. Slice 3 (repo introspection) is next; brief not yet written.
+- **Status**: Slices 0 + 1 (scaffolding + GitHub OAuth) and Slice 2 (OAuth `repo` scope + repo connection) shipped. Slice 3 (repo introspection) code shipped against [slice/slice3.md](slice/slice3.md), awaiting user sign-off.
 - **Repo access uses the user's OAuth token, not a GitHub App.** The slice 2 brief was redesigned mid-build to drop the App/installation/webhook path in favor of expanding the slice 1 OAuth scope to `read:user user:email repo` and persisting the token on `User.github_access_token`. See [slice/slice2.md](slice/slice2.md), [Plan.md §12](Plan.md), and the redesign block in [Contributions.md](Contributions.md) for the rationale.
 
 ---
@@ -32,7 +32,7 @@ python_packages/        Reusable Python imported by both apps
   db/                   Beanie models + connect/disconnect
   sandbox_provider/     Sprites Protocol + impl (slice 4)
   github_integration/   githubkit OAuth-token helpers + GithubReauthRequired (slice 2)
-  repo_introspection/   Detect language/framework (slice 3)
+  repo_introspection/   GitHub Trees+Contents → RepoIntrospection (slice 3 — `introspect_via_github`); adapter pattern, slice 4 swaps to filesystem source
   agent_config/         System prompts, tool allowlists (slice 6)
 docs/
   Plan.md               Full design — heavy, do NOT update without permission

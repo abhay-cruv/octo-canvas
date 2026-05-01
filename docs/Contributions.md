@@ -40,6 +40,23 @@ For *what changed structurally*, read [progress.md](progress.md). For *who and w
 
 ## Log
 
+### 2026-05-01 — Claude Opus 4.7 via Claude Code (slice 3 — scope amendment: dev_command + overrides)
+
+- Added `dev_command` field to `RepoIntrospection`; detected per-pm in [../python_packages/repo_introspection/src/repo_introspection/commands.py](../python_packages/repo_introspection/src/repo_introspection/commands.py) (JS: `scripts.dev` → `scripts.start`; cargo run; go run; gradle run).
+- Added `IntrospectionOverrides` ([../python_packages/shared_models/src/shared_models/introspection.py](../python_packages/shared_models/src/shared_models/introspection.py)) and split `Repo` storage into `introspection_detected` + `introspection_overrides`. `ConnectedRepo` wire shape now exposes both raw fields plus a merged-effective `introspection` field.
+- New `PATCH /api/repos/{repo_id}/introspection` endpoint in [../apps/orchestrator/src/orchestrator/routes/repos.py](../apps/orchestrator/src/orchestrator/routes/repos.py) (full replacement; send `{}` to clear; re-introspect preserves overrides — only `detected` refreshes).
+- UI: 5th pill for dev_command, "(overridden)" rendered as black-filled pill with `•`, new "Edit fields" panel ([../apps/web/src/routes/_authed/dashboard.tsx](../apps/web/src/routes/_authed/dashboard.tsx)) with placeholder = detected, helper text, Clear-all/Cancel/Save buttons. New `updateIntrospectionOverrides` mutation in [../apps/web/src/lib/repos.ts](../apps/web/src/lib/repos.ts).
+- Brief updated in-flight (per AGENTS.md §3.2) — added §0 *Scope amendment*. New tests: 5 override-endpoint cases in `test_repos.py` (set/clear, no-detection, 422 on unknown pm, reintrospect-preserves-overrides) and 4 dev_command cases in `test_commands.py`. Suite green: orchestrator 35, introspection 50.
+
+### 2026-05-01 — Claude Opus 4.7 via Claude Code (slice 3 — repo introspection)
+
+- Authored [slice/slice3.md](slice/slice3.md): GitHub-API-only detection (Trees + Contents), inline-on-connect best-effort, explicit `POST /api/repos/{id}/reintrospect`. Adapter pattern in [../python_packages/repo_introspection/src/repo_introspection/github_source.py](../python_packages/repo_introspection/src/repo_introspection/github_source.py) so slice 4 can swap to a filesystem source without rewriting detectors.
+- Implemented `repo_introspection/` package: `language.py`, `package_manager.py`, `commands.py`, `orchestrate.py`, `github_source.py`. `RepoIntrospection` shared model + `PackageManager` literal extended to `bun`/`maven`/`gradle`/`other` (user-edited during draft).
+- Wired into [../apps/orchestrator/src/orchestrator/routes/repos.py](../apps/orchestrator/src/orchestrator/routes/repos.py): `_introspect_into` runs on connect (best-effort, 401 propagates as `github_reauth_required`); new reintrospect endpoint reuses the same helper.
+- Web UI in [../apps/web/src/routes/_authed/dashboard.tsx](../apps/web/src/routes/_authed/dashboard.tsx): four-pill row (`null` → muted `—`) + Re-introspect button. New `reintrospectRepo` mutation in [../apps/web/src/lib/repos.ts](../apps/web/src/lib/repos.ts).
+- 46 unit tests in [../python_packages/repo_introspection/tests/](../python_packages/repo_introspection/tests/), 8 new integration tests in [../apps/orchestrator/tests/test_repos.py](../apps/orchestrator/tests/test_repos.py). `pnpm typecheck && lint && test && build` all green.
+- Regenerated [../packages/api-types/generated/schema.d.ts](../packages/api-types/generated/schema.d.ts) by piping `app.openapi()` through `openapi-typescript` (no running orchestrator needed).
+
 ### 2026-05-01 — Claude Opus 4.7 via Claude Code (slice 2 sign-off + collection registry)
 
 - **User signed off slice 2.** [slice/slice2.md](slice/slice2.md) is now frozen per AGENTS.md §3.2/§5; corrections move to [progress.md](progress.md). Slice status table flipped 2 → ✅ shipped, 3 → ⬜ awaiting brief.
