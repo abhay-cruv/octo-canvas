@@ -1,8 +1,64 @@
-# Contributing
+# Engineering handbook
 
-This document explains the **end-to-end change flow** for this repo: how a feature crosses from the database, through the orchestrator, through the type-generation step, into the frontend. Read it once before making your first change, then keep it open as a reference.
+The **end-to-end change flow** for this repo: how a feature crosses from the database, through the orchestrator, through the type-generation step, into the frontend. Read it once before making your first change, then keep it open as a reference.
 
-For testing instructions see [TESTING.md](TESTING.md).
+For testing instructions see [TESTING.md](TESTING.md). For agent rules see [../AGENTS.md](../AGENTS.md). For active state see [progress.md](progress.md). For the contributions log see [Contributions.md](Contributions.md).
+
+---
+
+## Architecture rules (humans + agents)
+
+Both human contributors and AI coding agents must follow these. Agent-specific extras live in [../AGENTS.md](../AGENTS.md).
+
+### Reuse before you write
+
+Before adding any new function, type, component, route, or package, search the repo:
+
+```bash
+grep -rn "<thing-you-want-to-name>" apps/ packages/ python_packages/
+```
+
+If something close exists, **use or extend it**. Don't fork. Don't copy-paste. If a structural change is needed to fit your case, surface it before refactoring.
+
+### Modular, not monolithic
+
+- One responsibility per file. If a module does two unrelated things, split it.
+- Soft caps: Python module ≤ 300 lines, TS module ≤ 250 lines, function ≤ 50 lines. Signals, not laws.
+- Routes: one file per resource (`routes/auth.py`, `routes/repos.py`). No monolithic `routes.py`.
+- React components: one component per file unless trivially co-located.
+- No kitchen-sink `utils.py` / `helpers.py`. Name modules by what they do, not what they are.
+
+### Strictness
+
+- Pyright **strict**. No untyped functions. No `Any` outside generated code. Targeted `# pyright: ignore[<rule>]` is acceptable for known third-party type gaps; never disable strict globally.
+- TypeScript: `strict: true`, `noUncheckedIndexedAccess: true`. No `any` outside generated code.
+
+### Don't add what wasn't asked for
+
+- No defensive error handling for cases that can't happen.
+- No backwards-compatibility shims when you can change the code in place.
+- No TODO scaffolding for "future" features.
+- No comments explaining what well-named code already says.
+
+---
+
+## Documentation update policy
+
+Some docs are **live state**. Update them. Others are **stable** — touch only on explicit instruction.
+
+| File | Policy |
+| --- | --- |
+| [progress.md](progress.md) | **Always update** when you ship code or change slice state |
+| [Contributions.md](Contributions.md) | **Always update** — append a one-line entry every session (human or agent) |
+| [engineering.md](engineering.md) (this file) | **Always update** when you set a new convention |
+| [agent_context.md](agent_context.md) | **Always update** when the repo's "shape" changes (new package, new boundary, new gotcha) |
+| [Plan.md](Plan.md) | **Touch only when explicitly asked** — design lock during slice execution |
+| [scaffold.md](scaffold.md), [slice/*.md](slice/) | **Touch only when explicitly asked** — historical briefs, append-only |
+| [../CLAUDE.md](../CLAUDE.md) | **Touch only when explicitly asked** — thin entry-point pointer, stable |
+| [../README.md](../README.md) | **Touch only when explicitly asked** — user-facing setup |
+| [../AGENTS.md](../AGENTS.md) | **Touch only when explicitly asked** — canonical agent rules |
+
+Don't create new top-level `.md` files without a clear reader. If you need to capture something, append to one of the always-update files above.
 
 ---
 
@@ -418,7 +474,7 @@ Before opening a PR:
 - [ ] If you touched a route or response model, you regenerated types and the frontend still typechecks
 - [ ] If you added an env var, you updated `.env.example` and the README
 - [ ] You did **not** disable Pyright strict mode globally
-- [ ] You did **not** introduce a banned dependency (see [CLAUDE.md](CLAUDE.md))
+- [ ] You did **not** introduce a banned dependency (see [../AGENTS.md](../AGENTS.md) §2.6)
 - [ ] No business logic in scaffolding paths (placeholder `__init__.py`-only directories should stay that way until they're naturally filled)
 - [ ] No `npm`, `yarn`, `pip`, or `poetry` invocations — only `pnpm` and `uv`
 

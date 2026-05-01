@@ -172,7 +172,7 @@ curl http://localhost:3001/api/me
 | When | Run |
 | --- | --- |
 | After every change, before commit | `pnpm typecheck && pnpm lint && pnpm test` |
-| After changing an orchestrator route or response model | Layer 1 + regenerate types (see `CONTRIBUTING.md`) |
+| After changing an orchestrator route or response model | Layer 1 + regenerate types (see `engineering.md`) |
 | After changing UI behaviour | Layer 1 + Layer 2, then click through the flow in a browser |
 | After upgrading dependencies | All three layers |
 | Before merging a slice | All three layers |

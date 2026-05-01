@@ -2,7 +2,7 @@
 
 End-to-end design and rollout plan for the platform. Source of truth for *what* we're building, *why* the boundaries are where they are, and *the order things ship in*. Live document — slice briefs override it where they conflict, but new design decisions land here first.
 
-> Companion docs: [scaffold.md](scaffold.md) (skeleton), [slice1.md](slice1.md) (auth slice), [TESTING.md](TESTING.md) (verification), [CONTRIBUTING.md](CONTRIBUTING.md) (change flow), [CLAUDE.md](CLAUDE.md) (agent rules).
+> Companion docs: [scaffold.md](scaffold.md) (skeleton), [slice1.md](slice/slice1.md) (auth slice), [TESTING.md](TESTING.md) (verification), [engineering.md](engineering.md) (change flow), [CLAUDE.md](../CLAUDE.md) (agent rules).
 
 ---
 
@@ -113,7 +113,7 @@ Why this shape:
 
 ---
 
-## 5. Tech stack — locked in (see [CLAUDE.md](CLAUDE.md))
+## 5. Tech stack — locked in (rule lives in [AGENTS.md §2.6](../AGENTS.md))
 
 ### Backend (Python 3.12+)
 
@@ -161,9 +161,11 @@ Why this shape:
 | Type bridge | `openapi-typescript` consumes FastAPI's `/openapi.json` → `packages/api-types/generated/schema.d.ts` |
 | Local services | Docker Compose: MongoDB + Redis |
 
-### Banned (do not introduce — see [CLAUDE.md](CLAUDE.md))
+### Banned (do not introduce)
 
 Hono, Express, tRPC, Drizzle, Bun, Next.js, Prisma, Clerk, Better Auth, Poetry, conda, rye, npm, yarn, mypy, black, isort, flake8.
+
+The agent-facing rule version of this list lives in [AGENTS.md §2.6](../AGENTS.md).
 
 ---
 
@@ -193,7 +195,8 @@ Hono, Express, tRPC, Drizzle, Bun, Next.js, Prisma, Clerk, Better Auth, Poetry, 
 ├── tsconfig.json                  TS workspace root
 ├── pytest.ini, .ruff.toml, .prettierrc, .eslintrc.cjs, ...
 ├── .env / .env.example
-├── README.md, CONTRIBUTING.md, TESTING.md, CLAUDE.md, scaffold.md, slice1.md
+├── README.md, CLAUDE.md, AGENTS.md (root)
+├── docs/                                       Plan, engineering, progress, Contributions, agent_context, TESTING, scaffold, slice/
 └── Plan.md  (this file)
 ```
 
@@ -376,9 +379,9 @@ class AgentEvent(Document):
 
 ### Cross-doc rules
 
-- All `*_at` fields use `datetime.now(UTC)` via a `_now()` helper. Never `datetime.utcnow()` (deprecated, fails Pyright strict). See [CONTRIBUTING.md:99](CONTRIBUTING.md#L99).
+- All `*_at` fields use `datetime.now(UTC)` via a `_now()` helper. Never `datetime.utcnow()` (deprecated, fails Pyright strict). See [engineering.md:99](engineering.md#L99).
 - Every uniquely-keyed field uses `Annotated[T, Indexed(unique=True)]`.
-- Every `Document` must be registered in [python_packages/db/src/db/connect.py](python_packages/db/src/db/connect.py)'s `init_beanie(document_models=[...])` list, or it will silently not be queryable.
+- Every `Document` must be registered in [python_packages/db/src/db/connect.py](../python_packages/db/src/db/connect.py)'s `init_beanie(document_models=[...])` list, or it will silently not be queryable.
 
 ---
 
@@ -521,9 +524,9 @@ The orchestrator transcodes `AgentEvent`s into a UI-friendly schema (`TaskEventF
 - **Cookie**: `httponly=True`, `secure=is_production`, `samesite="lax"`, `max_age=7d`, `path="/"`.
 - **CSRF for OAuth flow**: a second short-lived cookie `vibe_oauth_state` (10 min, samesite=lax) holds a `secrets.token_urlsafe(32)` state token. Verified and cleared on callback.
 - **Scope**: `read:user user:email`. **Not** `repo` — repo access comes via the GitHub App, not the OAuth App.
-- **Lookup path**: every request → read cookie → load `Session` → check `expires_at` → load `User` → bump `last_used_at`. Implemented as the FastAPI dependency `require_user` in [apps/orchestrator/src/orchestrator/middleware/auth.py](apps/orchestrator/src/orchestrator/middleware/auth.py). Optional variant `get_user_optional` returns `None` instead of raising.
+- **Lookup path**: every request → read cookie → load `Session` → check `expires_at` → load `User` → bump `last_used_at`. Implemented as the FastAPI dependency `require_user` in [apps/orchestrator/src/orchestrator/middleware/auth.py](../apps/orchestrator/src/orchestrator/middleware/auth.py). Optional variant `get_user_optional` returns `None` instead of raising.
 
-Hard rules (from [slice1.md:643-651](slice1.md#L643-L651)):
+Hard rules (from [slice1.md:643-651](slice/slice1.md#L643-L651)):
 
 - No second auth library.
 - No email transport, ever.
@@ -560,7 +563,7 @@ Tokens are never persisted long-term — installation tokens are 1-hour, minted 
 
 **One persistent sandbox per user.** It hosts every connected repo of that user under `/work/<full_name>/` and serves every agent run. It outlives individual tasks; it does not outlive the user account.
 
-[`SandboxProvider` Protocol](python_packages/sandbox_provider/src/sandbox_provider/interface.py) — currently has TODO methods. To implement:
+[`SandboxProvider` Protocol](../python_packages/sandbox_provider/src/sandbox_provider/interface.py) — currently has TODO methods. To implement:
 
 ```python
 class SandboxProvider(Protocol):
@@ -750,7 +753,7 @@ pnpm --filter @vibe-platform/orchestrator dev
 pnpm --filter @vibe-platform/api-types gen:api-types
 ```
 
-This rewrites [packages/api-types/generated/schema.d.ts](packages/api-types/generated/schema.d.ts). The frontend picks up the new types on next typecheck. **Auto-regen on backend change is intentionally deferred** — the manual two-terminal step is fine for v1.
+This rewrites [packages/api-types/generated/schema.d.ts](../packages/api-types/generated/schema.d.ts). The frontend picks up the new types on next typecheck. **Auto-regen on backend change is intentionally deferred** — the manual two-terminal step is fine for v1.
 
 ### 16.6 Dev workflow (humans + agents)
 
@@ -766,7 +769,7 @@ Before considering work done: `pnpm typecheck && pnpm lint && pnpm test`.
 
 ---
 
-## 17. Environment variables (full v1 set; see [.env.example](.env.example))
+## 17. Environment variables (full v1 set; see [.env.example](../.env.example))
 
 | Var | Used by | Slice |
 |---|---|---|
@@ -786,7 +789,7 @@ Before considering work done: `pnpm typecheck && pnpm lint && pnpm test`.
 | `ORCHESTRATOR_BASE_URL` | orchestrator (callback URL) | scaffold |
 | `VITE_ORCHESTRATOR_BASE_URL` | web (build-time) | scaffold |
 
-Vite gotcha: env file lives at the repo root, not [apps/web/](apps/web/). [apps/web/vite.config.ts](apps/web/vite.config.ts) sets `envDir: '../..'` so `import.meta.env.VITE_*` resolves correctly. Without that, [apps/web/src/lib/api.ts](apps/web/src/lib/api.ts) throws at module load and the page is blank.
+Vite gotcha: env file lives at the repo root, not [apps/web/](../apps/web/). [apps/web/vite.config.ts](../apps/web/vite.config.ts) sets `envDir: '../..'` so `import.meta.env.VITE_*` resolves correctly. Without that, [apps/web/src/lib/api.ts](../apps/web/src/lib/api.ts) throws at module load and the page is blank.
 
 ---
 
@@ -798,7 +801,7 @@ Each slice is end-to-end verifiable. Slices stack — never start N+1 until N is
 Skeleton repo, placeholders, build/dev/test plumbing. Acceptance: [scaffold.md:583-602](scaffold.md#L583-L602).
 
 ### Slice 1 — GitHub OAuth + user persistence  ✅ code done, ⬜ verifying
-Sign-in flow + `User`/`Session` collections + protected route convention. Acceptance: [slice1.md:611-637](slice1.md#L611-L637).
+Sign-in flow + `User`/`Session` collections + protected route convention. Acceptance: [slice1.md:611-637](slice/slice1.md#L611-L637).
 
 **Active punch list to close it out:**
 1. `uv sync --all-packages --all-extras`.
@@ -807,7 +810,7 @@ Sign-in flow + `User`/`Session` collections + protected route convention. Accept
 4. Restart `pnpm dev` (picks up Vite `envDir` fix + new env).
 5. Walk the sign-in flow in a browser; verify `users` and `sessions` writes in Mongo.
 6. `pnpm typecheck && pnpm lint && pnpm test` all green.
-7. `pnpm --filter @vibe-platform/api-types gen:api-types` so [packages/api-types/generated/schema.d.ts](packages/api-types/generated/schema.d.ts) is real, not the stub.
+7. `pnpm --filter @vibe-platform/api-types gen:api-types` so [packages/api-types/generated/schema.d.ts](../packages/api-types/generated/schema.d.ts) is real, not the stub.
 8. User reviews and approves; *only then* slice 2 brief is written.
 
 ### Slice 2 — GitHub App + repo connection
@@ -868,12 +871,12 @@ Sign-in flow + `User`/`Session` collections + protected route convention. Accept
 
 ## 19. Risks & known gotchas
 
-1. **`uv sync` flags** — bare `uv sync` only installs the root, not the workspace members. Always `uv sync --all-packages --all-extras`. Documented in [slice1.md:15](slice1.md#L15) and [TESTING.md](TESTING.md).
-2. **Vite envDir** — `.env` lives at repo root; [apps/web/vite.config.ts](apps/web/vite.config.ts) must set `envDir: '../..'`. Without it, `import.meta.env.VITE_*` is undefined and [apps/web/src/lib/api.ts:4](apps/web/src/lib/api.ts#L4) throws → blank page.
-3. **OAuth App ≠ GitHub App** — different artifacts, both in the "Developer settings" menu. Slice 1 needs only the OAuth App; slice 2 adds the GitHub App. ([slice1.md:643-646](slice1.md#L643-L646))
-4. **Beanie `init_beanie` registration** — adding a `Document` class without registering it in [python_packages/db/src/db/connect.py](python_packages/db/src/db/connect.py)'s `document_models` list silently fails to query. ([CONTRIBUTING.md:94](CONTRIBUTING.md#L94))
-5. **`datetime.utcnow()`** — deprecated in Python 3.12, fails Pyright strict. Use `datetime.now(UTC)` via a `_now()` helper. ([CONTRIBUTING.md:99](CONTRIBUTING.md#L99))
-6. **DB shape vs API shape** — never reuse a Beanie `Document` as a FastAPI `response_model`. The split is intentional. ([CONTRIBUTING.md:33-38](CONTRIBUTING.md#L33-L38))
+1. **`uv sync` flags** — bare `uv sync` only installs the root, not the workspace members. Always `uv sync --all-packages --all-extras`. Documented in [slice1.md:15](slice/slice1.md#L15) and [TESTING.md](TESTING.md).
+2. **Vite envDir** — `.env` lives at repo root; [apps/web/vite.config.ts](../apps/web/vite.config.ts) must set `envDir: '../..'`. Without it, `import.meta.env.VITE_*` is undefined and [apps/web/src/lib/api.ts:4](../apps/web/src/lib/api.ts#L4) throws → blank page.
+3. **OAuth App ≠ GitHub App** — different artifacts, both in the "Developer settings" menu. Slice 1 needs only the OAuth App; slice 2 adds the GitHub App. ([slice1.md:643-646](slice/slice1.md#L643-L646))
+4. **Beanie `init_beanie` registration** — adding a `Document` class without registering it in [python_packages/db/src/db/connect.py](../python_packages/db/src/db/connect.py)'s `document_models` list silently fails to query. ([engineering.md:94](engineering.md#L94))
+5. **`datetime.utcnow()`** — deprecated in Python 3.12, fails Pyright strict. Use `datetime.now(UTC)` via a `_now()` helper. ([engineering.md:99](engineering.md#L99))
+6. **DB shape vs API shape** — never reuse a Beanie `Document` as a FastAPI `response_model`. The split is intentional. ([engineering.md:33-38](engineering.md#L33-L38))
 7. **`pytest` event loop** — DB-touching tests must use the `httpx.AsyncClient + ASGITransport` fixture, not FastAPI's `TestClient`. ([TESTING.md:165](TESTING.md#L165))
 8. **Webhook delivery in local dev** — slice 2 needs a public URL for GitHub webhooks. Use smee.io or ngrok. Document in the slice 2 brief.
 9. **Sprites SDK pinning** — slice 4 should pin the Sprites SDK version explicitly; SDK churn is a known supply-chain risk on early-stage providers.
@@ -899,9 +902,9 @@ Repo metrics (from latest `/graphify` run): 217 nodes, 200 edges, 64 communities
 ## 21. Concrete next steps (do these in order)
 
 1. **Close slice 1 verification** — punch list under §18 / Slice 1.
-2. **Author `slice2.md`** following the same shape as [slice1.md](slice1.md): context, scope, what to build, hard rules, acceptance criteria, when-done summary template.
+2. **Author `slice2.md`** following the same shape as [slice1.md](slice/slice1.md): context, scope, what to build, hard rules, acceptance criteria, when-done summary template.
 3. **Register the GitHub App** (manual) on GitHub developer settings; copy `GITHUB_APP_ID`, generate and store the private key, set the webhook secret. Add to `.env`.
 4. **Implement slice 2** per the brief.
 5. Repeat for slices 3 → 8.
 
-Do **not** start slice 2 implementation before the brief exists and the user reviews it. The hard rule from [slice1.md:665](slice1.md#L665) — "do not start the next task automatically" — applies for every slice transition.
+Do **not** start slice 2 implementation before the brief exists and the user reviews it. The hard rule from [slice1.md:665](slice/slice1.md#L665) — "do not start the next task automatically" — applies for every slice transition.

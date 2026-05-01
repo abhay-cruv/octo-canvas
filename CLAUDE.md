@@ -1,41 +1,33 @@
 # CLAUDE.md
 
-Guidance for Claude Code sessions working in this repository.
+Entry point for Claude Code sessions in this repository. The actual rules live elsewhere — this file just tells you where.
 
-## Stack — locked in, do not change without explicit approval
+## Read in this order
 
-- Backend: Python 3.12+, FastAPI, Beanie (Pydantic + Motor), Authlib, httpx, githubkit, structlog, pydantic-settings.
-- Bridge: Python 3.12+, `claude-agent-sdk`, `websockets`, GitPython.
-- Frontend: TypeScript 5.x (`strict: true`, `noUncheckedIndexedAccess: true`), Vite SPA, React 18, TanStack Router (file-based), TanStack Query, `openapi-fetch`, Tailwind CSS, shadcn/ui.
-- Tooling: Turborepo runs commands across pnpm and uv workspaces.
+1. [docs/agent_context.md](docs/agent_context.md) — distilled cold-start brief
+2. [AGENTS.md](AGENTS.md) — canonical agent rules: modular code, reuse-before-write, strictness, dependency constraints, doc-update policy, slice discipline
+3. [docs/progress.md](docs/progress.md) — active project state and current punch list
+4. [docs/Contributions.md](docs/Contributions.md) — recent activity log; a glance reveals current focus and team cadence
+5. The active slice brief in [docs/slice/](docs/slice/) — the contract for whatever you're working on
+6. [docs/Plan.md](docs/Plan.md) — only when your task touches design boundaries (sandbox model, type bridges, data model, API surface, etc.)
 
-Do **not** introduce: Hono, Express, tRPC, Drizzle, Bun, Next.js, Prisma, Clerk, Better Auth, Poetry, conda, rye, npm, yarn, mypy, black, isort, flake8.
+## Where things live
 
-## Package managers
+| Topic | Source of truth |
+| --- | --- |
+| Stack choices, dependency inventory, tech-stack rationale | [docs/Plan.md §5](docs/Plan.md) |
+| Banned dependencies + package-manager rules | [AGENTS.md §2.6](AGENTS.md) |
+| Strictness (Pyright strict, TS strict) | [AGENTS.md §2.4](AGENTS.md) |
+| Repo layout + workspace membership | [docs/Plan.md §6](docs/Plan.md) |
+| Type bridges (Pydantic → OpenAPI → TS) | [docs/Plan.md §7](docs/Plan.md) |
+| Where reusable code lives (`python_packages/` vs `packages/` vs app `src/`) | [AGENTS.md §2.2](AGENTS.md) |
+| Engineering change-flow recipes | [docs/engineering.md](docs/engineering.md) |
+| Test strategy | [docs/TESTING.md](docs/TESTING.md) |
 
-- Python: `uv` only. Run scripts via `uv run <command>`. Never `pip install` directly.
-- TypeScript: `pnpm` only. Never `npm` or `yarn`.
-- Cross-language: Turborepo. Use `pnpm <task>` from the root for everything.
+## What to update when you ship
 
-## Source-of-truth bridges
-
-- Pydantic models in `python_packages/shared_models/` are the single source of truth for FastAPI request/response schemas **and** WebSocket message schemas.
-- `packages/api-types/` consumes FastAPI's `/openapi.json` (via `openapi-typescript`) and exposes typed `paths`/`components`/`operations` to the web app via `openapi-fetch`.
-- The web app talks to the orchestrator via HTTP (typed) and WebSocket (typed).
-
-## Strictness
-
-- TypeScript: `strict: true`, `noUncheckedIndexedAccess: true`. No `any` except in generated code.
-- Python: Pyright in strict mode. No untyped functions.
-- Run `pnpm typecheck && pnpm lint` before considering work done.
-
-## Workspace members
-
-- Python uv workspace members: `apps/orchestrator`, `apps/bridge`, `python_packages/*`.
-- pnpm workspace members: `apps/*`, `packages/*`, `python_packages/*` (the Python packages have empty Turbo-glue `package.json` files so Turbo can discover them).
-
-## Where things go
-
-- Reusable Python that is imported by both apps → `python_packages/`.
-- Reusable TS that is imported by the web app → `packages/`.
-- Anything specific to a single app → that app's `src/`.
+- Always: [docs/Contributions.md](docs/Contributions.md), [docs/progress.md](docs/progress.md)
+- When you set a new convention: [docs/engineering.md](docs/engineering.md)
+- When the repo's "shape" changes: [docs/agent_context.md](docs/agent_context.md)
+- Active slice brief at [docs/slice/slice{n}.md](docs/slice/) while it's in flight (frozen once user signs off)
+- Never (without explicit user direction): [docs/Plan.md](docs/Plan.md), this file, [README.md](README.md), [docs/scaffold.md](docs/scaffold.md), frozen slice briefs
