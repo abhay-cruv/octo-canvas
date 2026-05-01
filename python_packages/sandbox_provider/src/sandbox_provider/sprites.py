@@ -138,6 +138,65 @@ class SpritesProvider:
             raise SpritesError(_sanitize(exc), retriable=_is_retriable(exc)) from exc
         return _to_state(sprite)
 
+    async def pause(self, handle: SandboxHandle) -> SandboxState:
+        """Force the sprite to release compute by killing all active exec
+        sessions; Sprites' own idle timer then transitions the sprite to
+        `cold`. Returns whatever status Sprites currently reports — the
+        sprite may still be `warm` for a few seconds before going cold.
+
+        rc37 SDK does not expose `kill_session`; we POST the kill endpoint
+        directly via the SDK's `_client` (same auth, same base_url) per the
+        rc43 docs (POST /v1/sprites/{name}/exec/{session_id}/kill).
+        Per-session kill failures are logged but do not abort the pause —
+        a session that 404s during the race window is already gone.
+        """
+        sprite_name = _require_name(handle)
+
+        def _kill_then_status() -> Sprite:
+            sprite = self._client.sprite(sprite_name)
+            try:
+                sessions = sprite.list_sessions()
+            except NotFoundError:
+                # Sprite is gone; let status() raise the right error below.
+                sessions = []
+            killed = 0
+            for session in sessions:
+                session_id = getattr(session, "id", None)
+                if not isinstance(session_id, str) or not session_id:
+                    continue
+                try:
+                    resp = self._client._client.post(  # type: ignore[reportPrivateUsage]
+                        f"{self._client.base_url}/v1/sprites/{sprite_name}/exec/{session_id}/kill",
+                        headers=self._client._headers(),  # type: ignore[reportPrivateUsage]
+                        timeout=10.0,
+                    )
+                    if resp.status_code >= 400 and resp.status_code != 404:
+                        _logger.warning(
+                            "sprites.pause.kill_failed",
+                            sprite=sprite_name,
+                            session=session_id,
+                            status=resp.status_code,
+                        )
+                    else:
+                        killed += 1
+                except Exception as exc:  # noqa: BLE001 — best-effort kill
+                    _logger.warning(
+                        "sprites.pause.kill_error",
+                        sprite=sprite_name,
+                        session=session_id,
+                        error=str(exc),
+                    )
+            _logger.info("sprites.pause", sprite=sprite_name, sessions_killed=killed)
+            return self._client.get_sprite(sprite_name)
+
+        try:
+            sprite = await asyncio.to_thread(_kill_then_status)
+        except NotFoundError as exc:
+            raise SpritesError(f"sprite {sprite_name!r} not found", retriable=False) from exc
+        except SpriteError as exc:
+            raise SpritesError(_sanitize(exc), retriable=_is_retriable(exc)) from exc
+        return _to_state(sprite)
+
 
 def _name_for(sandbox_id: str) -> str:
     return f"vibe-sbx-{sandbox_id}"

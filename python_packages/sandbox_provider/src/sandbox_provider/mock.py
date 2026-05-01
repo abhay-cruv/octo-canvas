@@ -76,6 +76,13 @@ class MockSandboxProvider:
         rec.status = "running"
         return SandboxState(status="running", public_url=rec.public_url)
 
+    async def pause(self, handle: SandboxHandle) -> SandboxState:
+        # Mock has no exec sessions to kill; just transition to cold to model
+        # Sprites' idle-after-pause behaviour deterministically.
+        rec = self._require(handle)
+        rec.status = "cold"
+        return SandboxState(status="cold", public_url=rec.public_url)
+
     # ── Test hooks (not part of the Protocol) ────────────────────────────
 
     def _force_cold(self, handle: SandboxHandle) -> None:

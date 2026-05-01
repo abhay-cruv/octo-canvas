@@ -185,6 +185,58 @@ async def test_wake_409_when_destroyed(client: httpx.AsyncClient) -> None:
     assert response.status_code == 409
 
 
+# ── Pause ──────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_pause_transitions_to_cold(client: httpx.AsyncClient) -> None:
+    _, session = await _seed_user_and_session()
+    client.cookies.set(SESSION_COOKIE_NAME, session.session_id)
+    sandbox = (await client.post("/api/sandboxes")).json()
+    # Sprite is `warm` after create; wake first to confirm pause works from
+    # any alive state.
+    await client.post(f"/api/sandboxes/{sandbox['id']}/wake")
+
+    response = await client.post(f"/api/sandboxes/{sandbox['id']}/pause")
+    assert response.status_code == 200
+    assert response.json()["status"] == "cold"
+
+
+@pytest.mark.asyncio
+async def test_pause_idempotent_on_cold(client: httpx.AsyncClient) -> None:
+    _, session = await _seed_user_and_session()
+    client.cookies.set(SESSION_COOKIE_NAME, session.session_id)
+    sandbox = (await client.post("/api/sandboxes")).json()
+    await client.post(f"/api/sandboxes/{sandbox['id']}/pause")
+    response = await client.post(f"/api/sandboxes/{sandbox['id']}/pause")
+    assert response.status_code == 200
+    assert response.json()["status"] == "cold"
+
+
+@pytest.mark.asyncio
+async def test_pause_409_from_destroyed(client: httpx.AsyncClient) -> None:
+    _, session = await _seed_user_and_session()
+    client.cookies.set(SESSION_COOKIE_NAME, session.session_id)
+    sandbox = (await client.post("/api/sandboxes")).json()
+    await client.post(f"/api/sandboxes/{sandbox['id']}/destroy")
+
+    response = await client.post(f"/api/sandboxes/{sandbox['id']}/pause")
+    assert response.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_pause_404_for_other_users_sandbox(client: httpx.AsyncClient) -> None:
+    other, _ = await _seed_user_and_session(github_user_id=11)
+    assert other.id is not None
+    other_doc = Sandbox(user_id=other.id, provider_name="mock")
+    await other_doc.create()
+
+    _, session = await _seed_user_and_session(github_user_id=22)
+    client.cookies.set(SESSION_COOKIE_NAME, session.session_id)
+    response = await client.post(f"/api/sandboxes/{other_doc.id}/pause")
+    assert response.status_code == 404
+
+
 # ── Refresh ────────────────────────────────────────────────────────────────
 
 

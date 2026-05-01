@@ -23,12 +23,53 @@ class _FakeSprite:
 
 
 @dataclass
+class _FakeSession:
+    id: str
+
+
+@dataclass
+class _FakeHttpResponse:
+    status_code: int
+
+
+@dataclass
+class _FakeHttpClient:
+    """Stands in for the SDK's `_client` (httpx). Records POSTs; returns a
+    response with the status code set by `kill_responses[session_id]` (defaults
+    to 200)."""
+
+    posts: list[tuple[str, dict[str, str]]] = field(default_factory=list)
+    kill_responses: dict[str, int] = field(default_factory=dict)
+    raise_on_post: BaseException | None = None
+
+    def post(
+        self, url: str, headers: dict[str, str], timeout: float
+    ) -> _FakeHttpResponse:
+        if self.raise_on_post is not None:
+            raise self.raise_on_post
+        self.posts.append((url, dict(headers)))
+        # Default 200 unless overridden per session.
+        for sid, code in self.kill_responses.items():
+            if f"/exec/{sid}/kill" in url:
+                return _FakeHttpResponse(status_code=code)
+        return _FakeHttpResponse(status_code=200)
+
+
+@dataclass
 class _FakeClient:
     sprites: dict[str, _FakeSprite] = field(default_factory=dict)
+    sessions_per_sprite: dict[str, list[_FakeSession]] = field(default_factory=dict)
     raise_on_create: BaseException | None = None
     raise_on_get: BaseException | None = None
     raise_on_delete: BaseException | None = None
+    raise_on_list_sessions: BaseException | None = None
     last_command: list[Any] = field(default_factory=list)
+    base_url: str = "https://api.sprites.dev"
+    token: str = "test-token"
+    _client: _FakeHttpClient = field(default_factory=_FakeHttpClient)
+
+    def _headers(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"}
 
     def create_sprite(self, name: str, config: Any = None) -> _FakeSprite:
         if self.raise_on_create is not None:
@@ -73,6 +114,11 @@ class _FakeSpriteWrapper:
     def command(self, *args: str) -> "_FakeCommand":
         self.client.last_command.append(args)
         return _FakeCommand()
+
+    def list_sessions(self) -> list[_FakeSession]:
+        if self.client.raise_on_list_sessions is not None:
+            raise self.client.raise_on_list_sessions
+        return list(self.client.sessions_per_sprite.get(self.name, []))
 
 
 @dataclass
@@ -181,3 +227,68 @@ async def test_handle_for_wrong_provider_raises() -> None:
 async def test_constructor_rejects_empty_token() -> None:
     with pytest.raises(ValueError):
         SpritesProvider(token="")
+
+
+# ── pause ─────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_pause_with_no_sessions_just_refreshes_status() -> None:
+    fake = _FakeClient()
+    fake.sprites["vibe-sbx-x"] = _FakeSprite(
+        name="vibe-sbx-x", id="id", status="warm", url="u"
+    )
+    p = _build_provider(fake)
+    handle = SandboxHandle(provider="sprites", payload={"name": "vibe-sbx-x"})
+    state = await p.pause(handle)
+    assert state.status == "warm"  # no sessions to kill; status echoed back
+    assert fake._client.posts == []  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_pause_kills_each_session_via_kill_endpoint() -> None:
+    fake = _FakeClient()
+    fake.sprites["vibe-sbx-x"] = _FakeSprite(
+        name="vibe-sbx-x", id="id", status="warm", url="u"
+    )
+    fake.sessions_per_sprite["vibe-sbx-x"] = [
+        _FakeSession(id="sess-1"),
+        _FakeSession(id="sess-2"),
+    ]
+    p = _build_provider(fake)
+    handle = SandboxHandle(provider="sprites", payload={"name": "vibe-sbx-x"})
+    state = await p.pause(handle)
+    posts = fake._client.posts  # pyright: ignore[reportPrivateUsage]
+    assert len(posts) == 2
+    urls = sorted(url for url, _ in posts)
+    assert "/v1/sprites/vibe-sbx-x/exec/sess-1/kill" in urls[0]
+    assert "/v1/sprites/vibe-sbx-x/exec/sess-2/kill" in urls[1]
+    # Auth header propagated.
+    for _, headers in posts:
+        assert headers.get("Authorization") == "Bearer test-token"
+    assert state.status == "warm"  # provider returns whatever Sprites reports
+
+
+@pytest.mark.asyncio
+async def test_pause_404_on_kill_is_swallowed() -> None:
+    fake = _FakeClient()
+    fake.sprites["vibe-sbx-x"] = _FakeSprite(
+        name="vibe-sbx-x", id="id", status="warm", url="u"
+    )
+    fake.sessions_per_sprite["vibe-sbx-x"] = [_FakeSession(id="sess-gone")]
+    fake._client.kill_responses["sess-gone"] = 404  # pyright: ignore[reportPrivateUsage]
+    p = _build_provider(fake)
+    handle = SandboxHandle(provider="sprites", payload={"name": "vibe-sbx-x"})
+    state = await p.pause(handle)  # must not raise
+    assert state.status == "warm"
+
+
+@pytest.mark.asyncio
+async def test_pause_not_found_raises() -> None:
+    fake = _FakeClient(raise_on_list_sessions=NotFoundError("gone"))
+    fake.raise_on_get = NotFoundError("gone")
+    p = _build_provider(fake)
+    handle = SandboxHandle(provider="sprites", payload={"name": "vibe-sbx-x"})
+    with pytest.raises(SpritesError) as exc_info:
+        await p.pause(handle)
+    assert exc_info.value.retriable is False

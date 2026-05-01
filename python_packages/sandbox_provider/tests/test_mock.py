@@ -52,6 +52,26 @@ async def test_wake_forces_running_from_cold() -> None:
 
 
 @pytest.mark.asyncio
+async def test_pause_transitions_to_cold() -> None:
+    p = MockSandboxProvider()
+    handle = await p.create(sandbox_id="sbx", labels=[])
+    # Sprite is `warm` after create; bump to running first to confirm pause
+    # works from any alive state.
+    await p.wake(handle)
+    state = await p.pause(handle)
+    assert state.status == "cold"
+
+
+@pytest.mark.asyncio
+async def test_pause_idempotent_on_cold() -> None:
+    p = MockSandboxProvider()
+    handle = await p.create(sandbox_id="sbx", labels=[])
+    await p.pause(handle)
+    state = await p.pause(handle)
+    assert state.status == "cold"
+
+
+@pytest.mark.asyncio
 async def test_status_for_wrong_provider_raises() -> None:
     p = MockSandboxProvider()
     bad = SandboxHandle(provider="sprites", payload={"name": "x"})

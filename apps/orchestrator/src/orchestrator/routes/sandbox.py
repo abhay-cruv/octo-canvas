@@ -110,6 +110,24 @@ async def wake_sandbox(
     return _to_response(doc)
 
 
+@router.post("/{sandbox_id}/pause", response_model=SandboxResponse)
+async def pause_sandbox(
+    sandbox_id: PydanticObjectId,
+    user: User = Depends(require_user),
+    manager: SandboxManager = Depends(get_sandbox_manager),
+) -> SandboxResponse:
+    """Force the sandbox to release compute. Kills active exec sessions
+    so Sprites' idle timer can transition the sprite to `cold`. Filesystem
+    is preserved; user pays for storage only while paused."""
+    doc = await _load_owned(sandbox_id, user)
+    try:
+        doc = await manager.pause(doc)
+    except IllegalSandboxTransitionError as exc:
+        raise _conflict(exc) from exc
+    _bad_provider_if_failed(doc)
+    return _to_response(doc)
+
+
 @router.post("/{sandbox_id}/refresh", response_model=SandboxResponse)
 async def refresh_sandbox(
     sandbox_id: PydanticObjectId,

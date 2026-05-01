@@ -10,7 +10,7 @@ services:
 
   redis:
     image: redis:7-alpine
-    container_name: vibe-redis
+    container_name: octo-redis
     restart: unless-stopped
     ports:
       - "6379:6379"

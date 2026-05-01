@@ -86,3 +86,14 @@ class SandboxProvider(Protocol):
         any exec/HTTP/proxy access, so this is implemented as a no-op exec.
         Returns the new state."""
         ...
+
+    async def pause(self, handle: SandboxHandle) -> SandboxState:
+        """Force the sandbox to release compute (target `cold`).
+
+        Sprites has no explicit force-pause API verb. The implementation
+        kills any active exec sessions (which is what keeps a sprite warm)
+        so Sprites' own idle timer can fire. Returns whatever the provider
+        currently reports — may still be `warm` for a few seconds before
+        Sprites transitions to `cold`. Idempotent on already-cold sandboxes.
+        """
+        ...

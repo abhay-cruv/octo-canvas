@@ -43,6 +43,7 @@ _logger = structlog.get_logger("sandbox_manager")
 # [slice4.md §5](../../../../docs/slice/slice4.md).
 _ALIVE: tuple[SandboxStatus, ...] = ("cold", "warm", "running")
 _WAKE_FROM: tuple[SandboxStatus, ...] = _ALIVE
+_PAUSE_FROM: tuple[SandboxStatus, ...] = _ALIVE       # pause on cold is a no-op
 _RESET_FROM: tuple[SandboxStatus, ...] = (*_ALIVE, "failed")
 _DESTROY_FROM: tuple[SandboxStatus, ...] = (*_ALIVE, "failed", "provisioning")
 
@@ -134,6 +135,26 @@ class SandboxManager:
         await sandbox.save()
         await self._redis_write(sandbox)
         _logger.info("sandbox.waked", sandbox_id=str(sandbox.id), status=sandbox.status)
+        return sandbox
+
+    async def pause(self, sandbox: Sandbox) -> Sandbox:
+        """Force the sandbox to release compute. Sprites has no explicit
+        force-pause API; the provider implementation kills active exec
+        sessions so Sprites' idle timer can fire. Returned status may still
+        be `warm` for a few seconds before going cold."""
+        if sandbox.status == "cold":
+            return sandbox  # idempotent — already paused
+        if sandbox.status not in _PAUSE_FROM:
+            raise IllegalSandboxTransitionError(sandbox.status, "pause")
+        try:
+            state = await self._provider.pause(_handle_of(sandbox))
+        except SpritesError as exc:
+            return await self._mark_failed(sandbox, exc)
+        sandbox.status = state.status
+        sandbox.public_url = state.public_url
+        await sandbox.save()
+        await self._redis_write(sandbox)
+        _logger.info("sandbox.paused", sandbox_id=str(sandbox.id), status=sandbox.status)
         return sandbox
 
     async def reset(self, sandbox: Sandbox) -> Sandbox:
