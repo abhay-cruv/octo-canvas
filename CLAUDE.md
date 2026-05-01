@@ -4,7 +4,7 @@ Entry point for Claude Code sessions in this repository. The actual rules live e
 
 ## Read in this order
 
-1. [docs/agent_context.md](docs/agent_context.md) — distilled cold-start brief
+1. [docs/agent_context.md](docs/agent_context.md) — **cold-start primer; read in full first.** Repo map, mental model, gotchas, common commands — designed so every later doc is cheaper to skim. If you only have budget for one doc, it's this one. You are also expected to **update it** when the repo's shape shifts (new pkg/boundary/gotcha/command). See [AGENTS.md §1.1–§1.2](AGENTS.md).
 2. [AGENTS.md](AGENTS.md) — canonical agent rules: modular code, reuse-before-write, strictness, dependency constraints, doc-update policy, slice discipline
 3. [docs/progress.md](docs/progress.md) — active project state and current punch list
 4. [docs/Contributions.md](docs/Contributions.md) — recent activity log; a glance reveals current focus and team cadence
@@ -30,6 +30,6 @@ Entry point for Claude Code sessions in this repository. The actual rules live e
 
 - Always: [docs/Contributions.md](docs/Contributions.md), [docs/progress.md](docs/progress.md)
 - When you set a new convention: [docs/engineering.md](docs/engineering.md)
-- When the repo's "shape" changes: [docs/agent_context.md](docs/agent_context.md)
+- When the repo's "shape" changes (new pkg, app, boundary, type bridge, gotcha, common command, or stack invariant): [docs/agent_context.md](docs/agent_context.md) — keep it current so the next cold-start agent loads accurate context. Details in [AGENTS.md §1.1–§1.2](AGENTS.md).
 - Active slice brief at [docs/slice/slice{n}.md](docs/slice/) while it's in flight (frozen once user signs off)
 - Never (without explicit user direction): [docs/Plan.md](docs/Plan.md), this file, [README.md](README.md), [docs/scaffold.md](docs/scaffold.md), frozen slice briefs

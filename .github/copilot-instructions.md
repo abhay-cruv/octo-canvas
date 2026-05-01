@@ -1,8 +1,8 @@
 # GitHub Copilot instructions
 
-The canonical agent rules for this repo live in [`AGENTS.md`](../AGENTS.md). Read it first — including §2.6 for the locked-in stack, package managers, and banned dependencies.
+**Cold-start primer:** read [`docs/agent_context.md`](../docs/agent_context.md) **first, in full** — repo map, mental model, gotchas, common commands. It's optimized so every later doc is cheaper to skim. You are also expected to **update it** when the repo's shape shifts (new pkg/boundary/gotcha/command); see [`AGENTS.md` §1.1–§1.2](../AGENTS.md).
 
-The active slice and project state are in [`docs/progress.md`](../docs/progress.md) and [`docs/agent_context.md`](../docs/agent_context.md). Architecture and stack rationale (concern × choice × why) live in [`docs/Plan.md`](../docs/Plan.md) §5.
+After the primer, the canonical agent rules for this repo live in [`AGENTS.md`](../AGENTS.md) — including §2.6 for the locked-in stack, package managers, and banned dependencies. Active project state is in [`docs/progress.md`](../docs/progress.md). Architecture and stack rationale (concern × choice × why) live in [`docs/Plan.md`](../docs/Plan.md) §5.
 
 ## Quick rules (full set in AGENTS.md)
 

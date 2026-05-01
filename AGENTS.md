@@ -14,7 +14,7 @@ Canonical rules for any AI coding agent (Claude Code, Codex, Copilot, Antigravit
 
 Every agent session, before making changes, read in this order:
 
-1. [docs/agent_context.md](docs/agent_context.md) — distilled brief, optimized for agents
+1. [docs/agent_context.md](docs/agent_context.md) — **the cold-start primer**. Optimized for agents: distilled facts, repo map, mental model, gotchas, common commands. Read this *first, in full*; it is designed to make every following doc cheaper to skim. If you only have budget for one doc, this is the one.
 2. [CLAUDE.md](CLAUDE.md) — entry-point pointer for Claude Code (delegates here)
 3. This file (`AGENTS.md`) — code architecture rules
 4. [docs/progress.md](docs/progress.md) — what's done, what's active, what's blocked
@@ -23,6 +23,25 @@ Every agent session, before making changes, read in this order:
 7. [docs/Plan.md](docs/Plan.md) — only if your task touches design boundaries; otherwise skip
 
 If your change crosses a backend ↔ frontend boundary, also read [docs/engineering.md](docs/engineering.md) for the change flow.
+
+### 1.1 Using `agent_context.md` efficiently
+
+- **Cold-start every session with it.** Don't grep the repo to learn the layout, don't open `Plan.md` for a quick fact — both are answered in `agent_context.md`. Treat the heavy docs (Plan.md, full source trees) as escalation paths only when the primer doesn't cover what you need.
+- **Trust it as the index, verify before acting.** The repo map, sandbox model, and gotchas in the primer are kept current; specific file paths and symbol names should still be confirmed with `Read`/`grep` before you edit code that depends on them.
+- **Keep it lean.** It's a primer, not a manual. If a fact lives elsewhere (Plan.md inventory, engineering.md change flow, slice brief), link to it rather than copying it in.
+
+### 1.2 You must update `agent_context.md`
+
+It is an **always-update** file (see §3.1). Update it in the same session as your code change whenever the repo's "shape" shifts in a way a future cold-start agent would need to know:
+
+- A new package, app, or top-level directory appears or moves.
+- A new source-of-truth boundary, type bridge, or sandbox/runtime invariant is introduced or changed.
+- A new gotcha is discovered (a non-obvious flag, a silent-failure mode, a setup step that bites).
+- A locked-in stack choice changes (rare — and requires user approval per §2.6).
+- A common command changes (new dev/test/codegen invocation a future agent will need).
+- The slice status table or "what's next" framing materially shifts.
+
+Do **not** update it for: ephemeral progress (that's [progress.md](docs/progress.md)), per-session activity (that's [Contributions.md](docs/Contributions.md)), or new conventions/change-flow recipes (that's [engineering.md](docs/engineering.md)). If you're unsure which file a fact belongs in, prefer the more specific one and link from `agent_context.md` only if a cold-start agent genuinely needs the pointer.
 
 ---
 
@@ -229,7 +248,7 @@ Update these on every meaningful change. They're the live state of the project.
 | [docs/Contributions.md](docs/Contributions.md) | One-line entries naming who (human or agent) did what | Every session, no exceptions |
 | [docs/progress.md](docs/progress.md) | Slice status, current punch list, recent changes | Every session that ships code |
 | [docs/engineering.md](docs/engineering.md) | New conventions, change-flow patterns, gotchas you hit | Whenever you set a new precedent |
-| [docs/agent_context.md](docs/agent_context.md) | Distilled facts that future agents will need | When the repo's "shape" changes (new pkg, new boundary, new gotcha) |
+| [docs/agent_context.md](docs/agent_context.md) | Distilled facts a cold-starting agent needs (repo map, mental model, gotchas, common commands) | Whenever the repo's "shape" shifts — new pkg/app/boundary, new gotcha, changed setup or codegen command, changed stack invariant. See §1.1–§1.2. |
 
 ### 3.2 Slice briefs — editable while active, frozen when done
 
