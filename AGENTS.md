@@ -107,6 +107,115 @@ If a feature seems to need one of these, surface it to the user instead of addin
 3. Add it to the right manifest: `apps/<app>/pyproject.toml` or `apps/<app>/package.json` — never the repo root unless it's dev-tooling shared across all workspaces.
 4. Note the addition in [docs/Contributions.md](docs/Contributions.md).
 
+### 2.7 Use graphify-out as your map — first, but verify
+
+The repo has a pre-built knowledge graph in [graphify-out/](graphify-out/) that captures cross-file relationships, communities, and architecture clusters. **For any "how does X relate to Y" / "where is Z implemented" / "what depends on this module" question, consult the graph first.** It's far cheaper (1–2k tokens) than grepping or reading files linearly.
+
+#### Step 0 — Is graphify available?
+
+Before using any `/graphify` command, check that it's installed:
+
+```bash
+which graphify || python3 -c "import graphify" 2>/dev/null && echo "ok" || echo "missing"
+```
+
+If it's missing:
+
+1. **Ask the user**: "graphify isn't installed. Want me to install it (`pip install graphifyy`) so I can use the pre-built knowledge graph for relationship lookups? (Optional — I can fall back to grep/Read if you'd rather skip.)"
+2. If yes → install via `pip install graphifyy` (or `--break-system-packages` on macOS if needed). Then re-run the failing command.
+3. If no → fall back to `grep`/`Read`/`Explore` agent for the immediate task. Don't pester again in the same session.
+
+If [graphify-out/graph.json](graphify-out/graph.json) doesn't exist yet either, ask the user before triggering a fresh `/graphify` build (it costs tokens). The graph is most valuable on a repo that's been graphified at least once — for first-touch agents in a fresh clone, default to grep/Read until the user opts in.
+
+#### How to use it efficiently — common cases
+
+| You want | Do this |
+| --- | --- |
+| A topology overview (god nodes, surprising edges, suggested questions) | Read [graphify-out/GRAPH_REPORT.md](graphify-out/GRAPH_REPORT.md) — it's the audit summary, not the raw graph |
+| To answer a relationship question | `/graphify query "<question>"` (BFS, broad context) or `/graphify query "<question>" --dfs` (trace a chain) |
+| Shortest path between two concepts | `/graphify path "<NodeA>" "<NodeB>"` |
+| Everything connected to one node | `/graphify explain "<NodeName>"` |
+| Open the interactive graph | open `graphify-out/graph.html` in a browser |
+| Refresh after shipping changes | `/graphify --update` (incremental — re-extracts only changed files; cheap) |
+
+**Never load `graphify-out/graph.json` directly into context** — it's the raw data, not meant for reading. Use the query subcommands; they emit a token-budget-aware ranked subgraph.
+
+#### Other useful capabilities (use when relevant — don't pull all of these by default)
+
+| Capability | Command | When it earns its keep |
+| --- | --- | --- |
+| **Add an external doc** to the corpus (paper, tweet, arxiv URL, blog post, YouTube) | `/graphify add <url> --author "..." --contributor "..."` | When the user shares a URL that should be persisted as project context. Auto-runs `--update`. |
+| **Agent-crawlable wiki** (one Markdown article per community + index) | `/graphify --wiki` | Onboarding a new agent or human cold; cheaper than reading the full report. Output: `graphify-out/wiki/index.md`. |
+| **Live MCP server** so agents can query the graph as tools (`query_graph`, `get_neighbors`, `god_nodes`, `shortest_path`, etc.) | `/graphify --mcp` | When you want a sub-agent to consult the graph mid-task without re-running CLI commands. |
+| **Auto-rebuild on commit** | `graphify hook install` | Long-lived branches with frequent code changes — keeps the graph from going stale silently. |
+| **Watch a folder** and auto-rebuild on save | `/graphify --watch` | Active dev sessions where you want the graph to stay current without manual `--update` calls. |
+| **Re-cluster only** (don't re-extract — useful after manual graph edits) | `/graphify --cluster-only` | Rare. Skip unless you've hand-edited the graph. |
+| **Deep-mode extraction** (richer INFERRED edges) | `/graphify --mode deep` | Use sparingly — more INFERRED edges = more edges that need verification. Costs more tokens. |
+| **Directed graph** (preserves edge direction source→target) | `/graphify --directed` | When you actually need to reason about call-graph direction (e.g., "what calls `require_user`?" vs "what does `require_user` call?"). |
+| **Export to other tools** | `--svg` (embed in Notion/GitHub) · `--graphml` (Gephi/yEd) · `--neo4j` (Cypher file) · `--neo4j-push <uri>` (live push) | When the user wants to explore the graph in their preferred tool. |
+
+When in doubt: **start with `GRAPH_REPORT.md` and `/graphify query`**, escalate to other capabilities only when the basic ones don't answer the question.
+
+#### When the graph might be stale
+
+Findings from graphify are hypotheses, not facts. The graph reflects the corpus *at the last `/graphify` run* and may miss:
+
+- Files added or substantially edited since
+- Renames (the old node will be gone after `--update` but stale relationships may persist briefly)
+- INFERRED edges (model-reasoned, audit tag visible in the report) — those need verification before acting on them
+
+**Workflow**:
+
+1. Confirm graphify is installed (Step 0). If not, ask the user.
+2. Query graphify first for a lead.
+3. **Verify the lead by reading the actual file(s)** before making decisions or writing code based on it.
+4. If the graph clearly disagrees with reality (file gone, signature changed, no longer present), **run `/graphify --update`** to incrementally re-extract changed files. Don't run a full `/graphify` rebuild unless the user asks — it's expensive.
+
+#### Don't
+
+- Don't silently install graphify without asking the user — it's a tool choice, not a required dep.
+- Don't act on an INFERRED or AMBIGUOUS edge without reading the source file.
+- Don't replace `grep`/`Read` with graphify when you already know the exact file/symbol — it's slower for known-target lookups.
+- Don't trigger a full rebuild after every change. Use `--update` for incremental, or skip if the change was small.
+- Don't load `graph.json` directly into context. Use the query subcommands.
+- Don't use `/graphify --mode deep` reflexively — the extra INFERRED edges aren't free and most need verification anyway.
+
+### 2.8 Frontend theme — light mode, light/transparent surfaces, black accents
+
+The web app is **light-mode only** in v1 and beyond. There is no dark-mode toggle planned. Every contributor (human or agent) writes UI components against this palette:
+
+#### Surfaces (backgrounds)
+
+- Page background: `bg-white` or `bg-gray-50`
+- Cards / panels: `bg-white` with `border border-gray-200`, optionally `shadow-sm`
+- Overlays / modals / tooltips: `bg-white/80 backdrop-blur` (transparency + blur preferred over solid grays)
+- Hover/focus states: `bg-gray-100`, `bg-gray-50/50`, never colored hover backgrounds
+
+#### Text & accents
+
+- Primary text: `text-black` or `text-gray-900`
+- Secondary text: `text-gray-600`
+- Disabled/placeholder: `text-gray-400`
+- Primary action button: `bg-black text-white hover:bg-gray-800` (black-on-light is the canonical CTA — see [apps/web/src/routes/login.tsx](apps/web/src/routes/login.tsx))
+- Secondary button: `bg-gray-200 text-black hover:bg-gray-300` or `bg-white border border-gray-300`
+- Borders: `border-gray-200` (default), `border-black` (emphasis)
+
+#### Banned
+
+- **No `dark:` Tailwind variants** anywhere. The app does not respond to `prefers-color-scheme: dark`.
+- **No saturated brand colors** (`bg-blue-500`, `bg-red-500`, etc.) on backgrounds or large surfaces. Saturated colors are reserved for narrow semantic uses: error text (`text-red-600`), warning text (`text-amber-600`), success indicator (`text-green-600`). Never as a fill.
+- **No gradient backgrounds** unless explicitly approved.
+- **No glassmorphism beyond simple `backdrop-blur`** — keep it subtle.
+- **No custom hex colors** in component code. Use Tailwind's gray/black palette; if you need a brand color, surface it to the user before adding to the Tailwind config.
+
+#### shadcn/ui (when added per slice)
+
+- Initialize with the **neutral** color theme (zinc/gray base), not slate or stone unless the user picks otherwise.
+- Don't pull in shadcn's dark theme tokens.
+- Component-level overrides go in [apps/web/src/components/ui/](apps/web/src/components/ui/) or the equivalent — keep them adherent to the rules above.
+
+If a design need genuinely doesn't fit this palette, surface it to the user before deviating (per §3.5 deviation protocol).
+
 ---
 
 ## 3. Documentation rules
