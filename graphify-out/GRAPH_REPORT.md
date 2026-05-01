@@ -449,7 +449,7 @@ Nodes (1): index.html #root mount + main.tsx entry
 
 ### Community 79 - "Community 79"
 Cohesion: 1.0
-Nodes (1): vibe-platform README
+Nodes (1): octo-canvas README
 
 ### Community 80 - "Community 80"
 Cohesion: 1.0
@@ -610,7 +610,7 @@ Nodes (1): Slice 2 hard rules
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
 - **Thin community `Community 78`** (1 nodes): `index.html #root mount + main.tsx entry`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 79`** (1 nodes): `vibe-platform README`
+- **Thin community `Community 79`** (1 nodes): `octo-canvas README`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
 - **Thin community `Community 80`** (1 nodes): `Modular and small files rule`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.

@@ -5,7 +5,7 @@ the orchestrator stays event-loop-friendly. The SDK is the only Sprites
 import in the codebase — any swap to a different backend stays inside this
 module.
 
-Sprite naming: `vibe-sbx-{sandbox_id}` where `sandbox_id` is the Mongo
+Sprite naming: `octo-sbx-{sandbox_id}` where `sandbox_id` is the Mongo
 ObjectId. Reset (slice 4) destroys+recreates with the same name; slice 5b
 will switch Reset to `restore_checkpoint("clean")` and stop rotating the
 Sprite on every reset.
@@ -179,7 +179,7 @@ class SpritesProvider:
                         )
                     else:
                         killed += 1
-                except Exception as exc:  # noqa: BLE001 — best-effort kill
+                except Exception as exc:
                     _logger.warning(
                         "sprites.pause.kill_error",
                         sprite=sprite_name,
@@ -199,7 +199,7 @@ class SpritesProvider:
 
 
 def _name_for(sandbox_id: str) -> str:
-    return f"vibe-sbx-{sandbox_id}"
+    return f"octo-sbx-{sandbox_id}"
 
 
 def _require_name(handle: SandboxHandle) -> str:

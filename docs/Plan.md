@@ -313,7 +313,7 @@ Holds the sandbox-side state that needs to survive orchestrator restarts (Redis 
 class Sandbox(Document):
     user_id: Annotated[PydanticObjectId, Indexed()]  # NOT unique — see §4 forward-compat note
     provider_name: Literal["sprites", "mock"]    # discriminator
-    provider_handle: dict[str, str]              # opaque payload, e.g. {"name": "vibe-sbx-...", "id": "sprite-..."}
+    provider_handle: dict[str, str]              # opaque payload, e.g. {"name": "octo-sbx-...", "id": "sprite-..."}
     status: Literal["provisioning","cold","warm","running","resetting","destroyed","failed"]
     public_url: str | None       # Sprites' per-sandbox URL (cf. python.md → Management)
     last_active_at: datetime | None
@@ -442,6 +442,7 @@ Endpoints are parameterized by `{sandbox_id}` from day one (multi-sandbox forwar
 | POST | `/api/sandboxes` | Create a new sandbox. v1: 409 if user already has one. Future: returns the new sandbox. |
 | GET | `/api/sandboxes/{sandbox_id}` | Returns `SandboxResponse` — status, sprite_id, last_active_at, region, list of cloned repo paths. 404 if not the caller's. |
 | POST | `/api/sandboxes/{sandbox_id}/wake` | Spawn (if `none`/`destroyed`) or resume (if `hibernated`). Idempotent if already running. |
+| POST | `/api/sandboxes/{sandbox_id}/pause` | Force release of compute now: kills active exec sessions so Sprites' idle timer transitions the sprite to `cold`. Filesystem preserved. Idempotent on `cold`. 409 from `provisioning`/`resetting`/`destroyed`/`failed`. |
 | POST | `/api/sandboxes/{sandbox_id}/hibernate` | Force hibernate now. |
 | POST | `/api/sandboxes/{sandbox_id}/destroy` | Destroys the Sprite. Repos bound to this sandbox remain in `repos` but `clone_status="pending"` until next wake. |
 
@@ -679,7 +680,7 @@ The sandbox is provisioned via Sprites (see [docs/sprites/v0.0.1-rc43/python.md]
 @dataclass(frozen=True)
 class SandboxHandle:
     provider: ProviderName       # "sprites" | "mock"
-    payload: dict[str, str]      # opaque; e.g. {"name": "vibe-sbx-...", "id": "sprite-..."}
+    payload: dict[str, str]      # opaque; e.g. {"name": "octo-sbx-...", "id": "sprite-..."}
 
 class SandboxProvider(Protocol):
     name: ProviderName
@@ -687,9 +688,10 @@ class SandboxProvider(Protocol):
     async def status(self, handle: SandboxHandle) -> SandboxState   # ProviderStatus + public_url
     async def destroy(self, handle: SandboxHandle) -> None
     async def wake(self, handle: SandboxHandle) -> SandboxState     # no-op exec to force warm
+    async def pause(self, handle: SandboxHandle) -> SandboxState    # kill exec sessions; let Sprites idle
 ```
 
-Slice 5b widens with `fs_*` and `exec_*`; slice 6 with checkpoint helpers. Don't pre-add. Sprite naming: `vibe-sbx-{sandbox_id}` where `sandbox_id` is the Mongo `Sandbox._id`. v1 enforces exactly one alive `Sandbox` per user at the orchestrator routing layer (`SandboxManager.get_or_create`); the multi-sandbox future (§4 forward-compat note) lifts that enforcement — no naming or schema change needed.
+Slice 5b widens with `fs_*` and `exec_*`; slice 6 with checkpoint helpers. Don't pre-add. Sprite naming: `octo-sbx-{sandbox_id}` where `sandbox_id` is the Mongo `Sandbox._id`. v1 enforces exactly one alive `Sandbox` per user at the orchestrator routing layer (`SandboxManager.get_or_create`); the multi-sandbox future (§4 forward-compat note) lifts that enforcement — no naming or schema change needed.
 
 ### Per-user state machine
 
@@ -751,6 +753,10 @@ Queue lives in Redis: `sandbox:{sandbox_id}:queue` (LIST of `run_id`). The orche
 ### Idle hibernation
 
 **Sprites does this server-side** — sandboxes auto-pause to `cold` after idle and auto-warm on the next access (exec, HTTP request to the public URL, fs read). No orchestrator-side cron. The dashboard uses `POST /api/sandboxes/{id}/refresh` to resync live status when needed.
+
+### Manual pause (slice 4)
+
+`POST /api/sandboxes/{id}/pause` lets the user release compute *now* instead of waiting on Sprites' idle timer. Sprites' rc43 SDK exposes no force-pause verb, so the implementation kills any active exec sessions (which is what keeps a sprite warm) via `POST /v1/sprites/{name}/exec/{session_id}/kill` (raw HTTP through the SDK's authenticated client — `kill_session` isn't in rc37 SDK methods). The sprite then idles to `cold` on its own within seconds. Idempotent: pausing a `cold` sandbox is a no-op. Filesystem is preserved; user pays for storage only while paused. Slice 6+ will narrow the kill set to *non-agent* sessions so an active agent run isn't accidentally murdered by Pause.
 
 ### Destroy semantics
 
@@ -846,7 +852,7 @@ The agent-runner process inside the sprite is **stateless across runs**; warm ca
 
 1. Read `task_json` from argv: `{run_id, repo_full_name, base_branch, prompt, follow_up, user_token, tool_allowlist, agent_defaults}`. The `prompt` is post-enhancement when User Agent is on; pre-enhancement when off.
 2. `cd /work/<repo_full_name>/`. If missing, clone now (slice 5b's reconciliation should make this rare).
-3. `git fetch origin` + `git checkout -B <work_branch> origin/<base_branch>` — work branch is `vibe/task-{task_id_short}`.
+3. `git fetch origin` + `git checkout -B <work_branch> origin/<base_branch>` — work branch is `octo/task-{task_id_short}`.
 4. Invoke the Claude Agent SDK with:
    - System prompt from `agent_config.dev_agent` (templated with repo metadata, language, test command, in-repo `CLAUDE.md`).
    - The user's `initial_prompt` (or `follow_up_prompt`).
@@ -899,7 +905,7 @@ The User Agent does **not** have direct access to the sandbox filesystem or to t
 
 - All git ops happen inside `/work/<repo_full_name>/`. Each `provider.exec_oneshot` call sets `dir` per command; never `cd`s globally (so concurrent runs in the future stay isolated).
 - Repo bootstrap (slice 5b clone op): `git clone --filter=blob:none https://x-access-token:<user_token>@github.com/<full_name>.git /work/<full_name>` — partial clone for fast first-pull on big repos. Then `git remote set-url origin https://github.com/<full_name>.git` to scrub the token.
-- Branch naming: `vibe/task-{slug}` where `slug` is 8 chars of the task id. Run 1 creates it; follow-up runs check it out and add commits.
+- Branch naming: `octo/task-{slug}` where `slug` is 8 chars of the task id. Run 1 creates it; follow-up runs check it out and add commits.
 - Commit messages: agent generates them; the agent-runner appends `Co-Authored-By: octo-canvas <bot@octo-canvas.dev>`.
 - Push: HTTPS with the user's OAuth access token via `git -c http.extraheader="AUTHORIZATION: bearer <user_token>" push`. Token never written to `.git/config`.
 - PR creation: githubkit `repos.create_pull_request` against `default_branch`. Body includes a deep link back to the platform task page.
@@ -1035,10 +1041,10 @@ Sign-in flow + `User`/`Session` collections + protected route convention. Accept
 
 **Scope-narrow.** This slice ends at "the box exists, REST endpoints work, mock + Sprites providers behind one Protocol." It does **not** include cloning, reconciliation, exec, or PTY — those land in 5b/6/8.
 
-**Adds:** `SpritesProvider` (real `sprites-py` SDK) and `MockSandboxProvider` behind the `SandboxProvider` Protocol. Opaque `SandboxHandle(provider, payload: dict[str, str])` so the backend stays swappable. `Sandbox` Mongo collection (one alive per user enforced at the routing layer, NOT at the index — see §4 forward-compat note). Redis hash for hot state (`sandbox:{id} → {status, public_url, last_active_at}`, 90s TTL — no queue yet). REST endpoints `POST /api/sandboxes`, `GET /api/sandboxes`, `POST /api/sandboxes/{id}/wake`, `.../refresh`, `.../reset`, `.../destroy`. **No `hibernate` endpoint** — Sprites auto-hibernates after idle, no force-pause API exposed.
+**Adds:** `SpritesProvider` (real `sprites-py` SDK) and `MockSandboxProvider` behind the `SandboxProvider` Protocol. Opaque `SandboxHandle(provider, payload: dict[str, str])` so the backend stays swappable. `Sandbox` Mongo collection (one alive per user enforced at the routing layer, NOT at the index — see §4 forward-compat note). Redis hash for hot state (`sandbox:{id} → {status, public_url, last_active_at}`, 90s TTL — no queue yet). REST endpoints `POST /api/sandboxes`, `GET /api/sandboxes`, `POST /api/sandboxes/{id}/wake`, `.../pause`, `.../refresh`, `.../reset`, `.../destroy`. **`pause` is the manual force-pause** — Sprites' SDK has no force-hibernate verb, so the implementation kills active exec sessions via raw HTTP to `/v1/sprites/{name}/exec/{session_id}/kill` (rc37 SDK doesn't expose `kill_session`); Sprites' own idle timer then transitions to `cold` within seconds.
 **Files:** `python_packages/sandbox_provider/src/sandbox_provider/{sprites.py,mock.py,interface.py}`; orchestrator `services/sandbox_manager.py`, `routes/sandbox.py`, `lib/provider_factory.py`, `lib/redis_client.py`.
 **Risks:** Sprites SDK rc-only (rc37 on PyPI, rc43 docs at [docs/sprites/v0.0.1-rc43/python.md](sprites/v0.0.1-rc43/python.md); workspace pyproject sets `[tool.uv] prerelease = "allow"` so rc resolves); silent provider fallback (forbidden — empty `SPRITES_TOKEN` aborts startup); reset semantics (slice 4 uses sequential destroy+create; slice 5b switches to checkpoints).
-**Acceptance:** `POST /api/sandboxes` creates a `Sandbox` doc and immediately calls `provider.create()`; the sprite shows up `warm` with a public URL right away. `wake` issues a no-op exec to force `cold→running`. `refresh` resyncs status from the provider. `reset` rotates `provider_handle.id` on the same `Sandbox._id`, increments `reset_count`, returns the sandbox to `warm`. `destroy` marks the doc `destroyed`; user must re-`POST /api/sandboxes` to provision a new one (new `_id`).
+**Acceptance:** `POST /api/sandboxes` creates a `Sandbox` doc and immediately calls `provider.create()`; the sprite shows up `warm` with a public URL right away. `wake` issues a no-op exec to force `cold→running`. `pause` kills active exec sessions and returns whatever the provider currently reports (warm, then cold within seconds via Sprites' idle); idempotent on `cold`. `refresh` resyncs status from the provider. `reset` rotates `provider_handle.id` on the same `Sandbox._id`, increments `reset_count`, returns the sandbox to `warm`. `destroy` marks the doc `destroyed`; user must re-`POST /api/sandboxes` to provision a new one (new `_id`).
 **Out of scope:** WS endpoints (5a), cloning (5b), agent runs (6), PTY/file ops (8 — though Sprites already covers most of it, see §18 below).
 
 ### Slice 5a — Web ↔ orchestrator WS (control + events)
@@ -1138,7 +1144,7 @@ Builds the orchestrator-hosted User Agent on top of slice 6. Off-by-default; use
 11. **Per-user sandbox = noisy-neighbor surface** — all of one user's tasks share one sprite. v1 limits to one active run at a time per sandbox (queue the rest). Sprites manages CPU/RAM/disk; if cost-spiral becomes real, contact Sprites about per-sprite limits.
 12. **Multi-repo install token scoping** — different repos in the same sandbox can be on different GitHub App installations (different orgs). Mint **per-repo, per-run** install tokens at task-start time and pass via the agent-runner's `task_json`; never share a token across repos or persist on the sandbox filesystem.
 13. **Reconciliation correctness (slice 5b)** — the diff between `Repo` rows where `sandbox_id == this.sandbox_id` and the sprite's `/work` listing (via `provider.fs_list`) must converge: missing on disk → clone; on disk but not bound to this sandbox → remove. Reconciliation is per-sandbox, never per-user. Test the four-quadrant matrix explicitly.
-14. **Sandbox name reuse on Reset** — `vibe-sbx-{sandbox_id}` is deterministic and reused across resets (same `Sandbox._id`). The `provider.destroy → provider.create` sequence in `SandboxManager.reset` is sequential, so Sprites finishes destroying the old sprite before the new one is created. Don't parallelize.
+14. **Sandbox name reuse on Reset** — `octo-sbx-{sandbox_id}` is deterministic and reused across resets (same `Sandbox._id`). The `provider.destroy → provider.create` sequence in `SandboxManager.reset` is sequential, so Sprites finishes destroying the old sprite before the new one is created. Don't parallelize.
 15. **No disk-cap eviction yet** — Sprites manages storage; we don't run our own `du`-based eviction. If real users blow past the underlying quota, Reset (which clears the filesystem) is the escape hatch and slice 5b's `clean` checkpoint makes it cheap.
 
 16. **Transport choice — WS for the web leg only** — Sprites' SDK handles the orchestrator↔sandbox leg over WSS; we don't operate a custom protocol there. gRPC stays off the table for the web leg (browsers don't speak it natively, gRPC-Web is more cost than benefit). See §10.1.
@@ -1168,6 +1174,8 @@ Builds the orchestrator-hosted User Agent on top of slice 6. Off-by-default; use
 28. **User-Agent LLM cost** — slice 6b runs a User-Agent invocation on every user message and every sandbox-agent clarification. Budget caps: per-user spend cap (configurable, default $X/day) enforced before each User-Agent call; if exceeded, fall back to passthrough mode and surface a banner. Monitor average User-Agent calls per task; if it >5x's the Sandbox-Agent's call count, something is misrouted.
 
 29. **Sandbox-agent clarification timeout** — `ask_user_clarification` blocks reading stdin. v1 caps that wait at **5 minutes**; if no answer arrives, the sandbox-agent emits `ErrorEvent{kind: "clarification_timeout"}` and the run aborts. Otherwise a closed FE tab + dropped User Agent could deadlock the sandbox forever.
+
+30. **Pause kills *all* exec sessions in slice 4** — slice 4 has no agent runs yet, so this is harmless. From slice 6 onward Pause must be narrowed to skip sessions tagged as agent runs (or runs flagged as "in-progress" in `agent_runs`); otherwise clicking Pause mid-task would kill the agent. The pause implementation is in [`python_packages/sandbox_provider/src/sandbox_provider/sprites.py`](../python_packages/sandbox_provider/src/sandbox_provider/sprites.py); revisit at slice 6.
 
 - **Slice 0** ✅ scaffolding shipped
 - **Slice 1** ✅ shipped (GitHub OAuth + user persistence)

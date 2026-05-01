@@ -18,7 +18,7 @@ export async function getOrCreateSandbox(): Promise<SandboxResponse> {
   return data;
 }
 
-type Transition = 'wake' | 'refresh' | 'reset' | 'destroy';
+type Transition = 'wake' | 'pause' | 'refresh' | 'reset' | 'destroy';
 
 async function _transition(
   sandboxId: string,
@@ -27,6 +27,7 @@ async function _transition(
   const { data, error, response } = await api.POST(
     `/api/sandboxes/{sandbox_id}/${action}` as
       | '/api/sandboxes/{sandbox_id}/wake'
+      | '/api/sandboxes/{sandbox_id}/pause'
       | '/api/sandboxes/{sandbox_id}/refresh'
       | '/api/sandboxes/{sandbox_id}/reset'
       | '/api/sandboxes/{sandbox_id}/destroy',
@@ -45,6 +46,7 @@ async function _transition(
 }
 
 export const wakeSandbox = (id: string) => _transition(id, 'wake');
+export const pauseSandbox = (id: string) => _transition(id, 'pause');
 export const refreshSandbox = (id: string) => _transition(id, 'refresh');
 export const resetSandbox = (id: string) => _transition(id, 'reset');
 export const destroySandbox = (id: string) => _transition(id, 'destroy');

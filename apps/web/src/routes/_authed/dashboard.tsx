@@ -19,7 +19,7 @@ export const Route = createFileRoute('/_authed/dashboard')({
   component: DashboardPage,
 });
 
-const PANEL_KEY = 'vibe.dashboardPanelOpen';
+const PANEL_KEY = 'octo.dashboardPanelOpen';
 
 function DashboardPage() {
   const { data: me } = useQuery(meQueryOptions);

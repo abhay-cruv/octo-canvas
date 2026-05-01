@@ -43,7 +43,7 @@ _logger = structlog.get_logger("sandbox_manager")
 # [slice4.md §5](../../../../docs/slice/slice4.md).
 _ALIVE: tuple[SandboxStatus, ...] = ("cold", "warm", "running")
 _WAKE_FROM: tuple[SandboxStatus, ...] = _ALIVE
-_PAUSE_FROM: tuple[SandboxStatus, ...] = _ALIVE       # pause on cold is a no-op
+_PAUSE_FROM: tuple[SandboxStatus, ...] = _ALIVE  # pause on cold is a no-op
 _RESET_FROM: tuple[SandboxStatus, ...] = (*_ALIVE, "failed")
 _DESTROY_FROM: tuple[SandboxStatus, ...] = (*_ALIVE, "failed", "provisioning")
 

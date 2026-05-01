@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { sandboxesQueryOptions } from '../lib/queries';
 import {
   destroySandbox,
+  pauseSandbox,
   getOrCreateSandbox,
   refreshSandbox,
   resetSandbox,
@@ -45,6 +46,7 @@ export function SandboxPanel() {
     onSuccess,
   });
   const wake = useMutation({ mutationFn: wakeSandbox, onSuccess, onError });
+  const pause = useMutation({ mutationFn: pauseSandbox, onSuccess, onError });
   const refresh = useMutation({ mutationFn: refreshSandbox, onSuccess, onError });
   const reset = useMutation({ mutationFn: resetSandbox, onSuccess, onError });
   const destroy = useMutation({ mutationFn: destroySandbox, onSuccess, onError });
@@ -91,7 +93,12 @@ export function SandboxPanel() {
         <div>{labels.subtitle}</div>
         {active.status === 'cold' ? (
           <div className="text-xs text-gray-500">
-            Sprites auto-paused after idle. Click <span className="font-medium">Start session</span> or open the URL to wake it.
+            Paused — <span className="font-medium">no compute cost</span> while cold. Filesystem preserved. Click <span className="font-medium">Start session</span> or open the URL to wake.
+          </div>
+        ) : null}
+        {active.status === 'warm' || active.status === 'running' ? (
+          <div className="text-xs text-gray-500">
+            Click <span className="font-medium">Pause</span> to release compute now (or wait — Sprites auto-pauses after idle).
           </div>
         ) : null}
         {active.status === 'failed' && active.failure_reason ? (
@@ -128,6 +135,17 @@ export function SandboxPanel() {
             {wake.isPending ? 'Starting…' : 'Start session'}
           </button>
         ) : null}
+        {(active.status === 'warm' || active.status === 'running') && (
+          <button
+            type="button"
+            onClick={() => pause.mutate(active.id)}
+            disabled={pause.isPending}
+            className="px-3 py-1.5 rounded-lg bg-white border border-gray-300 text-gray-900 text-sm hover:bg-gray-50 disabled:opacity-60"
+            title="Release compute now; storage preserved"
+          >
+            {pause.isPending ? 'Pausing…' : 'Pause'}
+          </button>
+        )}
         {isAlive ? (
           <button
             type="button"
@@ -161,7 +179,8 @@ export function SandboxPanel() {
         )}
       </div>
       {(reset.error instanceof SandboxStateError ||
-        wake.error instanceof SandboxStateError) && (
+        wake.error instanceof SandboxStateError ||
+        pause.error instanceof SandboxStateError) && (
         <div className="mt-2 text-xs text-red-600">
           That action isn&apos;t allowed in the current state. The view has refreshed.
         </div>

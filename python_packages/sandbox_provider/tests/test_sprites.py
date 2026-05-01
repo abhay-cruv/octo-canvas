@@ -139,12 +139,12 @@ async def test_create_returns_handle_with_id_and_url() -> None:
     p = _build_provider(fake)
     handle = await p.create(sandbox_id="sbx1", labels=["env:test"])
     assert handle.provider == "sprites"
-    assert handle.payload["name"] == "vibe-sbx-sbx1"
-    assert handle.payload["id"] == "sprite-vibe-sbx-sbx1"
+    assert handle.payload["name"] == "octo-sbx-sbx1"
+    assert handle.payload["id"] == "sprite-octo-sbx-sbx1"
 
     state = await p.status(handle)
     assert state.status == "warm"
-    assert state.public_url == "https://vibe-sbx-sbx1.sprites.app"
+    assert state.public_url == "https://octo-sbx-sbx1.sprites.app"
 
 
 @pytest.mark.asyncio
@@ -169,7 +169,7 @@ async def test_create_5xx_is_retriable() -> None:
 async def test_destroy_404_is_idempotent() -> None:
     fake = _FakeClient(raise_on_delete=NotFoundError("not found"))
     p = _build_provider(fake)
-    handle = SandboxHandle(provider="sprites", payload={"name": "vibe-sbx-x"})
+    handle = SandboxHandle(provider="sprites", payload={"name": "octo-sbx-x"})
     # Should not raise.
     await p.destroy(handle)
 
@@ -178,7 +178,7 @@ async def test_destroy_404_is_idempotent() -> None:
 async def test_status_404_raises_non_retriable() -> None:
     fake = _FakeClient(raise_on_get=NotFoundError("missing"))
     p = _build_provider(fake)
-    handle = SandboxHandle(provider="sprites", payload={"name": "vibe-sbx-x"})
+    handle = SandboxHandle(provider="sprites", payload={"name": "octo-sbx-x"})
     with pytest.raises(SpritesError) as exc_info:
         await p.status(handle)
     assert exc_info.value.retriable is False
@@ -187,27 +187,27 @@ async def test_status_404_raises_non_retriable() -> None:
 @pytest.mark.asyncio
 async def test_status_maps_sprite_states() -> None:
     fake = _FakeClient()
-    fake.sprites["vibe-sbx-x"] = _FakeSprite(
-        name="vibe-sbx-x", id="id", status="cold", url="u"
+    fake.sprites["octo-sbx-x"] = _FakeSprite(
+        name="octo-sbx-x", id="id", status="cold", url="u"
     )
     p = _build_provider(fake)
-    handle = SandboxHandle(provider="sprites", payload={"name": "vibe-sbx-x"})
+    handle = SandboxHandle(provider="sprites", payload={"name": "octo-sbx-x"})
     assert (await p.status(handle)).status == "cold"
-    fake.sprites["vibe-sbx-x"].status = "running"
+    fake.sprites["octo-sbx-x"].status = "running"
     assert (await p.status(handle)).status == "running"
     # Unknown status maps to warm with a warning.
-    fake.sprites["vibe-sbx-x"].status = "starting"
+    fake.sprites["octo-sbx-x"].status = "starting"
     assert (await p.status(handle)).status == "warm"
 
 
 @pytest.mark.asyncio
 async def test_wake_issues_no_op_command_and_returns_state() -> None:
     fake = _FakeClient()
-    fake.sprites["vibe-sbx-x"] = _FakeSprite(
-        name="vibe-sbx-x", id="id", status="cold", url="u"
+    fake.sprites["octo-sbx-x"] = _FakeSprite(
+        name="octo-sbx-x", id="id", status="cold", url="u"
     )
     p = _build_provider(fake)
-    handle = SandboxHandle(provider="sprites", payload={"name": "vibe-sbx-x"})
+    handle = SandboxHandle(provider="sprites", payload={"name": "octo-sbx-x"})
     state = await p.wake(handle)
     # Wake calls command("true") on the sprite.
     assert fake.last_command == [("true",)]
@@ -235,11 +235,11 @@ async def test_constructor_rejects_empty_token() -> None:
 @pytest.mark.asyncio
 async def test_pause_with_no_sessions_just_refreshes_status() -> None:
     fake = _FakeClient()
-    fake.sprites["vibe-sbx-x"] = _FakeSprite(
-        name="vibe-sbx-x", id="id", status="warm", url="u"
+    fake.sprites["octo-sbx-x"] = _FakeSprite(
+        name="octo-sbx-x", id="id", status="warm", url="u"
     )
     p = _build_provider(fake)
-    handle = SandboxHandle(provider="sprites", payload={"name": "vibe-sbx-x"})
+    handle = SandboxHandle(provider="sprites", payload={"name": "octo-sbx-x"})
     state = await p.pause(handle)
     assert state.status == "warm"  # no sessions to kill; status echoed back
     assert fake._client.posts == []  # pyright: ignore[reportPrivateUsage]
@@ -248,21 +248,21 @@ async def test_pause_with_no_sessions_just_refreshes_status() -> None:
 @pytest.mark.asyncio
 async def test_pause_kills_each_session_via_kill_endpoint() -> None:
     fake = _FakeClient()
-    fake.sprites["vibe-sbx-x"] = _FakeSprite(
-        name="vibe-sbx-x", id="id", status="warm", url="u"
+    fake.sprites["octo-sbx-x"] = _FakeSprite(
+        name="octo-sbx-x", id="id", status="warm", url="u"
     )
-    fake.sessions_per_sprite["vibe-sbx-x"] = [
+    fake.sessions_per_sprite["octo-sbx-x"] = [
         _FakeSession(id="sess-1"),
         _FakeSession(id="sess-2"),
     ]
     p = _build_provider(fake)
-    handle = SandboxHandle(provider="sprites", payload={"name": "vibe-sbx-x"})
+    handle = SandboxHandle(provider="sprites", payload={"name": "octo-sbx-x"})
     state = await p.pause(handle)
     posts = fake._client.posts  # pyright: ignore[reportPrivateUsage]
     assert len(posts) == 2
     urls = sorted(url for url, _ in posts)
-    assert "/v1/sprites/vibe-sbx-x/exec/sess-1/kill" in urls[0]
-    assert "/v1/sprites/vibe-sbx-x/exec/sess-2/kill" in urls[1]
+    assert "/v1/sprites/octo-sbx-x/exec/sess-1/kill" in urls[0]
+    assert "/v1/sprites/octo-sbx-x/exec/sess-2/kill" in urls[1]
     # Auth header propagated.
     for _, headers in posts:
         assert headers.get("Authorization") == "Bearer test-token"
@@ -272,13 +272,13 @@ async def test_pause_kills_each_session_via_kill_endpoint() -> None:
 @pytest.mark.asyncio
 async def test_pause_404_on_kill_is_swallowed() -> None:
     fake = _FakeClient()
-    fake.sprites["vibe-sbx-x"] = _FakeSprite(
-        name="vibe-sbx-x", id="id", status="warm", url="u"
+    fake.sprites["octo-sbx-x"] = _FakeSprite(
+        name="octo-sbx-x", id="id", status="warm", url="u"
     )
-    fake.sessions_per_sprite["vibe-sbx-x"] = [_FakeSession(id="sess-gone")]
+    fake.sessions_per_sprite["octo-sbx-x"] = [_FakeSession(id="sess-gone")]
     fake._client.kill_responses["sess-gone"] = 404  # pyright: ignore[reportPrivateUsage]
     p = _build_provider(fake)
-    handle = SandboxHandle(provider="sprites", payload={"name": "vibe-sbx-x"})
+    handle = SandboxHandle(provider="sprites", payload={"name": "octo-sbx-x"})
     state = await p.pause(handle)  # must not raise
     assert state.status == "warm"
 
@@ -288,7 +288,7 @@ async def test_pause_not_found_raises() -> None:
     fake = _FakeClient(raise_on_list_sessions=NotFoundError("gone"))
     fake.raise_on_get = NotFoundError("gone")
     p = _build_provider(fake)
-    handle = SandboxHandle(provider="sprites", payload={"name": "vibe-sbx-x"})
+    handle = SandboxHandle(provider="sprites", payload={"name": "octo-sbx-x"})
     with pytest.raises(SpritesError) as exc_info:
         await p.pause(handle)
     assert exc_info.value.retriable is False

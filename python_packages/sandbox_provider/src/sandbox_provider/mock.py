@@ -42,7 +42,7 @@ class MockSandboxProvider:
 
     async def create(self, *, sandbox_id: str, labels: list[str]) -> SandboxHandle:
         _ = labels
-        sprite_name = f"vibe-sbx-{sandbox_id}"
+        sprite_name = f"octo-sbx-{sandbox_id}"
         if sprite_name in self._sprites and not self._sprites[sprite_name].destroyed:
             raise SpritesError(f"sprite {sprite_name!r} already exists", retriable=False)
         self._sprites[sprite_name] = _SpriteRecord(

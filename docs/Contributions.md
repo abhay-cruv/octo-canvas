@@ -40,6 +40,19 @@ For *what changed structurally*, read [progress.md](progress.md). For *who and w
 
 ## Log
 
+### 2026-05-02 — Claude Opus 4.7 via Claude Code (slice 4 sign-off)
+
+- Slice 4 signed off. [slice/slice4.md](slice/slice4.md) is now frozen — no further edits to that brief; corrections live under "Slice-4 corrections (post-freeze)" in [progress.md](progress.md).
+- [progress.md](progress.md) updated: slice 4 row → ✅ shipped; "Active slice" pointer flipped to slice 5a (web↔orchestrator control + events WS); three open followups carried forward (Pause-narrows-to-non-agent-sessions in slice 6 per [Plan.md §19 #30](Plan.md), `public_url` already surfaced for slice 5a, Sprites warm-billing rate question to confirm with Sprites team).
+- [agent_context.md](agent_context.md) status line updated: "Slices 0–4 shipped. Slice 4 = sandbox provisioning behind opaque `SandboxHandle`; 7-state machine; Reset/Pause/Destroy distinct."
+
+### 2026-05-02 — Claude Opus 4.7 via Claude Code (slice 4 — manual Pause endpoint shipped)
+
+- Added manual Pause to slice 4. New `POST /api/sandboxes/{id}/pause` endpoint; `SandboxProvider.pause(handle) -> SandboxState` widening on the Protocol; `MockSandboxProvider.pause` (force-cold) and `SpritesProvider.pause` (list_sessions + raw HTTP POST to `/v1/sprites/{name}/exec/{session_id}/kill` per session — `kill_session` not in rc37 SDK methods, so we use the SDK's authenticated `_client` directly). Sprites' idle timer transitions the sprite to `cold` within seconds after sessions are killed. Idempotent on `cold`; 409 from `provisioning`/`resetting`/`destroyed`/`failed`.
+- `SandboxManager.pause()` added with `_PAUSE_FROM = _ALIVE` state-machine constant. Web ([SandboxPanel.tsx](../apps/web/src/components/SandboxPanel.tsx)) gained a Pause button on `warm`/`running` plus cost-clarity copy: cold state now reads "Paused — no compute cost while cold. Filesystem preserved." and warm/running reads "Click Pause to release compute now (or wait — Sprites auto-pauses after idle)."
+- Plan.md updated: §9 API table adds `/pause`; §13 Provider Protocol code block adds `pause()`; new "Manual pause (slice 4)" subsection in §13 explains the session-kill mechanism; §18 slice-4 entry mentions the new endpoint + acceptance; §19 risks adds #30 (Pause kills *all* sessions in slice 4 — narrow to skip agent runs from slice 6+).
+- Tests: 4 orchestrator + 4 provider unit tests cover the new path. State-machine matrix updated. Pipeline green: 64 orchestrator + 23 provider passing; `pnpm typecheck && lint && test && build` all clean.
+
 ### 2026-05-02 — Claude Opus 4.7 via Claude Code (Plan.md — User Agent two-agent design)
 
 - Added the **User Agent** (orchestrator-side, opt-in MITM between FE and Sandbox Agent) to [Plan.md](../docs/Plan.md): §8 `User` doc gains `user_agent_enabled` + `user_agent_mode`; §9 adds `PATCH /api/me/user-agent`; §10 web protocol gains `PromptEnhancedEvent` / `AskUserClarification` / `AgentAnsweredClarification` (with `override_window_ms`) / `AnswerClarification` / `OverrideAgentAnswer`; §14 rewritten as two-agent architecture with combined data-flow diagram, the `AskUserClarification` blocking-stdin protocol, User Agent tool list + system-prompt rules; §17 adds `USER_AGENT_DAILY_USD_CAP`; §18 splits old slice 6 into slice 6 (sandbox-agent passthrough) + slice 6b (User Agent layer); §19 adds risks #25–29 (visibility, override race, two-LLM coherence, LLM cost cap, clarification timeout); §20 snapshot updated.
@@ -147,7 +160,7 @@ For *what changed structurally*, read [progress.md](progress.md). For *who and w
 - **§8 `Repo`**: added `sandbox_id: PydanticObjectId | None` (set by slice 4 when bound; null in slice 2). Forward-compat per the §4 note about repo-connect flow gaining sandbox selection.
 - **§8 `Task`**: added `sandbox_id: PydanticObjectId` (required). Resolves an inconsistency where the §4 note claimed "sandbox_id already on Task" but the model only had `user_id` + `repo_id`.
 - **§9 Sandbox API**: renamed all routes from `/api/sandbox/*` (singleton) → `/api/sandboxes/{sandbox_id}/*` (parameterized) plus `GET /api/sandboxes` (list — length-0/1 in v1) and `POST /api/sandboxes` (create — 409 if user already has one in v1). UI resolves the singleton id transparently; multi-sandbox future just adds a picker.
-- **§13 Sprite naming**: `vibe-sbx-{user_id}` → `vibe-sbx-{sandbox_id}` (collision-free with N sandboxes per user).
+- **§13 Sprite naming**: `octo-sbx-{user_id}` → `octo-sbx-{sandbox_id}` (collision-free with N sandboxes per user).
 - **§13–14 reconciliation**: clarified everywhere as **per-sandbox** (`Repo.sandbox_id == this.sandbox_id`), never per-user. Updated slice-4 brief in §18 + acceptance test in §19 (four-quadrant matrix is per-sandbox).
 - **§18 slice 4 brief** rewritten to reflect the new schema + API shape; acceptance test calls the parameterized endpoints.
 - **No shipped-code changes** — adding `sandbox_id` to `Repo` today would be dead-field scaffolding (no `Sandbox` model exists in slice 2). Per AGENTS.md §2.3 (no future-proofing), defer until slice 4 binds it. `AgentRun.sandbox_id` was already correct; WS endpoint `/ws/bridge/sandboxes/{sandbox_id}` was already parameterized.

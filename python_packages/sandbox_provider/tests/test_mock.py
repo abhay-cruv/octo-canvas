@@ -7,7 +7,7 @@ async def test_create_returns_warm_handle_with_url() -> None:
     p = MockSandboxProvider()
     handle = await p.create(sandbox_id="sbx1", labels=["user:42"])
     assert handle.provider == "mock"
-    assert handle.payload["name"] == "vibe-sbx-sbx1"
+    assert handle.payload["name"] == "octo-sbx-sbx1"
 
     state = await p.status(handle)
     assert state.status == "warm"
@@ -38,7 +38,7 @@ async def test_destroy_idempotent() -> None:
     await p.destroy(handle)
     await p.destroy(handle)
     # Destroying a handle that was never created is also a no-op.
-    other = SandboxHandle(provider="mock", payload={"name": "vibe-sbx-never"})
+    other = SandboxHandle(provider="mock", payload={"name": "octo-sbx-never"})
     await p.destroy(other)
 
 

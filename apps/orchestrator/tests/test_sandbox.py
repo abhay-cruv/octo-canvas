@@ -76,7 +76,7 @@ async def test_list_empty_then_after_create(client: httpx.AsyncClient) -> None:
     # MockSandboxProvider returns `warm` immediately after create with a
     # synthetic public URL.
     assert body["status"] == "warm"
-    assert body["public_url"].startswith("https://vibe-sbx-")
+    assert body["public_url"].startswith("https://octo-sbx-")
     assert body["provider_name"] == "mock"
     assert body["reset_count"] == 0
     assert body["spawned_at"] is not None
@@ -149,7 +149,7 @@ async def test_wake_forces_running(client: httpx.AsyncClient) -> None:
     client.cookies.set(SESSION_COOKIE_NAME, session.session_id)
 
     sandbox = (await client.post("/api/sandboxes")).json()
-    handle = SandboxHandle(provider="mock", payload={"name": f"vibe-sbx-{sandbox['id']}"})
+    handle = SandboxHandle(provider="mock", payload={"name": f"octo-sbx-{sandbox['id']}"})
     _mock_provider()._force_cold(handle)  # simulate Sprites idle-hibernation
 
     response = await client.post(f"/api/sandboxes/{sandbox['id']}/wake")
@@ -247,7 +247,7 @@ async def test_refresh_resyncs_status(client: httpx.AsyncClient) -> None:
     sandbox = (await client.post("/api/sandboxes")).json()
     assert sandbox["status"] == "warm"
 
-    handle = SandboxHandle(provider="mock", payload={"name": f"vibe-sbx-{sandbox['id']}"})
+    handle = SandboxHandle(provider="mock", payload={"name": f"octo-sbx-{sandbox['id']}"})
     _mock_provider()._force_cold(handle)  # Sprites went idle on its own
 
     response = await client.post(f"/api/sandboxes/{sandbox['id']}/refresh")
@@ -424,14 +424,18 @@ async def test_state_machine_matrix(client: httpx.AsyncClient) -> None:
 
     illegal_combos: list[tuple[str, str]] = [
         ("provisioning", "wake"),
+        ("provisioning", "pause"),
         ("provisioning", "reset"),
         ("resetting", "wake"),
+        ("resetting", "pause"),
         ("resetting", "reset"),
         ("resetting", "destroy"),
         ("destroyed", "wake"),
+        ("destroyed", "pause"),
         ("destroyed", "reset"),
         ("destroyed", "destroy"),
         ("failed", "wake"),
+        ("failed", "pause"),
     ]
     for from_status, action in illegal_combos:
         sandbox = Sandbox(

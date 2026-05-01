@@ -14,7 +14,7 @@ Sibling docs: [agent_context.md](agent_context.md) (quick-start) · [engineering
 | 1 | GitHub OAuth + user persistence | ✅ shipped | `User` + `Session` collections, `/login` → `/dashboard` flow, `require_user` dependency. UI redesigned to profile view. |
 | 2 | OAuth `repo` scope + repo connection | ✅ shipped | OAuth scope expanded to include `repo`; access token persisted on `User`; `Repo` collection; list/connect/disconnect endpoints; **401 → clear token + 403 `github_reauth_required`**; UI Reconnect flow. **No GitHub App, no smee, no webhooks** (rejected design). **No clone, no introspection, no sandbox** (slices 3 + 4). [slice2.md](slice/slice2.md) is now frozen — corrections live below. |
 | 3 | Repo introspection | ✅ shipped | GitHub Trees + Contents detection, no clone. Five fields incl. `dev_command`. Per-field user overrides via `PATCH /api/repos/{id}/introspection`. [slice3.md](slice/slice3.md) is now frozen — corrections live below. |
-| 4 | Sandbox provisioning (the box exists) | 🟡 active — rewritten on Sprites SDK, awaiting sign-off | Brief at [slice4.md](slice/slice4.md). Mid-slice rewrite 2026-05-01: dropped Fly Machines impl + hibernate verb + idle job; switched to `sprites-py` SDK behind opaque `SandboxHandle`. 7-state machine. 56 orchestrator + 17 provider tests passing. |
+| 4 | Sandbox provisioning (the box exists) | ✅ shipped | Sprites SDK behind opaque `SandboxHandle`. 7-state machine. Reset (destroy+create), Pause (kill exec sessions → Sprites idles), Destroy distinct. 64 orchestrator + 23 provider tests. [slice4.md](slice/slice4.md) is now frozen — corrections live below. |
 | 5a | WebSocket transport — control + events | ⬜ not started | Plan.md §10 rewritten with multi-WS architecture, disconnect handling, sticky routing. |
 | 5b | Reconciliation + clone | ⬜ not started | `EnsureRepoCloned` / `RemoveRepo` directives; clone reconciliation on `ClientHello`. |
 | 6 | Tasks + Agent SDK invocation | ⬜ not started | |
@@ -27,15 +27,23 @@ Sibling docs: [agent_context.md](agent_context.md) (quick-start) · [engineering
 
 ## Active slice — none
 
-Slice 3 signed off **2026-05-01**. [slice3.md](slice/slice3.md) is frozen. Corrections / followups live in this file from now on.
+Slice 4 signed off **2026-05-02**. [slice4.md](slice/slice4.md) is frozen. Corrections / followups live in this file from now on.
 
-Next: slice 4 (sandbox provider — Sprites, per-user, multi-repo). **Brief must be authored before any code** ([AGENTS.md §3.2](../AGENTS.md), [CLAUDE.md](../CLAUDE.md)).
+Next: slice 5a (web↔orchestrator WS for control + events). **Brief must be authored before any code** ([AGENTS.md §3.2](../AGENTS.md), [CLAUDE.md](../CLAUDE.md)). The Sandbox Agent → User Agent split (slice 6 / 6b) is documented in Plan.md §14; that's downstream of 5a.
+
+### Slice-4 corrections (post-freeze)
+
+*None yet — record any here as discovered.*
 
 ### Slice-3 corrections (post-freeze)
 
 - **CORS allowlist must include PATCH (and PUT)** — initial slice 3 ship missed this; the new `PATCH /api/repos/{id}/introspection` failed CORS preflight on the web client. Fixed in [../apps/orchestrator/src/orchestrator/app.py](../apps/orchestrator/src/orchestrator/app.py) `allow_methods` list. Lesson: when adding a new HTTP verb to any route, check `app.add_middleware(CORSMiddleware, ...)` first.
 
-### Open followups (not blockers; flag at slice-4 kickoff)
+### Open followups (not blockers; flag at slice-5a kickoff)
+
+- **Slice 4 → 6 carry-over (Plan.md §19 #30)**: `SpritesProvider.pause` currently kills *all* exec sessions. From slice 6 onward, narrow the kill set to skip sessions tagged as agent runs so clicking Pause mid-task doesn't murder an in-flight agent. The session tagging mechanism lands when slice 6 introduces `AgentRun` and we mint per-run exec sessions.
+- **Slice 4 → 5a carry-over**: `Sandbox.public_url` is surfaced now; slice 5a's UI hooks (the "open preview" affordance, status pill animations during transient states) can build on top without further backend work.
+- **Open question carried into slice 5a**: confirm Sprites' billing model — specifically whether `warm` is non-trivially billed vs essentially free until `running`. Affects whether Pause's "kills sessions and waits for idle" is enough cost-control or whether we need a more aggressive path.
 
 - **v1.1 introspection followups**: framework detection (React/Vue/Django/Flask), monorepo workspace splits, periodic re-introspection refresh, "force-clear detected → null" toggle (current `IntrospectionOverrides` design can't actively suppress a non-null detected value), Trees-API truncation handling for repos >100k entries / >7MB.
 - **Dev Mongo has a stale `github_repo_id_1` unique index** from the pre-fix schema — drop it once with `docker exec octo-mongo mongosh octo_canvas --eval 'db.repos.dropIndex("github_repo_id_1")'` so cross-user repo connects work. Test DB rebuilds indexes per run (see conftest), so tests are unaffected.
@@ -51,6 +59,15 @@ Next: slice 4 (sandbox provider — Sprites, per-user, multi-repo). **Brief must
 ---
 
 ## Recent changes (newest first)
+
+### 2026-05-02 (slice 4 — manual Pause endpoint shipped)
+
+- Added `POST /api/sandboxes/{id}/pause` and a Pause button to the dashboard. Sprites' SDK has no force-pause verb, so the implementation kills any active exec sessions via `POST /v1/sprites/{name}/exec/{session_id}/kill` (raw HTTP through the SDK's authenticated `_client` — `kill_session` isn't in rc37 SDK methods). Sprites' idle timer transitions the sprite to `cold` within seconds. Idempotent on `cold`.
+- **Provider Protocol** widened: `async pause(handle) -> SandboxState` ([interface.py](../python_packages/sandbox_provider/src/sandbox_provider/interface.py)). `MockSandboxProvider.pause` flips state to `cold` synchronously for deterministic tests; `SpritesProvider.pause` lists sessions and POSTs the kill endpoint per-session, swallowing 404s, then returns whatever Sprites currently reports.
+- **`SandboxManager.pause()`** added with state-machine entry `_PAUSE_FROM = (cold, warm, running)`. Pause on `cold` is a no-op (idempotent); pause from `provisioning`/`resetting`/`destroyed`/`failed` raises `IllegalSandboxTransitionError` → 409.
+- **Web** ([SandboxPanel.tsx](../apps/web/src/components/SandboxPanel.tsx)): new Pause button visible on `warm`/`running`, with title "Release compute now; storage preserved". Updated cold-state copy to lead with the cost angle: *"Paused — no compute cost while cold. Filesystem preserved."* Warm/running shows: *"Click Pause to release compute now (or wait — Sprites auto-pauses after idle)."*
+- **Plan.md updates**: §13 lifecycle gained a "Manual pause (slice 4)" subsection with the implementation note about raw HTTP kill; §13 Provider Protocol code block adds the `pause` method; §9 API table adds the `/pause` endpoint; §18 slice-4 entry mentions pause + acceptance; §19 risks adds #30 — "Pause kills *all* exec sessions in slice 4; from slice 6+ narrow to skip agent-run sessions or Pause will murder in-flight agents."
+- **Tests**: 4 new orchestrator tests (`test_pause_transitions_to_cold`, `test_pause_idempotent_on_cold`, `test_pause_409_from_destroyed`, `test_pause_404_for_other_users_sandbox`) + 4 new provider tests (no-sessions just refreshes, kills each session via kill endpoint with auth header propagated, 404-on-kill swallowed, not-found raises). State-machine matrix gained pause's illegal cells. Total: 64 orchestrator tests + 23 provider tests passing. `pnpm typecheck && lint && test && build` all green.
 
 ### 2026-05-02 (Plan.md — User Agent design landed)
 
@@ -72,7 +89,7 @@ Implementation will land in slice 6 (passthrough first) → slice 6b (User Agent
 - **Plan.md rewritten** to match the post-rc43 architecture (slice 4's mid-slice rewrite generalized to the whole plan):
   - **§8 sandbox doc**: dropped `sprite_id`/`region`/`bridge_version`/`hibernated_at`; added `provider_name`/`provider_handle`/`public_url`/`reset_count`. Status enum is the actual 7 we ship (`provisioning|cold|warm|running|resetting|destroyed|failed`).
   - **§10 transport**: rewritten end-to-end. Web↔orchestrator WS is the only custom protocol; orchestrator↔sandbox is the Sprites SDK. Deleted the bridge-WS-client design (ClientHello / EnsureRepoCloned / bridge token / sticky-by-bridge routing). Channels table now references Sprites endpoints (Exec, Filesystem, fs/watch, Proxy, per-sandbox URL). Added §10.5 PTY brokerage (orchestrator opens Sprites Exec WSS, pipes bytes; reattach via Sprites' `Attach to Exec Session` for scrollback). §10.6 reliability covers Sprites-leg disconnects (session-loss, network, cold-on-exec). §10.7 horizontal scale: stateless orchestrator + Redis pub/sub `task:{id}` for cross-instance event fan-out (no bridge to route).
-  - **§13 lifecycle**: state machine maps to Sprites' `cold|warm|running` directly; auto-hibernation is delegated to Sprites; Reset uses checkpoints (slice 5b). Sprite name `vibe-sbx-{sandbox_id}` reused across resets.
+  - **§13 lifecycle**: state machine maps to Sprites' `cold|warm|running` directly; auto-hibernation is delegated to Sprites; Reset uses checkpoints (slice 5b). Sprite name `octo-sbx-{sandbox_id}` reused across resets.
   - **§14 agent runtime**: no daemon. Agent invoked per-run via `provider.exec_oneshot([..., "agent_runner", task_json], ...)`; orchestrator parses JSON-lines from stdout. Persistent FS holds warm caches across runs.
   - **§15 git workflow**: swapped `EnsureRepoCloned`/`RemoveRepo` directive language for "slice 5b clone op / remove op".
   - **§17 env vars**: removed `GITHUB_APP_*`, replaced `SPRITES_API_KEY` with `SPRITES_TOKEN`/`SANDBOX_PROVIDER`/`SPRITES_BASE_URL`. `ANTHROPIC_API_KEY` is now passed to the agent-runner via Sprites Exec env, not the bridge process.
