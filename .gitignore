@@ -16,5 +16,6 @@ __pycache__/
 packages/api-types/generated/schema.d.ts
 apps/web/src/routeTree.gen.ts
 apps/web/.tanstack/
+graphify-out/cache/
 
 .DS_Store
