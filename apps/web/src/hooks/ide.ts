@@ -12,7 +12,7 @@ import {
   FsConflictError,
 } from '../lib/fs';
 import { openFsWatch } from '../lib/fsWatch';
-import { gitStatus, type GitStatusResponse } from '../lib/git';
+import { gitStatus, SpriteBusyError, type GitStatusResponse } from '../lib/git';
 import { openPty, type PtyHandle } from '../lib/pty';
 
 // ── usePanelLayout ─────────────────────────────────────────────────────
@@ -105,6 +105,14 @@ export function useGitStatus(
       refetchOnReconnect: false,
       staleTime: 1000,
       enabled: Boolean(sandboxId) && rp.length > 0,
+      // Don't retry-storm on `SpriteBusyError` (orchestrator returned
+      // 503 because the sprite is mid-pyenv-compile or similar). The
+      // next bumpKey invalidation will refetch when things settle.
+      // Other errors (real 5xx, network) get the default 3 retries.
+      retry: (failureCount: number, err: unknown) => {
+        if (err instanceof SpriteBusyError) return false;
+        return failureCount < 3;
+      },
     })),
   });
 

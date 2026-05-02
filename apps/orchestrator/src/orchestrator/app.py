@@ -63,6 +63,35 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         await fanout.start()
     app.state.task_fanout = fanout
 
+    # Slice 7: clear any stale `activity` / `activity_started_at` /
+    # `last_reconcile_error` left over from a prior process that died
+    # mid-reconcile (uvicorn reload, OOM, deploy). The end-of-pass
+    # cleanup didn't get to run, so the dashboard would otherwise show
+    # a stuck banner with hours of fake elapsed time. Touches only live
+    # sandboxes (no point on `destroyed`/`failed`).
+    try:
+        cleared = await mongo.sandboxes.update_many(
+            {
+                "status": {"$in": ["cold", "warm", "running"]},
+                "activity": {"$ne": None},
+            },
+            {
+                "$set": {
+                    "activity": None,
+                    "activity_detail": None,
+                    "activity_started_at": None,
+                    "last_reconcile_error": None,
+                }
+            },
+        )
+        if cleared.modified_count:
+            logger.info(
+                "orchestrator.cleared_stale_activity",
+                count=cleared.modified_count,
+            )
+    except Exception as exc:
+        logger.warning("orchestrator.clear_stale_activity_failed", error=str(exc))
+
     logger.info("orchestrator.startup_complete")
 
     try:

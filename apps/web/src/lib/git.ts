@@ -35,6 +35,19 @@ export type GitShowResponse = {
   truncated: boolean;
 };
 
+/**
+ * Sentinel raised when the orchestrator returns 503 — sprite is busy
+ * (typically mid-`pyenv install` or other CPU-bound exec). Callers
+ * should treat this as "skip this poll, try again next tick" rather
+ * than rendering an error.
+ */
+export class SpriteBusyError extends Error {
+  constructor(endpoint: string) {
+    super(`${endpoint}: sprite busy`);
+    this.name = 'SpriteBusyError';
+  }
+}
+
 export async function gitStatus(
   sandboxId: string,
   repoPath: string,
@@ -43,6 +56,7 @@ export async function gitStatus(
   const r = await fetch(`${baseUrl}/api/sandboxes/${sandboxId}/git/status?${qs}`, {
     credentials: 'include',
   });
+  if (r.status === 503) throw new SpriteBusyError('gitStatus');
   if (!r.ok) throw new Error(`gitStatus ${r.status}`);
   return (await r.json()) as GitStatusResponse;
 }
@@ -61,6 +75,7 @@ export async function gitShow(
   const r = await fetch(`${baseUrl}/api/sandboxes/${sandboxId}/git/show?${qs}`, {
     credentials: 'include',
   });
+  if (r.status === 503) throw new SpriteBusyError('gitShow');
   if (!r.ok) throw new Error(`gitShow ${r.status}`);
   return (await r.json()) as GitShowResponse;
 }

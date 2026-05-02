@@ -9,6 +9,8 @@ This is read-only on purpose. Push/PR/commit live in slice 9.
 
 from __future__ import annotations
 
+import asyncio
+
 from beanie import PydanticObjectId
 from db.models import Sandbox, User
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -120,6 +122,26 @@ async def git_status(
     except SpritesError as exc:
         logger.warning("git.status_failed", error=str(exc))
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except (TimeoutError, asyncio.TimeoutError) as exc:
+        # Sprites Exec under load (e.g. mid `pyenv install`) regularly
+        # times out the per-call wall clock. Surface as 503 so the FE
+        # treats it as "try again next poll" rather than rendering a
+        # red error.
+        logger.info("git.status_busy", repo_path=canonical, error=str(exc))
+        raise HTTPException(status_code=503, detail="sprite_busy") from exc
+    except Exception as exc:  # noqa: BLE001
+        # Sprites SDK rc37 has a bug at `sprites/exec.py:182` where the
+        # timeout path raises `TimeoutError(<kwargs>)` and crashes the
+        # constructor with `TypeError: TimeoutError() takes no keyword
+        # arguments`. Catch the lot and return 503 so the IDE poll
+        # doesn't 500-spam.
+        logger.warning(
+            "git.status_unexpected_error",
+            repo_path=canonical,
+            error_type=type(exc).__name__,
+            error=str(exc)[:200],
+        )
+        raise HTTPException(status_code=503, detail="sprite_busy") from exc
     # Always log the raw command + outcome so the user can see exactly
     # what `git status` thought of their tree. Helps diagnose "I edited a
     # file and it doesn't show up" — the FE only sees the parsed result.
@@ -268,6 +290,18 @@ async def git_show(
     except SpritesError as exc:
         logger.warning("git.show_failed", error=str(exc))
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except (TimeoutError, asyncio.TimeoutError) as exc:
+        logger.info("git.show_busy", repo_path=canonical_repo, error=str(exc))
+        raise HTTPException(status_code=503, detail="sprite_busy") from exc
+    except Exception as exc:  # noqa: BLE001
+        # Same SDK-bug guard as `git_status` — see comment there.
+        logger.warning(
+            "git.show_unexpected_error",
+            repo_path=canonical_repo,
+            error_type=type(exc).__name__,
+            error=str(exc)[:200],
+        )
+        raise HTTPException(status_code=503, detail="sprite_busy") from exc
     if result.exit_code != 0:
         # Path doesn't exist at this ref — return exists=False so the FE
         # renders an empty-vs-current diff (i.e. the file was added).

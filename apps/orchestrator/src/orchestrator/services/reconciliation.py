@@ -279,7 +279,10 @@ _RUNTIME_INSTALL_CMDS: dict[str, list[str]] = {
     # `bash -lc` so /etc/profile.d/octo-runtimes.sh is sourced and
     # `nvm`/`pyenv`/`rbenv`/`rustup` + the go-current symlink are on
     # PATH.
-    "node": ["bash", "-lc", "nvm install {version}"],
+    # `nvm install` already activates the version it just installed
+    # for the *current* shell, but we also set it as the default so a
+    # fresh terminal lands on it without needing `nvm use {version}`.
+    "node": ["bash", "-lc", "nvm install {version} && nvm alias default {version}"],
     # NB: pyenv/rbenv were `git clone --depth 1 --branch <pin>` so the
     # working tree sits on a detached HEAD at the tag — `git pull` is a
     # no-op (no tracking branch). When `installing_runtimes` asks for a
@@ -290,22 +293,35 @@ _RUNTIME_INSTALL_CMDS: dict[str, list[str]] = {
     "python": [
         "bash",
         "-lc",
-        'pyenv install -s {version} || ('
+        # On success: set this version as the pyenv global so the
+        # `python3` shim resolves to it for any interactive shell that
+        # doesn't have a `.python-version` (otherwise the shim hangs
+        # trying to forward to "system" through Sprites' injected
+        # `/.sprite/bin/python3`). `pyenv global` writes
+        # `$PYENV_ROOT/version`; PYENV_ROOT is root-owned post-bridge-
+        # setup, so we sudo-write the file directly.
+        '(pyenv install -s {version} || ('
         "echo 'pyenv install failed — updating pyenv and retrying' "
         '&& sudo -n git -C "$PYENV_ROOT" fetch --depth 1 origin master '
         '&& sudo -n git -C "$PYENV_ROOT" checkout --quiet FETCH_HEAD '
         '&& pyenv install -s {version}'
-        ')',
+        ')) '
+        '&& sudo -n tee "$PYENV_ROOT/version" >/dev/null <<<"{version}" '
+        '&& pyenv rehash',
     ],
     "ruby": [
         "bash",
         "-lc",
-        'rbenv install -s {version} || ('
+        # Same `pyenv global` rationale — set this as rbenv's default
+        # so `ruby` resolves outside of an `.ruby-version` repo.
+        '(rbenv install -s {version} || ('
         "echo 'rbenv install failed — updating ruby-build and retrying' "
         '&& sudo -n git -C "$RBENV_ROOT/plugins/ruby-build" fetch --depth 1 origin master '
         '&& sudo -n git -C "$RBENV_ROOT/plugins/ruby-build" checkout --quiet FETCH_HEAD '
         '&& rbenv install -s {version}'
-        ')',
+        ')) '
+        '&& sudo -n tee "$RBENV_ROOT/version" >/dev/null <<<"{version}" '
+        '&& rbenv rehash',
     ],
     # Java via Adoptium Temurin: introspection emits versions like
     # `17`, `17.0.13`, or `21.0.1`; we install the matching major
