@@ -79,6 +79,24 @@ class Sandbox(Document):
     # bridge-setup phase is a no-op. `None` until first install. When it
     # mismatches (e.g. CLI version bump), the phase re-runs.
     bridge_setup_fingerprint: str | None = None
+    # Slice 8 Phase 0b: combined sha256 of the bridge wheel bundle
+    # (bridge + workspace deps) currently installed in `/opt/bridge/.venv`
+    # on the sprite. The reconciler builds the bundle on the orchestrator,
+    # uploads via `fs_write`, and installs via `uv pip install`. When the
+    # locally built bundle's combined_sha matches this, the wheel-install
+    # step is a no-op — covers the "no source change since last reconcile"
+    # path (most reconcile passes). `None` until first install.
+    bridge_wheel_sha: str | None = None
+    # Slice 8: bridge daemon liveness. `bridge_version` is what the
+    # bridge reports in its WSS `Hello` (matches the wheel installed in
+    # /opt/bridge/.venv); `bridge_connected_at` is the timestamp of the
+    # most recent accepted handshake; `bridge_last_acked_seq_per_chat`
+    # mirrors the bridge's ring-buffer ack cursor per chat (used for
+    # replay on reconnect — orchestrator says "I have up to seq X for
+    # this chat", bridge resends X+1 onward).
+    bridge_version: str | None = None
+    bridge_connected_at: datetime | None = None
+    bridge_last_acked_seq_per_chat: dict[str, int] = Field(default_factory=dict)
     # Populated when status="failed". Sanitized — never contains tokens.
     failure_reason: str | None = None
     created_at: datetime = Field(default_factory=_now)

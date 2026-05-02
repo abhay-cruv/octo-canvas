@@ -28,7 +28,17 @@ from pymongo.errors import PyMongoError
 
 from db.collections import ALL as ALL_COLLECTIONS
 from db.collections import Collections
-from db.models import AgentEvent, Repo, Sandbox, Session, Task, User
+from db.models import (
+    AgentEvent,
+    Chat,
+    ChatTurn,
+    Repo,
+    Sandbox,
+    Session,
+    Task,
+    User,
+    UserAgentMemory,
+)
 
 __all__ = ["ALL_COLLECTIONS", "Collections", "Mongo", "connect", "disconnect", "mongo"]
 
@@ -40,7 +50,17 @@ _logger = structlog.get_logger("db")
 _DEFAULT_DB_NAME = "octo_canvas"
 
 # Every Beanie Document must appear here or it silently fails to query.
-_DOCUMENT_MODELS: list[type] = [User, Session, Repo, Sandbox, Task, AgentEvent]
+_DOCUMENT_MODELS: list[type] = [
+    User,
+    Session,
+    Repo,
+    Sandbox,
+    Task,
+    AgentEvent,
+    Chat,
+    ChatTurn,
+    UserAgentMemory,
+]
 
 
 def _database_name(uri: str) -> str:
@@ -104,6 +124,18 @@ class Mongo:
     @property
     def seq_counters(self) -> "AsyncCollection[dict[str, object]]":
         return self.db[Collections.SEQ_COUNTERS]
+
+    @property
+    def chats(self) -> "AsyncCollection[dict[str, object]]":
+        return self.db[Collections.CHATS]
+
+    @property
+    def chat_turns(self) -> "AsyncCollection[dict[str, object]]":
+        return self.db[Collections.CHAT_TURNS]
+
+    @property
+    def user_agent_memory(self) -> "AsyncCollection[dict[str, object]]":
+        return self.db[Collections.USER_AGENT_MEMORY]
 
     def collection(self, name: str) -> "AsyncCollection[dict[str, object]]":
         """Escape hatch for migrations / one-off scripts that need to touch a

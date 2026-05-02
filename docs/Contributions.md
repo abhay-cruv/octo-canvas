@@ -40,6 +40,88 @@ For *what changed structurally*, read [progress.md](progress.md). For *who and w
 
 ## Log
 
+### 2026-05-02 — Claude Opus 4.7 (1M) via Claude Code (slice 8 — brief rewrite + Phase 0 sandbox runtime)
+
+Slice 8 brief rewritten with the dual-agent design (dev agent in sandbox + user agent on BE; user sees one merged transcript) and several scope changes from the original 2026-04 brief. Phases 0a + 0b shipped — the rest of slice 8 is staged work.
+
+Brief changes ([slice8.md](slice/slice8.md)):
+
+- Dual-agent unified UX: dev agent (Claude Code in sandbox) + user agent (Haiku 4.5 on orchestrator). Provider-agnostic — `LLMProvider` Protocol at `python_packages/agent_config/src/agent_config/llm_provider.py`; v1 ships `AnthropicProvider` only, OpenAI / Gemini land later as additional impls + a settings flip.
+- User agent toggleable per user (`User.user_agent_enabled`). When ON: enhances every user message (memory-driven), sees ONLY important dev-agent events (clarifications + result + final assistant text + errors — not thinking, deltas, tool-calls); auto-answers clarifications behind a 10s override countdown. When OFF: direct passthrough.
+- Memory in Mongo (`user_agent_memory` collection), MEMORY.md-shape (index doc + per-topic docs); in-process `memory_list/read/write/delete` (no MCP — same Python process).
+- Chats run at `cwd=/work/` always. Dropped: `Chat.scope`, per-chat git worktrees, `octo/chat-<slug>` branches. Branching + PR creation deferred to slice 9. Concurrent chats on the same repo allowed but unprotected (foot-gun acknowledged).
+- Renamed `ClaudeAgentClient → ClaudeSDKClient` (verified against installed `claude-agent-sdk 0.1.72`).
+
+Phase 0a — sandbox bridge runtime base ([reconciliation.py](../apps/orchestrator/src/orchestrator/services/reconciliation.py)):
+
+- `_BRIDGE_SETUP_REST` extended: install `uv` system-wide (`UV_INSTALL_DIR=/usr/local/bin`), create `/opt/bridge/.venv` with uv-managed Python 3.12 (`--python-preference only-managed`, isolated from pyenv → `pyenv global 3.13` cannot break the bridge). Managed Python persisted at `/usr/local/uv-python/` so it survives Reset.
+- `/opt/bridge/` chowned to sprite user → `fs_write` + `uv pip install` work without sudo.
+- `BRIDGE_SETUP_FINGERPRINT` bumped: `nvm=v0.40.3;pyenv=v2.5.5;rbenv=v1.3.2;claude=2.1.118;venv-py=3.12` — existing sprites pick up the new venv on next reconcile pass.
+
+Phase 0b — bridge wheel build + upload + install:
+
+- New [services/bridge_wheel.py](../apps/orchestrator/src/orchestrator/services/bridge_wheel.py): builds bridge + 4 transitive workspace deps (`shared_models`, `agent_config`, `repo_introspection`, `github_integration`) via `uv build --all-packages --wheel`, source-fingerprint cache (sha256 over the bundled package trees, excludes `__pycache__`/`.venv`/`dist`/`build`). Returns `BridgeWheelBundle(wheels, combined_sha, bridge_wheel_filename)`.
+- New `Reconciler._install_bridge_wheel(sandbox)` runs after `_bridge_setup_rest` succeeds: builds bundle → uploads each wheel via `provider.fs_write` to `/opt/bridge/wheels/` → runs `uv pip install --python /opt/bridge/.venv/bin/python --find-links /opt/bridge/wheels --reinstall-package <each workspace pkg> /opt/bridge/wheels/bridge-*.whl`. PyPI deps (claude-agent-sdk, websockets, httpx, ...) cached normally; only workspace wheels are force-reinstalled (their version strings don't bump per code change).
+- `Sandbox.bridge_wheel_sha: str | None` added — combined sha gates re-install. Most reconcile passes are no-ops once installed.
+- 5 new unit tests at [test_bridge_wheel.py](../apps/orchestrator/tests/test_bridge_wheel.py): wheel set is exactly the 5 we expect (no orchestrator/db/sandbox_provider leakage), combined sha is stable across rebuilds with identical source, source-fingerprint cache returns the same `Bundle` instance, per-wheel sha matches content.
+
+Test counts at end of session: orchestrator **180** (+5 new wheel tests, was 175), bridge **6**, all green. Pyright clean on changed files.
+
+Phase 1 — Anthropic reverse proxy ([routes/anthropic_proxy.py](../apps/orchestrator/src/orchestrator/routes/anthropic_proxy.py)):
+
+- Route `/api/_internal/anthropic-proxy/{sandbox_id}/{path:path}` accepts every method, registered unconditionally (production-required, NOT gated by `allow_internal_endpoints`).
+- Auth: extract `Authorization: Bearer <token>` → sha256 + `hmac.compare_digest` against `Sandbox.bridge_token_hash`. Single 401 shape on every failure (missing/wrong/badly-formatted token, missing/garbage sandbox_id, destroyed sandbox) — no probe channel.
+- Real-key swap: strip `Authorization` from inbound, set `x-api-key: <real>` from `request.app.state.bridge_config._anthropic_api_key`. 503 when real key missing or shared httpx client missing.
+- Async streaming end-to-end: `request.stream()` inbound → `client.build_request(content=request.stream())` → `client.send(req, stream=True)` → `aiter_raw()` + `StreamingResponse` + `BackgroundTask(upstream.aclose)`. `Cache-Control: no-cache` + `X-Accel-Buffering: no` injected so any nginx in front doesn't buffer SSE.
+- Header filtering both directions: drop hop-by-hop (`connection`, `keep-alive`, `proxy-authenticate`, `proxy-authorization`, `te`, `trailers`, `transfer-encoding`, `upgrade`, `host`, `content-length`) + `authorization` + `x-api-key` outbound. Forward `anthropic-version`, `anthropic-beta`, `content-type`, etc.
+- Error mapping: upstream 5xx + `httpx.RequestError` → 502 with empty body (never echoes upstream errors that might mention key prefixes); auth → 401; key/client missing → 503.
+- Cancellation: bridge disconnect → handler cancelled → `relay()` finally + `BackgroundTask` both call `upstream.aclose()` → upstream HTTP/2 RST → Anthropic stops billing.
+- App lifespan: shared `httpx.AsyncClient(http2=True, timeout=Timeout(connect=10, read=600, write=60, pool=10))` started in `app.lifespan`, awaited closed on shutdown ([app.py](../apps/orchestrator/src/orchestrator/app.py)).
+- 14 unit tests at [test_anthropic_proxy.py](../apps/orchestrator/tests/test_anthropic_proxy.py): auth single-shape (5 paths — missing/wrong/bad-format token, garbage/wrong sandbox_id), key swap correctness (Authorization stripped, x-api-key matches sentinel `sk-ant-real-secret-do-not-leak`, 503 when key missing), key-leak audit (sentinel never appears in response headers), streaming body integrity + anti-buffer headers (httpx ASGITransport buffers internally so inter-chunk timing isn't observable at the test layer; documented in the test), cancellation propagation via `spy.aclose_called` event on the fake-Anthropic ASGI app, hop-by-hop sentinel-value drop, AST-based static-import audit (no `requests`/`urllib` imports, no `time.sleep` calls — docstring matches don't false-positive).
+
+Test counts at end of session: orchestrator **194** (+14 proxy + 5 wheel = +19 from the 175 baseline), bridge **6**, all green. Pyright clean.
+
+Phase 2 — wire protocol + Beanie model additions (additive; slice-5a plumbing untouched):
+
+- New [wire_protocol/bridge.py](../python_packages/shared_models/src/shared_models/wire_protocol/bridge.py): `BridgeToOrchestrator` and `OrchestratorToBridge` discriminated unions covering Hello/Goodbye/Pong/ChatStarted/ChatEvicted/StatusChange/AssistantMessageDelta/AssistantMessage/ThinkingBlock/ToolCallStarted/ToolCallFinished/FileEditEvent/ShellExecEvent/TokenUsageEvent/AskUserClarification/ResultMessage/ErrorEvent (bridge→orch) and Ping/Ack/ChatState/UserMessage/AnswerClarification/CancelChat/PauseChat/SessionEnv (orch→bridge). All `extra="ignore"` for forward-compat. Re-exported with `Bridge*`-prefixed aliases through `shared_models.wire_protocol.__init__` to avoid colliding with slice-5a names (`Pong`, `Ping`, `ErrorEvent`, `AssistantMessage`, `FileEditEvent`).
+- New Beanie models: [chat.py](../python_packages/db/src/db/models/chat.py) (Chat doc — `cwd=/work/` always, no repo binding, no branch in slice 8 — branching defers to slice 9; statuses `pending|running|awaiting_input|completed|failed|cancelled|archived`), [chat_turn.py](../python_packages/db/src/db/models/chat_turn.py) (one round-trip per user message; records both `prompt` and `enhanced_prompt`), [user_agent_memory.py](../python_packages/db/src/db/models/user_agent_memory.py) (per-user MEMORY.md-shape store, unique index on `(user_id, name)`).
+- [user.py](../python_packages/db/src/db/models/user.py) widened: `claude_auth_mode: ClaudeAuthMode = "platform_api_key"`, `user_agent_enabled: bool = True`, `user_agent_provider: UserAgentProvider = "anthropic"`, `user_agent_model: str = "claude-haiku-4-5"`. New `Literal` type aliases for both enums.
+- [sandbox.py](../python_packages/db/src/db/models/sandbox.py) widened: `bridge_version`, `bridge_connected_at`, `bridge_last_acked_seq_per_chat: dict[str, int]` (mirrors the bridge's ring-buffer ack cursor per chat, for replay on reconnect).
+- [agent_event.py](../python_packages/db/src/db/models/agent_event.py) widened additively — `task_id` and `chat_id` BOTH optional, plus `claude_session_id`. Sparse indexes (`task_id_seq_unique_sparse`, `chat_session_seq_unique_sparse`) so slice-5a task-keyed events and slice-8 chat-keyed events coexist on the same collection without violating uniqueness on `None` values.
+- `Collections` constants + `mongo.chats`/`mongo.chat_turns`/`mongo.user_agent_memory` accessors registered.
+
+Phase 3 — bridge WSS handler + cross-instance ownership:
+
+- New [ws/bridge.py](../apps/orchestrator/src/orchestrator/ws/bridge.py): `/ws/bridge/{sandbox_id}` accepts the bridge's outgoing connection. Bearer auth (sha256 + `hmac.compare_digest` against `Sandbox.bridge_token_hash`), close 4001 on missing/bad/destroyed; 4009 if another instance owns the bridge. After handshake: claim ownership → spawn TaskGroup of four loops (`read_inbound`, `pump_outbound`, `heartbeat`, `ack_pump`). Inbound frames go through `BridgeToOrchestratorAdapter` validation; event-class frames persist via `event_store.append_chat_event` with the chat's session id. `Hello` triggers `ChatState` reconciliation messages — orchestrator tells the bridge "I have up to seq X for chat Y", bridge resends X+1 onward from its ring buffer.
+- New [services/bridge_owner.py](../apps/orchestrator/src/orchestrator/services/bridge_owner.py): `BridgeOwner` per-instance singleton. Redis `bridge_owner:{sandbox_id}` lock with 60s TTL refreshed every 20s, `bridge_in:*` pubsub for cross-instance command routing. `BridgeOwner.send(sandbox_id, frame)` checks local ownership first → falls through to `redis.publish` if owned elsewhere. Tolerates Redis-absent (single-instance dev path).
+- App lifespan wires `app.state.bridge_owner` and graceful stop on shutdown.
+
+Phase 4 — event store widening:
+
+- [event_store.py](../apps/orchestrator/src/orchestrator/services/event_store.py) gains `append_chat_event`, `ack_bridge_chat`, `replay_chat`, `chat_channel_for`, `chat_user_agent_channel_for`, `is_important_for_user_agent`. Per-chat seq keyed `f"{chat_id}:{session_id or '_global'}"` so post-`--resume` events get a distinct seq space from pre-`ChatStarted` events. Dual fan-out: every event goes to `chat:{chat_id}` (FE), and IF the chat's user has user-agent enabled AND the payload type is "important" (clarification / result / final assistant / error — NOT thinking / deltas / tool-calls), also to `chat:{chat_id}:ua` for the in-process user-agent service.
+
+Phase 5 — LLMProvider + user agent:
+
+- New [agent_config/llm_provider.py](../python_packages/agent_config/src/agent_config/llm_provider.py): `LLMProvider` Protocol with `complete()` + `stream()`. Provider-agnostic so OpenAI / Gemini land later as additional impls + a `User.user_agent_provider` flip — no schema migration.
+- New [services/user_agent/providers/anthropic.py](../apps/orchestrator/src/orchestrator/services/user_agent/providers/anthropic.py): v1 impl using `anthropic.AsyncAnthropic`. Holds the real Anthropic key directly (the user agent runs on the orchestrator — the key never leaves this process; the bridge's calls go through the §4 reverse proxy).
+- New [services/user_agent/memory.py](../apps/orchestrator/src/orchestrator/services/user_agent/memory.py): `list_memory`, `read_memory`, `write_memory` (upsert), `delete_memory` over the `user_agent_memory` collection. In-process Mongo helpers — no MCP server needed since the user agent shares the orchestrator's Python process.
+- New [services/user_agent/enhance.py](../apps/orchestrator/src/orchestrator/services/user_agent/enhance.py): `enhance_prompt(user_id, raw, *, provider, model)` asks Haiku whether to inject memory context. Strong default to passthrough — only enhances when the model commits to a specific topic. Materializes topic bodies into the enhanced prompt deterministically rather than trusting the LLM to copy-paste.
+- New [services/user_agent/clarification.py](../apps/orchestrator/src/orchestrator/services/user_agent/clarification.py): `resolve_clarification(user_id, *, question, context, provider, model)` returns `auto_answer` or `defer`. JSON-mode response, defensive parsing, defaults to `defer` on any error.
+- New [services/user_agent/filter.py](../apps/orchestrator/src/orchestrator/services/user_agent/filter.py): re-exports the routing rule from `event_store` so the filter lives semantically inside the user-agent package.
+- `httpx[http2]>=0.27` and `anthropic>=0.39` added to orchestrator deps. Fixed an `h2` import error from `pnpm dev` — the slice-8 §4 proxy uses HTTP/2 to api.anthropic.com.
+
+Phase 6 — chat service + routes:
+
+- New [services/chat_runner.py](../apps/orchestrator/src/orchestrator/services/chat_runner.py): `create_chat`, `add_follow_up`, `cancel_chat`. Each path runs user-agent enhancement when enabled, persists `Chat` + `ChatTurn`, sends `UserMessage` (or `CancelChat`) to the bridge via `BridgeOwner.send`. Raises `ChatRunnerError` with stable codes (`no_sandbox`, `sandbox_not_ready`, `bridge_unavailable`, `not_owner`, `chat_closed`) that the routes translate to HTTP statuses.
+- New [routes/chats.py](../apps/orchestrator/src/orchestrator/routes/chats.py): `POST /api/chats`, `GET /api/chats`, `GET /api/chats/{id}`, `POST /api/chats/{id}/messages`, `POST /api/chats/{id}/cancel`, `POST /api/chats/{id}/clarifications/{cid}/answer`. The clarification-answer route doubles as the override path for an in-flight agent auto-answer (slice 8 §calls #15).
+
+Test counts unchanged at session end: orchestrator **194** + bridge **6** = **200** passing; pyright clean across all changed files. No new tests added in phases 2–6 — the existing 200 stayed green proving the additive widening didn't regress slice-5a plumbing. Dedicated tests for the chat-keyed event store, bridge WSS handshake, BridgeOwner pubsub routing, LLMProvider/AnthropicProvider, user-agent memory + enhance + clarification, and `/api/chats` happy paths land alongside the bridge process work in the next session (Phase 7), where the runtime can actually round-trip.
+
+Pending in slice 8:
+
+- **Phase 7** — bridge process internals: `apps/bridge/src/bridge/{ws_client,chat_mux,ringbuf}.py` + `mcp/octo_server.py`. `ws_client` dials `/ws/bridge/{sandbox_id}` with `Authorization: Bearer ${BRIDGE_TOKEN}`, owns the per-chat ring buffer (1000 frames or 1 MB), reconnects with `Hello{last_acked_seq_per_chat}`. `chat_mux` orchestrates `ClaudeSDKClient` per chat with `cwd=/work/`, `permission_mode="acceptEdits"`, hooks for Bash/Write/Edit jail, MCP server registering `ask_user_clarification`. Stream SDK messages → wire frames. Capture `claude_session_id` from `ResultMessage`.
+- **Phase 8** — FE: `apps/web/src/routes/_authed/sandbox/index.tsx` chat panel rewire, `ChatTranscript` (streaming `AssistantMessage` + collapsible `ThinkingBlock`, `ToolCall` cards with args+result, `FileEditEvent` inline diff, `TokenUsageEvent` footer chip), `ClarificationCard` (manual reply form OR auto-answered-with-10s-override), `lib/chats.ts` typed mutations, settings toggle for `user_agent_enabled`.
+
 ### 2026-05-02 — Claude Opus 4.7 (1M) via Claude Code (slice 7 — sign-off)
 
 User signed off on slice 7. [slice7.md](slice/slice7.md) frozen with a header note pointing future corrections to progress.md. Status flipped to ✅ shipped on the slice table; full implementation summary + post-freeze followups added to [progress.md](progress.md) under "Slice-7 implementation summary" / "Slice-7 followups (post-freeze)".

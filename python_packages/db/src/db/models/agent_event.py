@@ -22,7 +22,17 @@ def _now() -> datetime:
 
 
 class AgentEvent(Document):
-    task_id: PydanticObjectId
+    # Slice 5a — task-keyed events for `/ws/web/tasks/{task_id}`
+    # injection plumbing. Coexists with slice 8's chat-keyed flow so
+    # the slice-5a tests keep working until the FE migrates.
+    task_id: PydanticObjectId | None = None
+    # Slice 8 — chat-keyed events for `/ws/web/chats/{chat_id}`. Bridge
+    # frames + user-agent decisions persist with this key.
+    chat_id: PydanticObjectId | None = None
+    # Slice 8 — `claude-agent-sdk` session id (assigned on first
+    # `ResultMessage`). Null on slice-5a rows and on dev events that
+    # aren't session-scoped.
+    claude_session_id: str | None = None
     seq: int
     payload: dict[str, Any]
     created_at: datetime = Field(default_factory=_now)
@@ -30,6 +40,36 @@ class AgentEvent(Document):
     class Settings:
         name = Collections.AGENT_EVENTS
         indexes: ClassVar[list[IndexModel]] = [
-            IndexModel([("task_id", ASCENDING), ("seq", ASCENDING)], unique=True),
-            IndexModel([("task_id", ASCENDING), ("created_at", ASCENDING)]),
+            # Sparse on task_id so chat-keyed rows don't violate the
+            # uniqueness on (task_id=None, seq).
+            IndexModel(
+                [("task_id", ASCENDING), ("seq", ASCENDING)],
+                unique=True,
+                sparse=True,
+                name="task_id_seq_unique_sparse",
+            ),
+            IndexModel(
+                [("task_id", ASCENDING), ("created_at", ASCENDING)],
+                sparse=True,
+                name="task_id_created_at_sparse",
+            ),
+            # Slice 8 — chat-keyed replay. Sparse so task-keyed rows
+            # don't index here. Compound on `claude_session_id` so
+            # `--resume`-spawned sessions get distinct seq spaces from
+            # cold-spawned ones (matches `seq_counters` keying).
+            IndexModel(
+                [
+                    ("chat_id", ASCENDING),
+                    ("claude_session_id", ASCENDING),
+                    ("seq", ASCENDING),
+                ],
+                unique=True,
+                sparse=True,
+                name="chat_session_seq_unique_sparse",
+            ),
+            IndexModel(
+                [("chat_id", ASCENDING), ("created_at", ASCENDING)],
+                sparse=True,
+                name="chat_id_created_at_sparse",
+            ),
         ]

@@ -32,7 +32,14 @@ class Collections:
     AGENT_EVENTS: Final = "agent_events"
     # Slice 5a: per-task atomic seq allocator. Raw collection (no Beanie) —
     # `findOneAndUpdate {$inc: {next: 1}}` upsert is the only access pattern.
+    # Slice 8 widens this: keying flips from `_id=task_id` to
+    # `_id="{chat_id}:{claude_session_id or '_global'}"` — same collection,
+    # different document shape.
     SEQ_COUNTERS: Final = "seq_counters"
+    # Slice 8: dual-agent runtime.
+    CHATS: Final = "chats"
+    CHAT_TURNS: Final = "chat_turns"
+    USER_AGENT_MEMORY: Final = "user_agent_memory"
 
 
 # Names of every collection currently materialized in Mongo. Iterate this in
@@ -45,4 +52,7 @@ ALL: Final[tuple[str, ...]] = (
     Collections.TASKS,
     Collections.AGENT_EVENTS,
     Collections.SEQ_COUNTERS,
+    Collections.CHATS,
+    Collections.CHAT_TURNS,
+    Collections.USER_AGENT_MEMORY,
 )

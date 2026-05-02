@@ -36,6 +36,11 @@ if TYPE_CHECKING:
     from orchestrator.services.sandbox_manager import BridgeRuntimeConfig
     from sandbox_provider import SandboxProvider
 
+from orchestrator.services.bridge_wheel import (
+    BridgeWheelBundle,
+    build_bridge_wheel_bundle,
+)
+
 _logger = structlog.get_logger("reconciliation")
 
 WORK_ROOT = "/work"
@@ -91,6 +96,17 @@ _CARGO_HOME = "/usr/local/cargo"
 # `/usr/local/go-versions/<version>` and symlink the highest-installed
 # at `/usr/local/go-current` for the activation script's PATH.
 _GO_INSTALL_ROOT = "/usr/local/go-versions"
+# Slice 8: the bridge process runs in an isolated Python venv at
+# `/opt/bridge/.venv` driven by uv-managed Python (NOT pyenv). pyenv is
+# user territory — `pyenv global` flips must not break the bridge. uv
+# downloads its own python-build-standalone interpreter under
+# `UV_PYTHON_INSTALL_DIR=/usr/local/uv-python` so the venv survives Reset
+# (which wipes `/work`, not `/opt` or `/usr/local`). Bumping
+# `_BRIDGE_VENV_PYTHON` rotates `BRIDGE_SETUP_FINGERPRINT` and forces the
+# venv to be recreated on the next reconcile.
+_BRIDGE_VENV_PYTHON = "3.12"
+_BRIDGE_VENV_DIR = "/opt/bridge/.venv"
+_UV_PYTHON_INSTALL_DIR = "/usr/local/uv-python"
 
 
 def _read_cli_pin() -> str:
@@ -109,7 +125,8 @@ def _read_cli_pin() -> str:
 
 _CLAUDE_CLI_PIN = _read_cli_pin()
 BRIDGE_SETUP_FINGERPRINT = (
-    f"nvm={_NVM_PIN};pyenv={_PYENV_PIN};rbenv={_RBENV_PIN};claude={_CLAUDE_CLI_PIN}"
+    f"nvm={_NVM_PIN};pyenv={_PYENV_PIN};rbenv={_RBENV_PIN};"
+    f"claude={_CLAUDE_CLI_PIN};venv-py={_BRIDGE_VENV_PYTHON}"
 )
 BRIDGE_SETUP_TIMEOUT_S = 600
 
@@ -250,12 +267,42 @@ log "claude CLI @ {_CLAUDE_CLI_PIN}"
 NPM_BIN=$(command -v npm)
 sudo -n "$NPM_BIN" install -g @anthropic-ai/claude-code@{_CLAUDE_CLI_PIN}
 
+log "uv (system-wide install for bridge venv)"
+# uv at /usr/local/bin/uv — on every shell's PATH, no profile.d edit
+# needed. INSTALLER_NO_MODIFY_PATH=1 stops the installer from touching
+# user shell rc files; UV_INSTALL_DIR places the binary system-wide.
+if ! command -v uv >/dev/null 2>&1; then
+    curl -LsSf https://astral.sh/uv/install.sh \\
+        | sudo -n env UV_INSTALL_DIR=/usr/local/bin INSTALLER_NO_MODIFY_PATH=1 sh
+fi
+
+log "/opt/bridge skeleton + isolated Python {_BRIDGE_VENV_PYTHON} venv"
+# /opt/bridge survives Reset (which wipes /work). Owned by the sprite
+# user so `fs_write` (slice 6) and the bridge process itself can write
+# to /opt/bridge/wheels and /opt/bridge/.venv without sudo.
+SPRITE_USER=$(id -un)
+sudo -n install -d -m 0755 -o "$SPRITE_USER" -g "$SPRITE_USER" \\
+    /opt/bridge /opt/bridge/wheels {_UV_PYTHON_INSTALL_DIR}
+# `--python-preference only-managed` forces uv to use its own
+# python-build-standalone build, NOT pyenv's or system Python — so
+# `pyenv global 3.13` (user territory) cannot break the bridge.
+# UV_PYTHON_INSTALL_DIR pins the managed Python to /usr/local so it
+# survives /work resets and is shared across venv recreations.
+if [ ! -x {_BRIDGE_VENV_DIR}/bin/python ]; then
+    UV_PYTHON_INSTALL_DIR={_UV_PYTHON_INSTALL_DIR} \\
+        uv venv {_BRIDGE_VENV_DIR} \\
+            --python {_BRIDGE_VENV_PYTHON} \\
+            --python-preference only-managed
+fi
+
 log "verify"
 bash -lc 'claude --version'
 bash -lc 'nvm --version'
 bash -lc 'pyenv --version'
 bash -lc 'rbenv --version'
 bash -lc 'rustup --version'
+uv --version
+{_BRIDGE_VENV_DIR}/bin/python --version
 
 log "done"
 """
@@ -733,6 +780,17 @@ class Reconciler:
             await _set_activity(sandbox, "installing_bridge", _CLAUDE_CLI_PIN)
             await bridge_rest_task
 
+        # 2b. Bridge wheel install (slice 8 phase 0b). Builds the wheel
+        # bundle locally + uploads + uv pip installs into
+        # /opt/bridge/.venv. Idempotent on Sandbox.bridge_wheel_sha —
+        # most reconcile passes are no-ops. Only runs when bridge setup
+        # has completed (the venv must exist).
+        if (
+            self._bridge_config is not None
+            and sandbox.bridge_setup_fingerprint == BRIDGE_SETUP_FINGERPRINT
+        ):
+            await self._install_bridge_wheel(sandbox)
+
         # 2c. Language-runtime install (slice 7). Deduped union across
         # repos; each (manager, version) installed once. Best-effort —
         # failures set `Repo.runtime_install_error` for the affected
@@ -936,6 +994,121 @@ class Reconciler:
             "reconcile.bridge_setup_done",
             sandbox_id=str(sandbox.id),
             fingerprint=BRIDGE_SETUP_FINGERPRINT,
+        )
+
+    async def _install_bridge_wheel(self, sandbox: Sandbox) -> None:
+        """Slice 8 Phase 0b: build the bridge wheel bundle locally,
+        upload it to `/opt/bridge/wheels/`, and `uv pip install` it
+        into `/opt/bridge/.venv`. Idempotent on `Sandbox.bridge_wheel_sha`
+        — when the locally built bundle's combined sha matches what's
+        already installed, this is a fast no-op.
+
+        Best-effort: failures set `last_reconcile_error` but don't
+        derail the rest of the pass; next pass retries. The bridge
+        process itself isn't launched here — that's a later phase.
+        """
+        try:
+            bundle = await asyncio.to_thread(build_bridge_wheel_bundle)
+        except Exception as exc:  # noqa: BLE001 — surface any build error
+            _logger.warning(
+                "reconcile.bridge_wheel_build_failed",
+                sandbox_id=str(sandbox.id),
+                error=str(exc)[:200],
+            )
+            await _set_reconcile_error(
+                sandbox, f"bridge wheel build: {str(exc)[:200]}"
+            )
+            return
+        if sandbox.bridge_wheel_sha == bundle.combined_sha:
+            return
+        await _set_activity(
+            sandbox, "installing_bridge_wheel", bundle.combined_sha[:12]
+        )
+        handle = _handle_of(sandbox)
+        # 1. Upload all wheels under /opt/bridge/wheels/.
+        for wheel in bundle.wheels:
+            try:
+                await self._provider.fs_write(
+                    handle,
+                    f"/opt/bridge/wheels/{wheel.filename}",
+                    wheel.content,
+                    mkdir=True,
+                )
+            except SpritesError as exc:
+                _logger.warning(
+                    "reconcile.bridge_wheel_upload_failed",
+                    sandbox_id=str(sandbox.id),
+                    filename=wheel.filename,
+                    error=str(exc)[:200],
+                )
+                await _set_reconcile_error(
+                    sandbox, f"bridge wheel upload: {str(exc)[:200]}"
+                )
+                return
+        # 2. Install. `--reinstall-package` for each workspace package
+        # forces reinstall on those (their version strings don't bump
+        # per code change), while leaving PyPI deps (claude-agent-sdk,
+        # websockets, ...) cached when their pins haven't changed.
+        # `--find-links` surfaces the workspace wheels we just uploaded;
+        # PyPI deps still resolve from PyPI.
+        workspace_pkgs = [
+            "bridge",
+            "shared-models",
+            "agent-config",
+            "repo-introspection",
+            "github-integration",
+        ]
+        reinstall_flags = " ".join(
+            f"--reinstall-package {p}" for p in workspace_pkgs
+        )
+        cmd = (
+            f"/usr/local/bin/uv pip install "
+            f"--python /opt/bridge/.venv/bin/python "
+            f"--find-links /opt/bridge/wheels "
+            f"{reinstall_flags} "
+            f"/opt/bridge/wheels/{bundle.bridge_wheel_filename}"
+        )
+        try:
+            res = await self._provider.exec_oneshot(
+                handle,
+                ["bash", "-lc", cmd],
+                env={},
+                cwd="/",
+                timeout_s=BRIDGE_SETUP_TIMEOUT_S,
+            )
+        except SpritesError as exc:
+            _logger.warning(
+                "reconcile.bridge_wheel_install_error",
+                sandbox_id=str(sandbox.id),
+                error=str(exc)[:200],
+            )
+            await _set_reconcile_error(
+                sandbox, f"bridge wheel install: {str(exc)[:200]}"
+            )
+            return
+        if res.exit_code != 0:
+            _logger.warning(
+                "reconcile.bridge_wheel_install_failed",
+                sandbox_id=str(sandbox.id),
+                exit_code=res.exit_code,
+                stderr=res.stderr[-1000:],
+            )
+            await _set_reconcile_error(
+                sandbox,
+                f"bridge wheel install exit {res.exit_code}: "
+                f"{res.stderr.strip()[-200:]}",
+            )
+            return
+        sandbox.bridge_wheel_sha = bundle.combined_sha
+        if sandbox.id is not None:
+            await Sandbox.find_one(Sandbox.id == sandbox.id).update(  # pyright: ignore[reportGeneralTypeIssues]
+                {"$set": {"bridge_wheel_sha": bundle.combined_sha}}
+            )
+        _logger.info(
+            "reconcile.bridge_wheel_installed",
+            sandbox_id=str(sandbox.id),
+            combined_sha=bundle.combined_sha[:12],
+            wheel_count=len(bundle.wheels),
         )
 
     async def _ensure_git_setup(self, sandbox: Sandbox, user: User) -> None:
