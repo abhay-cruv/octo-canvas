@@ -101,22 +101,26 @@ async def test_published_payload_round_trips_through_adapter(client: "httpx.Asyn
     through `OrchestratorToWebAdapter.validate_json`."""
     _ = client
     task_id = await _make_task()
-    pubsub = redis_client.pubsub()
-    await pubsub.subscribe(f"task:{task_id}")
+    pubsub = redis_client.pubsub()  # pyright: ignore[reportUnknownMemberType]
+    await pubsub.subscribe(f"task:{task_id}")  # pyright: ignore[reportUnknownMemberType]
     # drain the subscribe ack
     await asyncio.sleep(0.05)
 
     await append_event(task_id, DebugEvent(seq=0, message="hi"), redis=redis_client)
 
-    async def next_message():  # type: ignore[no-untyped-def]
+    async def next_message() -> dict[str, object]:
         for _ in range(50):
-            msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=0.1)
-            if msg and msg.get("type") == "message":
-                return msg
+            msg = await pubsub.get_message(  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+                ignore_subscribe_messages=True, timeout=0.1
+            )
+            if msg and msg.get("type") == "message":  # pyright: ignore[reportUnknownMemberType]
+                return msg  # pyright: ignore[reportUnknownVariableType, reportReturnType]
         raise AssertionError("no published message arrived")
 
     msg = await next_message()
-    payload = OrchestratorToWebAdapter.validate_json(msg["data"])
+    raw = msg["data"]
+    assert isinstance(raw, (str, bytes))
+    payload = OrchestratorToWebAdapter.validate_json(raw)
     assert isinstance(payload, DebugEvent)
     assert payload.message == "hi"
     assert payload.seq == 1

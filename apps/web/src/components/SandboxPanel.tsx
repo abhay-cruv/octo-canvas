@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { sandboxesQueryOptions } from '../lib/queries';
 import {
@@ -17,27 +17,67 @@ const TRANSIENT: ReadonlyArray<SandboxResponse['status']> = [
   'resetting',
 ];
 
+// Reconciler-emitted activity values → friendly UI strings. Anything
+// unknown falls back to the raw activity name (forward-compatible with
+// new phases the backend introduces).
+const ACTIVITY_LABELS: Record<string, string> = {
+  configuring_git: 'Setting up git…',
+  installing_packages: 'Installing system packages…',
+  cloning: 'Cloning repository…',
+  checkpointing: 'Snapshotting clean state…',
+  pausing: 'Releasing compute (waiting for idle)…',
+};
+
 type DialogKind = 'reset' | 'destroy' | null;
 
 export function SandboxPanel() {
   const queryClient = useQueryClient();
+  // Burst-poll window: timestamp until which we poll fast regardless of
+  // current state. Bumped on every mutation (Wake, Pause, Reset, etc.)
+  // so the FE catches the next ~10s of state/activity transitions and
+  // then stops polling once everything settles. Without this, polling
+  // would either continue forever (annoying when nothing's happening)
+  // or stop too early to catch activity flipping from null →
+  // "configuring_git" a couple seconds after Wake.
+  const burstUntilRef = useRef<number>(0);
   const sandboxes = useQuery({
     ...sandboxesQueryOptions,
     refetchInterval: (query) => {
       const data = query.state.data;
       if (!data) return false;
       const active = pickActive(data);
-      return active && TRANSIENT.includes(active.status) ? 2000 : false;
+      if (!active) return false;
+      // Fast poll while something is in flight OR we're inside the
+      // post-mutation burst window.
+      if (TRANSIENT.includes(active.status) || active.activity) return 2000;
+      if (Date.now() < burstUntilRef.current) return 2000;
+      // Stable state — no polling. The next user action will reopen
+      // the burst window via `kickBurst`.
+      return false;
     },
   });
 
   const active = pickActive(sandboxes.data);
 
-  const onSuccess = () =>
-    queryClient.invalidateQueries({ queryKey: ['sandboxes'] });
+  const kickBurst = (ms = 10_000) => {
+    burstUntilRef.current = Date.now() + ms;
+  };
+  // Every sandbox-state mutation can mutate Repo rows server-side too
+  // (provision binds orphans, wake retries failed, reset flips ready→
+  // pending, destroy unbinds). Invalidate BOTH so the dashboard repo
+  // cards refetch the new clone_status, not just the sandbox pill.
+  const invalidateAll = () =>
+    Promise.all([
+      queryClient.invalidateQueries({ queryKey: ['sandboxes'] }),
+      queryClient.invalidateQueries({ queryKey: ['repos', 'connected'] }),
+    ]);
+  const onSuccess = () => {
+    kickBurst();
+    return invalidateAll();
+  };
   const onError = (err: unknown) => {
     if (err instanceof SandboxStateError) {
-      void queryClient.invalidateQueries({ queryKey: ['sandboxes'] });
+      void invalidateAll();
     }
   };
 
@@ -90,6 +130,17 @@ export function SandboxPanel() {
         pill={<StatusPill status={active.status} />}
       />
       <div className="text-sm text-gray-600 space-y-1">
+        {active.activity ? (
+          <div className="text-xs px-2 py-1 rounded-md bg-amber-50 border border-amber-200 text-amber-900 inline-flex items-center gap-1.5">
+            <span className="inline-block w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse" />
+            <span className="font-medium">
+              {ACTIVITY_LABELS[active.activity] ?? active.activity}
+            </span>
+            {active.activity_detail ? (
+              <span className="font-mono">— {active.activity_detail}</span>
+            ) : null}
+          </div>
+        ) : null}
         <div>{labels.subtitle}</div>
         {active.status === 'cold' ? (
           <div className="text-xs text-gray-500">

@@ -35,5 +35,10 @@ class SandboxResponse(BaseModel):
     destroyed_at: datetime | None
     last_reset_at: datetime | None
     reset_count: int
+    # Slice 5b: progress banner alongside cold/warm/running. Examples:
+    # "configuring_git", "cloning", "installing_packages",
+    # "checkpointing", "pausing". `None` when idle.
+    activity: str | None = None
+    activity_detail: str | None = None
     failure_reason: str | None
     created_at: datetime

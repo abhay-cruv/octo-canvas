@@ -16,7 +16,7 @@ Sibling docs: [agent_context.md](agent_context.md) (quick-start) · [engineering
 | 3 | Repo introspection | ✅ shipped | GitHub Trees + Contents detection, no clone. Five fields incl. `dev_command`. Per-field user overrides via `PATCH /api/repos/{id}/introspection`. [slice3.md](slice/slice3.md) is now frozen — corrections live below. |
 | 4 | Sandbox provisioning (the box exists) | ✅ shipped | Sprites SDK behind opaque `SandboxHandle`. 7-state machine. Reset (destroy+create), Pause (kill exec sessions → Sprites idles), Destroy distinct. 64 orchestrator + 23 provider tests. [slice4.md](slice/slice4.md) is now frozen — corrections live below. |
 | 5a | WebSocket transport — control + events | ✅ shipped | `/ws/web/tasks/{task_id}` Pydantic discriminated unions, `seq`-replay from Mongo via atomic `findOneAndUpdate $inc` upsert on `seq_counters`, 30/90s heartbeat, jittered backoff reconnect on the FE, Redis pub/sub fan-out across instances via `TaskFanout`. Dev-only `/api/_internal/tasks*`. Wire-protocol TS bindings via JSON-Schema → `json-schema-to-typescript` → `packages/api-types/generated/wire.d.ts`. 82 orchestrator + 23 provider tests. [slice5a.md](slice/slice5a.md) is now frozen — corrections live below. |
-| 5b | Reconciliation + clone | ⬜ not started | `EnsureRepoCloned` / `RemoveRepo` directives; clone reconciliation on `ClientHello`. |
+| 5b | Cloning + reconciliation + Reset = wipe `/work` | ✅ shipped | Provider Protocol widened with `exec_oneshot`, `fs_list`, `fs_delete`, `snapshot`, `restore`. Reconciliation service with per-sandbox `asyncio.Lock` triggers on connect/disconnect/provision/wake/reset; clones serialized as `sh -c "mkdir -p … && git clone …"` (single WebSocket per repo); `apt-get update && install` deduped across repos with `sudo -n`. **Git is set up once at fixed paths** (`/etc/octo-canvas/gitconfig` + `…/git-credentials`) and every git command exports `GIT_CONFIG_GLOBAL` to read them — credentials don't depend on `$HOME`. Reset = `rm -rf /work && mkdir -p /work` via exec, sprite preserved, repos re-cloned by the kicked reconcile (failed sandboxes fall back to destroy+create). `exec_oneshot` retries WebSocket-handshake timeouts up to 6 times (1+2+4+8+16+32s backoff). Reconciler has a top-level safety net + 15-min wall-clock timeout — repos can never get stuck at `pending` forever. Introspection deepening folded in: `RepoIntrospection.runtimes` + `system_packages` + matching `IntrospectionOverrides`. UI repo card surfaces both new fields with editable overrides; sandbox panel shows reconciler activity (configuring_git/installing_packages/cloning/checkpointing/pausing). 92 orchestrator + 31 provider + 66 introspection tests passing. [slice5b.md](slice/slice5b.md) is now frozen — corrections live below. |
 | 6 | Tasks + Agent SDK invocation | ⬜ not started | |
 | 7 | Git ops + PR creation | ⬜ not started | |
 | 8 | Interactive coding surface — PTY + file ops | ⬜ not started | New slice. PTY WS per terminal (binary, on-demand); file ops via REST. |
@@ -27,9 +27,31 @@ Sibling docs: [agent_context.md](agent_context.md) (quick-start) · [engineering
 
 ## Active slice — none
 
-Slice 5a signed off **2026-05-02**. [slice5a.md](slice/slice5a.md) is frozen. Corrections / followups live in this file from now on.
+Slice 5b signed off **2026-05-02**. [slice5b.md](slice/slice5b.md) is frozen. Corrections / followups live in this file from now on.
 
-Next: slice 5b (clone + reconciliation + checkpoint-based reset). **Brief must be authored before any code** ([AGENTS.md §3.2](../AGENTS.md), [CLAUDE.md](../CLAUDE.md)).
+Next: slice 6 (Tasks + Sandbox-Agent invocation, passthrough). **Brief must be authored before any code** ([AGENTS.md §3.2](../AGENTS.md), [CLAUDE.md](../CLAUDE.md)).
+
+### Slice-5b corrections (post-freeze)
+
+- **`SpritesProvider.snapshot` now retries on transient errors** (503, 502, 504, timeout, connection). Up to 3 attempts with 2s + 4s backoff. Sprites' `/checkpoint` endpoint occasionally returns 503; without retries, `Sandbox.clean_checkpoint_id` would silently stay null and any future code path that wants to use the checkpoint (e.g., a "Quick reset" button) would degrade. Implemented in [`python_packages/sandbox_provider/src/sandbox_provider/sprites.py`](../python_packages/sandbox_provider/src/sandbox_provider/sprites.py) — definitive errors (auth, 4xx, NotFound) still raise immediately.
+
+### Slice-5b open followups (not blockers; flag at slice-6 kickoff)
+
+- **Reset semantics changed mid-slice.** The brief said "Reset uses `restore_checkpoint('clean')`"; in practice that path was indistinguishable from a no-op (repos preserved, status flipped pending→ready in milliseconds, user couldn't tell anything had happened). Reset now wipes `/work` via `rm -rf /work && mkdir -p /work` and lets reconcile re-clone — visible `pending → cloning → ready`, sprite identity preserved, ~30s. The fast checkpoint path is still in `provider.snapshot/restore` for slice-6+ use, just not wired into Reset. If we ever bring it back as a "Quick reset" button, that's a small UI addition.
+- **Sprites Exec WebSocket-handshake flakes.** First exec after Wake (and after `/work` wipe) sometimes hits `WebSocket error: TimeoutError: timed out during opening handshake` — Sprites' Exec runtime isn't ready the instant the sprite reports `warm`. Mitigated by `exec_oneshot` retrying up to 6 times with 1+2+4+8+16+32s backoff (63s total). If retries still exhaust, real stderr is surfaced in `Repo.clone_error`. Underlying issue is on Sprites' side; revisit if production users keep hitting it.
+- **Passwordless sudo required for apt.** `apt-get update/install` calls use `sudo -n`; if the sprite image isn't configured with passwordless sudo, the install step fails fast with a useful stderr. Document the sprite-image expectation when we lock the production image.
+- **Runtime install deferred to slice 6.** Detected `runtimes` are recorded but not installed — slice 6 / agent runtime owns version pinning via `nvm`/`pyenv`/etc. Detected runtimes show on the dashboard so the user knows what slice 6 will use.
+- **No periodic background reconciliation timer.** Reconciler is event-driven only (provision / wake / reset / connect / disconnect). If drift becomes a real problem in prod, add a periodic scan; otherwise leave it.
+- **Concurrent clones are serialized per sandbox** for simpler error handling. v1.1 followup if cloning N repos becomes the bottleneck.
+- **Beanie `find().update()` is unreliable** — every bulk repo update in the orchestrator now uses raw `mongo.repos.update_many` after observing silent no-ops on chained Beanie updates. Don't reach for the chained form again; the raw collection helper is the right tool.
+
+### Slice-3 corrections (post-freeze) — slice 5b additive widening
+
+`RepoIntrospection` and `IntrospectionOverrides` gained two new fields, additive (defaults preserve existing rows):
+
+- `runtimes: list[Runtime]` where `Runtime = {name: Literal["node","python","go","ruby","rust","java"], version: str | None, source: str}`. Detected from `package.json#engines.node`, `.nvmrc`, `pyproject.toml#requires-python`, `.python-version`, `runtime.txt`, `go.mod`, `.ruby-version`, `Gemfile`, `rust-toolchain[.toml]`, `Cargo.toml#package.rust-version`, `pom.xml#java.version`, `build.gradle*`. Multiple runtimes per repo supported (monorepos).
+- `system_packages: list[str]` — Ubuntu apt package names. Detected from `Dockerfile` `apt-get install` lines (multi-line continuation handled), `apt.txt`, and known native-module mappings on `package.json` (`sharp`→`libvips-dev`, `canvas`→cairo/pango/jpeg/gif, `puppeteer`/`playwright`→`chromium`, etc.) + `requirements.txt` (`psycopg2`→`libpq-dev`, `lxml`→`libxml2-dev libxslt1-dev`, `pyodbc`→`unixodbc-dev`, etc.).
+- The reconciler runs `apt-get install -y <system_packages>` once per pass (deduped across repos) before clones; failure is logged, not blocking. Runtime *installation* is deferred to slice 6 (nvm/pyenv).
 
 ### Slice-5a corrections (post-freeze)
 

@@ -17,6 +17,9 @@ broaden until each slice needs it.
 """
 
 from sandbox_provider.interface import (
+    CheckpointId,
+    ExecResult,
+    FsEntry,
     ProviderName,
     ProviderStatus,
     SandboxHandle,
@@ -28,6 +31,9 @@ from sandbox_provider.mock import MockSandboxProvider
 from sandbox_provider.sprites import SpritesProvider
 
 __all__ = [
+    "CheckpointId",
+    "ExecResult",
+    "FsEntry",
     "MockSandboxProvider",
     "ProviderName",
     "ProviderStatus",

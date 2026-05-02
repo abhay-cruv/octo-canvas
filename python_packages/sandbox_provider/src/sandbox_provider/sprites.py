@@ -20,19 +20,28 @@ status enum, and the per-sprite URL.
 """
 
 import asyncio
+import time
+from collections.abc import Mapping
+from typing import Any
 
+import httpx
 import structlog
 from sprites import (
     AuthenticationError as SDKAuthenticationError,
 )
 from sprites import (
+    ExecError,
     NotFoundError,
     Sprite,
     SpriteError,
     SpritesClient,
 )
+from sprites.exec import run as _sprites_run
 
 from sandbox_provider.interface import (
+    CheckpointId,
+    ExecResult,
+    FsEntry,
     ProviderName,
     ProviderStatus,
     SandboxHandle,
@@ -197,6 +206,275 @@ class SpritesProvider:
             raise SpritesError(_sanitize(exc), retriable=_is_retriable(exc)) from exc
         return _to_state(sprite)
 
+    # ── Slice 5b additions ────────────────────────────────────────────────
+
+    async def exec_oneshot(
+        self,
+        handle: SandboxHandle,
+        argv: list[str],
+        *,
+        env: Mapping[str, str],
+        cwd: str,
+        timeout_s: int = 300,
+    ) -> ExecResult:
+        sprite_name = _require_name(handle)
+
+        def _run() -> ExecResult:
+            sprite = self._client.sprite(sprite_name)
+            start = time.monotonic()
+            # `sprites.run(...)` is the subprocess-style helper. It sets
+            # `_capture_stdout = _capture_stderr = True` so we get the
+            # actual command output back. The lower-level `cmd.run()`
+            # we used previously does NOT capture by default — that's
+            # why every failure showed up as "exit status 1" with empty
+            # stderr. Set `check=False` so non-zero exits don't raise;
+            # we read the exit code off `CompletedProcess`.
+            try:
+                proc = _sprites_run(
+                    sprite,
+                    *argv,
+                    capture_output=True,
+                    check=False,
+                    timeout=float(timeout_s),
+                    env=dict(env),
+                    cwd=cwd,
+                )
+            except ExecError as exc:
+                # `check=False` should prevent ExecError from rising,
+                # but the SDK still raises on transport-level failures
+                # that present as ExecError variants. Capture whatever
+                # output the SDK already buffered on the exception.
+                duration = time.monotonic() - start
+                return ExecResult(
+                    exit_code=exc.exit_code(),
+                    stdout=_to_text(getattr(exc, "stdout", b"")),
+                    stderr=_to_text(getattr(exc, "stderr", b"")),
+                    duration_s=duration,
+                )
+            except SpriteError as exc:
+                raise SpritesError(_sanitize(exc), retriable=_is_retriable(exc)) from exc
+            duration = time.monotonic() - start
+            return ExecResult(
+                exit_code=int(proc.returncode),
+                stdout=_to_text(proc.stdout),
+                stderr=_to_text(proc.stderr),
+                duration_s=duration,
+            )
+
+        # Retry up to 6 times on websocket-handshake timeouts. Sprites'
+        # Exec endpoint isn't always Exec-ready the instant the sprite
+        # status flips to `warm` — the WS handshake can time out for
+        # tens of seconds, especially on the first exec after wake or
+        # right after a /work wipe. Backoff: 1+2+4+8+16+32 = 63s of
+        # total backoff, plenty for Sprites' runtime to come up.
+        backoff_s = 1.0
+        last: ExecResult | None = None
+        for attempt in range(6):
+            try:
+                last = await asyncio.to_thread(_run)
+            except NotFoundError as exc:
+                raise SpritesError(f"sprite {sprite_name!r} not found", retriable=False) from exc
+            err_blob = (last.stderr + last.stdout).lower()
+            if last.exit_code != 0 and (
+                "timed out during opening handshake" in err_blob
+                or "websocket error: timeouterror" in err_blob
+            ):
+                _logger.warning(
+                    "sprites.exec.retry",
+                    sprite=sprite_name,
+                    attempt=attempt + 1,
+                    stderr_tail=last.stderr[-200:],
+                )
+                await asyncio.sleep(backoff_s)
+                backoff_s *= 2
+                continue
+            return last
+        # Exhausted retries — return the last result so the caller can
+        # surface the actual stderr (the websocket-handshake message)
+        # to the user instead of swallowing it as a generic failure.
+        assert last is not None
+        return last
+
+    async def fs_list(self, handle: SandboxHandle, path: str) -> list[FsEntry]:
+        """List directory contents via raw HTTP — rc37 SDK doesn't expose
+        `list_files` as a Python method, so we hit `/v1/sprites/{name}/fs/list`
+        through the SDK's authenticated client (same pattern as `pause`)."""
+        sprite_name = _require_name(handle)
+
+        def _list() -> list[FsEntry]:
+            try:
+                resp = self._client._client.get(  # type: ignore[reportPrivateUsage]
+                    f"{self._client.base_url}/v1/sprites/{sprite_name}/fs/list",
+                    params={"path": path, "workingDir": "/"},
+                    headers=self._client._headers(),  # type: ignore[reportPrivateUsage]
+                    timeout=15.0,
+                )
+            except httpx.RequestError as exc:
+                # ReadTimeout, ConnectError, etc. — wrap as retriable
+                # so the reconciler logs a clean SpritesError instead
+                # of an uncaught httpx exception that aborts the pass.
+                raise SpritesError(f"fs_list transport error: {exc}", retriable=True) from exc
+            if resp.status_code == 404:
+                raise SpritesError(f"path {path!r} not found", retriable=False)
+            if resp.status_code >= 400:
+                raise SpritesError(
+                    f"fs_list failed: {resp.status_code}", retriable=resp.status_code >= 500
+                )
+            data: dict[str, Any] = resp.json()
+            entries_raw = data.get("entries") or []
+            out: list[FsEntry] = []
+            for raw in entries_raw:
+                if not isinstance(raw, dict):
+                    continue
+                name = raw.get("name")
+                kind_raw = raw.get("type") or raw.get("kind")
+                size_raw = raw.get("size", 0)
+                if not isinstance(name, str):
+                    continue
+                kind: str = "dir" if kind_raw == "dir" or kind_raw == "directory" else "file"
+                size = int(size_raw) if isinstance(size_raw, (int, float)) else 0
+                out.append(FsEntry(name=name, kind=kind, size=size))  # type: ignore[arg-type]
+            return out
+
+        return await asyncio.to_thread(_list)
+
+    async def fs_delete(self, handle: SandboxHandle, path: str, *, recursive: bool = False) -> None:
+        sprite_name = _require_name(handle)
+
+        def _delete() -> None:
+            try:
+                resp = self._client._client.delete(  # type: ignore[reportPrivateUsage]
+                    f"{self._client.base_url}/v1/sprites/{sprite_name}/fs/delete",
+                    params={
+                        "path": path,
+                        "workingDir": "/",
+                        "recursive": str(recursive).lower(),
+                    },
+                    headers=self._client._headers(),  # type: ignore[reportPrivateUsage]
+                    timeout=30.0,
+                )
+            except httpx.RequestError as exc:
+                raise SpritesError(f"fs_delete transport error: {exc}", retriable=True) from exc
+            if resp.status_code == 404:
+                return  # idempotent
+            if resp.status_code >= 400:
+                raise SpritesError(
+                    f"fs_delete failed: {resp.status_code}", retriable=resp.status_code >= 500
+                )
+
+        await asyncio.to_thread(_delete)
+
+    async def snapshot(self, handle: SandboxHandle, *, comment: str) -> CheckpointId:
+        """Take a checkpoint via the SDK. `create_checkpoint` returns a
+        streaming `CheckpointStream` of `StreamMessage(type, data, error)`
+        records — the id may live in `record.data.id`, `record.data["id"]`,
+        or only on the final "complete" message depending on SDK version.
+        Rather than parse, we drain the stream then call
+        `list_checkpoints` and pick the newest entry whose comment matches
+        ours. That's robust against any stream-shape change."""
+        sprite_name = _require_name(handle)
+
+        def _snap() -> str:
+            sprite = self._client.sprite(sprite_name)
+            stream = sprite.create_checkpoint(comment)  # type: ignore[no-untyped-call]
+            stream_id: str | None = None
+            for record in stream:
+                # Best-effort: capture id if any message carries one. We
+                # fall back to list_checkpoints regardless.
+                data = getattr(record, "data", None)
+                if isinstance(data, dict):
+                    candidate = data.get("id") or data.get("checkpoint_id")
+                    if isinstance(candidate, str) and candidate:
+                        stream_id = candidate
+                elif data is not None:
+                    candidate = getattr(data, "id", None)
+                    if isinstance(candidate, str) and candidate:
+                        stream_id = candidate
+            if stream_id:
+                return stream_id
+            # Fall back: list checkpoints, pick the newest matching our
+            # comment. Sprites returns checkpoints with `comment` field
+            # set to whatever we passed in.
+            checkpoints = sprite.list_checkpoints()
+            matching = [c for c in checkpoints if getattr(c, "comment", "") == comment]
+            if matching:
+                # SDK returns oldest-first by default; sort by create_time.
+                matching.sort(key=lambda c: getattr(c, "create_time", None) or 0, reverse=True)
+                cid = getattr(matching[0], "id", None)
+                if isinstance(cid, str) and cid:
+                    return cid
+            # Last resort — newest checkpoint period.
+            if checkpoints:
+                cid = getattr(checkpoints[-1], "id", None)
+                if isinstance(cid, str) and cid:
+                    return cid
+            raise SpritesError("create_checkpoint returned no id", retriable=True)
+
+        # Retry up to 3 times on transient Sprites errors (503s, network
+        # blips, etc.) — checkpoints are best-effort during slice 5b
+        # but slice 6+ may use `clean_checkpoint_id` for fast resets,
+        # and a missing field there will silently disable that path.
+        # Backoff: 2s, 4s.
+        backoff_s = 2.0
+        last_err: Exception | None = None
+        for attempt in range(3):
+            try:
+                ckpt = await asyncio.to_thread(_snap)
+                if attempt > 0:
+                    _logger.info(
+                        "sprites.snapshot.retry_succeeded",
+                        sprite=sprite_name,
+                        attempt=attempt + 1,
+                    )
+                return CheckpointId(ckpt)
+            except NotFoundError as exc:
+                # Definitive — sprite is gone. No point retrying.
+                raise SpritesError(f"sprite {sprite_name!r} not found", retriable=False) from exc
+            except SpriteError as exc:
+                last_err = exc
+                msg = _sanitize(exc).lower()
+                # Only retry on shapes we know are transient. 503,
+                # 502, gateway timeouts, network errors all qualify;
+                # 4xx auth/validation errors don't.
+                transient = any(
+                    s in msg
+                    for s in ("503", "502", "504", "timeout", "connection", "service unavailable")
+                )
+                if not transient or attempt == 2:
+                    raise SpritesError(_sanitize(exc), retriable=_is_retriable(exc)) from exc
+                _logger.warning(
+                    "sprites.snapshot.retry",
+                    sprite=sprite_name,
+                    attempt=attempt + 1,
+                    error=msg[:200],
+                )
+                await asyncio.sleep(backoff_s)
+                backoff_s *= 2
+        # Unreachable — the loop either returns or raises — but make
+        # the type checker happy.
+        raise SpritesError(f"snapshot exhausted retries: {last_err}", retriable=True)
+
+    async def restore(self, handle: SandboxHandle, checkpoint_id: CheckpointId) -> SandboxState:
+        sprite_name = _require_name(handle)
+
+        def _restore() -> Sprite:
+            sprite = self._client.sprite(sprite_name)
+            stream = sprite.restore_checkpoint(str(checkpoint_id))  # type: ignore[no-untyped-call]
+            for _ in stream:  # drain progress
+                pass
+            return self._client.get_sprite(sprite_name)
+
+        try:
+            sprite = await asyncio.to_thread(_restore)
+        except NotFoundError as exc:
+            raise SpritesError(
+                f"checkpoint {checkpoint_id!r} not found on sprite {sprite_name!r}",
+                retriable=False,
+            ) from exc
+        except SpriteError as exc:
+            raise SpritesError(_sanitize(exc), retriable=_is_retriable(exc)) from exc
+        return _to_state(sprite)
+
 
 def _name_for(sandbox_id: str) -> str:
     return f"octo-sbx-{sandbox_id}"
@@ -219,6 +497,20 @@ def _to_handle(sprite: Sprite) -> SandboxHandle:
     if sprite.id:
         payload["id"] = sprite.id
     return SandboxHandle(provider="sprites", payload=payload)
+
+
+def _to_text(buf: object) -> str:
+    """Coerce SDK byte-or-str output to text. The Exec result fields are
+    bytes; the older string-shaped path is kept for forward-compat with
+    SDK versions that swap to `str`."""
+    if isinstance(buf, bytes):
+        try:
+            return buf.decode("utf-8", errors="replace")
+        except Exception:
+            return repr(buf)
+    if isinstance(buf, str):
+        return buf
+    return str(buf or "")
 
 
 def _to_state(sprite: Sprite) -> SandboxState:

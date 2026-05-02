@@ -10,6 +10,8 @@ from shared_models.introspection import (
     IntrospectionOverrides,
     PackageManager,
     RepoIntrospection,
+    Runtime,
+    RuntimeName,
 )
 from shared_models.sandbox import ProviderName, SandboxResponse, SandboxStatus
 from shared_models.user import UserResponse
@@ -23,6 +25,8 @@ __all__ = [
     "PackageManager",
     "ProviderName",
     "RepoIntrospection",
+    "Runtime",
+    "RuntimeName",
     "SandboxResponse",
     "SandboxStatus",
     "UserResponse",

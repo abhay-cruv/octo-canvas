@@ -12,6 +12,7 @@ from .lib.logger import logger
 from .lib.provider_factory import build_sandbox_provider
 from .lib.redis_client import redis_client
 from .routes import auth, internal, me, repos, sandbox
+from .services.reconciliation import Reconciler
 from .services.sandbox_manager import SandboxManager
 from .ws import web as ws_web
 from .ws.task_fanout import TaskFanout
@@ -34,6 +35,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     manager = SandboxManager(provider=provider, redis=redis_handle)
     app.state.sandbox_manager = manager
     app.state.sandbox_provider = provider
+    app.state.reconciler = Reconciler(provider)
     app.state.redis_handle = redis_handle
 
     # TaskFanout (slice 5a) only spins up if Redis is connected. Without

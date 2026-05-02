@@ -36,6 +36,24 @@ class Sandbox(Document):
     destroyed_at: datetime | None = None
     last_reset_at: datetime | None = None
     reset_count: int = 0
+    # Slice 5b: id of the most recent `clean` checkpoint produced by a
+    # mutating reconciliation pass. `None` until the first successful clone
+    # finishes — Reset falls through to the slow destroy+create path while
+    # this is unset.
+    clean_checkpoint_id: str | None = None
+    # Slice 5b: SHA-256 fingerprint of the OAuth token we last wrote into
+    # the sandbox's `~/.git-credentials`. The reconciler skips git setup
+    # when this matches the user's current token; mismatch → re-run setup
+    # (covers Reconnect GitHub flows and token rotation).
+    git_configured_token_fp: str | None = None
+    # Slice 5b: human-readable banner of what the sandbox is *doing*
+    # right now beyond the basic cold/warm/running. Set by the reconciler
+    # at phase boundaries (`configuring_git`, `installing_packages`,
+    # `cloning`, `checkpointing`) and by `pause` (`pausing`); cleared
+    # when the action completes. Display the cold/warm/running pill AND
+    # the activity banner together so the user sees what's in flight.
+    activity: str | None = None
+    activity_detail: str | None = None
     # Populated when status="failed". Sanitized — never contains tokens.
     failure_reason: str | None = None
     created_at: datetime = Field(default_factory=_now)

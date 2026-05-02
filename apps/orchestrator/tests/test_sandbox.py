@@ -150,7 +150,7 @@ async def test_wake_forces_running(client: httpx.AsyncClient) -> None:
 
     sandbox = (await client.post("/api/sandboxes")).json()
     handle = SandboxHandle(provider="mock", payload={"name": f"octo-sbx-{sandbox['id']}"})
-    _mock_provider()._force_cold(handle)  # simulate Sprites idle-hibernation
+    _mock_provider()._force_cold(handle)  # pyright: ignore[reportPrivateUsage]  # simulate idle-hibernation
 
     response = await client.post(f"/api/sandboxes/{sandbox['id']}/wake")
     assert response.status_code == 200
@@ -248,7 +248,7 @@ async def test_refresh_resyncs_status(client: httpx.AsyncClient) -> None:
     assert sandbox["status"] == "warm"
 
     handle = SandboxHandle(provider="mock", payload={"name": f"octo-sbx-{sandbox['id']}"})
-    _mock_provider()._force_cold(handle)  # Sprites went idle on its own
+    _mock_provider()._force_cold(handle)  # pyright: ignore[reportPrivateUsage]  # idle
 
     response = await client.post(f"/api/sandboxes/{sandbox['id']}/refresh")
     assert response.status_code == 200
@@ -273,9 +273,12 @@ async def test_refresh_is_no_op_for_terminal_states(
 
 
 @pytest.mark.asyncio
-async def test_reset_rotates_handle_and_increments_count(
+async def test_reset_keeps_handle_and_increments_count(
     client: httpx.AsyncClient,
 ) -> None:
+    """Reset on a healthy sandbox now wipes `/work` instead of
+    destroying+recreating the sprite. The provider handle therefore
+    stays the same (same sprite!) and `reset_count` increments."""
     _, session = await _seed_user_and_session()
     client.cookies.set(SESSION_COOKIE_NAME, session.session_id)
     sandbox = (await client.post("/api/sandboxes")).json()
@@ -295,7 +298,7 @@ async def test_reset_rotates_handle_and_increments_count(
     refreshed = await Sandbox.get(PydanticObjectId(sandbox_id))
     assert refreshed is not None
     new_handle_id = refreshed.provider_handle.get("id")
-    assert new_handle_id and new_handle_id != original_handle_id
+    assert new_handle_id == original_handle_id  # same sprite preserved
 
     reset2 = (await client.post(f"/api/sandboxes/{sandbox_id}/reset")).json()
     assert reset2["reset_count"] == 2
@@ -345,13 +348,21 @@ async def test_reset_works_from_failed(
 
 
 @pytest.mark.asyncio
-async def test_reset_calls_destroy_then_create(
+async def test_reset_wipes_workdir_without_recreating_sprite(
     client: httpx.AsyncClient, mocker: MockerFixture
 ) -> None:
+    """Healthy reset wipes `/work` via `rm -rf /work && mkdir -p /work`
+    through exec_oneshot; it does NOT destroy or recreate the sprite.
+    That preserves git config, apt cache, any user-installed binaries —
+    only repo working trees are reset."""
     _, session = await _seed_user_and_session()
     client.cookies.set(SESSION_COOKIE_NAME, session.session_id)
     sandbox = (await client.post("/api/sandboxes")).json()
 
+    exec_spy = mocker.spy(
+        _manager()._provider,  # pyright: ignore[reportPrivateUsage]
+        "exec_oneshot",
+    )
     destroy_spy = mocker.spy(
         _manager()._provider,  # pyright: ignore[reportPrivateUsage]
         "destroy",
@@ -362,8 +373,16 @@ async def test_reset_calls_destroy_then_create(
     )
     response = await client.post(f"/api/sandboxes/{sandbox['id']}/reset")
     assert response.status_code == 200
-    assert destroy_spy.call_count == 1
-    assert create_spy.call_count == 1
+    # The wipe runs `sh -c "rm -rf /work && mkdir -p /work"` so look
+    # for the recognizable shell argv.
+    wipe_calls = [
+        c
+        for c in exec_spy.call_args_list
+        if len(c.args) >= 2 and c.args[1][:2] == ["sh", "-c"] and "/work" in c.args[1][2]
+    ]
+    assert len(wipe_calls) >= 1, "expected at least one /work wipe exec"
+    assert destroy_spy.call_count == 0
+    assert create_spy.call_count == 0
 
 
 # ── Destroy ────────────────────────────────────────────────────────────────

@@ -29,6 +29,10 @@ class ConnectedRepo(BaseModel):
     default_branch: str
     private: bool
     clone_status: Literal["pending", "cloning", "ready", "failed"]
+    # Slice 5b: human-readable failure reason when `clone_status="failed"`.
+    # Sanitized of tokens before persisting; values like
+    # "github_reauth_required", "branch_not_found", or a stderr-tail prefix.
+    clone_error: str | None = None
     connected_at: datetime
     # Effective values: detected merged with user overrides. Slice 4+ callers
     # (bridge, agent runs) read this — they don't care which fields were user-set.

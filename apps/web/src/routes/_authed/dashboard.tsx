@@ -23,7 +23,21 @@ const PANEL_KEY = 'octo.dashboardPanelOpen';
 
 function DashboardPage() {
   const { data: me } = useQuery(meQueryOptions);
-  const connected = useQuery(connectedReposQueryOptions);
+  const connected = useQuery({
+    ...connectedReposQueryOptions,
+    // Poll while any repo is mid-clone — the reconciler flips
+    // clone_status from pending → cloning → ready/failed in the
+    // background, and without a refetch the card never updates. Stops
+    // polling once everything settles to ready/failed.
+    refetchInterval: (query) => {
+      const data = query.state.data;
+      if (!data || !Array.isArray(data)) return false;
+      const inFlight = data.some(
+        (r) => r.clone_status === 'pending' || r.clone_status === 'cloning',
+      );
+      return inFlight ? 2000 : false;
+    },
+  });
   const navigate = useNavigate();
   const queryClient = useQueryClient();
 
@@ -376,6 +390,9 @@ function RepoRow({
           <div className="text-xs text-gray-600 mt-0.5">
             {repo.private ? 'Private' : 'Public'} ·{' '}
             <CloneStatusLabel status={repo.clone_status} />
+            {repo.clone_status === 'failed' && repo.clone_error ? (
+              <span className="ml-1 text-red-700">— {repo.clone_error}</span>
+            ) : null}
           </div>
           <IntrospectionPills
             effective={effective}
@@ -452,13 +469,62 @@ function OverrideEditor({
     }
     return initial;
   });
+  // List-typed overrides are kept as text in the form (one entry per line).
+  // Empty string → `null` override (use detected). Non-empty → `[...]` override.
+  const [sysPkgsDraft, setSysPkgsDraft] = useState<string>(() => {
+    if (overrides?.system_packages) return overrides.system_packages.join('\n');
+    return '';
+  });
+  // Runtimes draft format: one per line, `<name>` or `<name> <version>`.
+  // Examples: `node 20`, `python 3.12`, `go`. Reasonable typo behavior:
+  // unknown runtime names are dropped on save.
+  const [runtimesDraft, setRuntimesDraft] = useState<string>(() => {
+    if (overrides?.runtimes) {
+      return overrides.runtimes
+        .map((r) => (r.version ? `${r.name} ${r.version}` : r.name))
+        .join('\n');
+    }
+    return '';
+  });
+
+  const KNOWN_RUNTIMES = new Set([
+    'node',
+    'python',
+    'go',
+    'ruby',
+    'rust',
+    'java',
+  ]);
+
+  function parseRuntimes(text: string): { name: string; version: string | null; source: string }[] {
+    const out: { name: string; version: string | null; source: string }[] = [];
+    for (const raw of text.split(/\n+/)) {
+      const line = raw.trim();
+      if (!line) continue;
+      const [name, ...rest] = line.split(/\s+/);
+      if (!name || !KNOWN_RUNTIMES.has(name.toLowerCase())) continue;
+      out.push({
+        name: name.toLowerCase(),
+        version: rest.join(' ').trim() || null,
+        source: 'override',
+      });
+    }
+    return out;
+  }
 
   function buildPayload(): IntrospectionOverrides {
-    const out: Record<string, string | null> = {};
+    const out: Record<string, unknown> = {};
     for (const { key } of OVERRIDE_FIELDS) {
       const v = draft[key]?.trim() ?? '';
       out[key] = v === '' ? null : v;
     }
+    const rawPkgs = sysPkgsDraft
+      .split(/[\n,]+/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+    out.system_packages = rawPkgs.length > 0 ? rawPkgs : null;
+    const rawRuntimes = parseRuntimes(runtimesDraft);
+    out.runtimes = rawRuntimes.length > 0 ? rawRuntimes : null;
     return out as IntrospectionOverrides;
   }
 
@@ -496,6 +562,49 @@ function OverrideEditor({
           );
         })}
       </div>
+      <label className="flex flex-col gap-1">
+        <span className="text-[11px] uppercase tracking-wider text-gray-500">
+          Runtimes
+        </span>
+        <textarea
+          rows={3}
+          value={runtimesDraft}
+          onChange={(e) => setRuntimesDraft(e.target.value)}
+          placeholder={
+            (detected?.runtimes ?? []).length > 0
+              ? `Detected: ${(detected?.runtimes ?? [])
+                  .map((r) => (r.version ? `${r.name} ${r.version}` : r.name))
+                  .join(', ')}`
+              : 'node 20\npython 3.12'
+          }
+          className="px-2 py-1.5 text-sm rounded-md border border-gray-300 bg-white focus:outline-none focus:border-black font-mono"
+        />
+        <span className="text-[11px] text-gray-500">
+          One per line: <span className="font-mono">name</span> or{' '}
+          <span className="font-mono">name version</span>. Known names:
+          node / python / go / ruby / rust / java. Empty falls back to
+          detected.
+        </span>
+      </label>
+      <label className="flex flex-col gap-1">
+        <span className="text-[11px] uppercase tracking-wider text-gray-500">
+          System packages
+        </span>
+        <textarea
+          rows={3}
+          value={sysPkgsDraft}
+          onChange={(e) => setSysPkgsDraft(e.target.value)}
+          placeholder={
+            (detected?.system_packages ?? []).length > 0
+              ? `Detected: ${(detected?.system_packages ?? []).join(', ')}`
+              : 'libpq-dev, ffmpeg, …'
+          }
+          className="px-2 py-1.5 text-sm rounded-md border border-gray-300 bg-white focus:outline-none focus:border-black font-mono"
+        />
+        <span className="text-[11px] text-gray-500">
+          One per line or comma-separated. Empty falls back to detected.
+        </span>
+      </label>
       <div className="flex flex-wrap items-center gap-2 justify-end">
         <button
           type="button"
@@ -557,15 +666,50 @@ function IntrospectionPills({
       />
     );
   }
+  const runtimes = effective?.runtimes ?? [];
+  const systemPackages = effective?.system_packages ?? [];
+  const runtimesOverridden =
+    overrides !== null && overrides.runtimes !== null && overrides.runtimes !== undefined;
+  const sysPkgsOverridden =
+    overrides !== null &&
+    overrides.system_packages !== null &&
+    overrides.system_packages !== undefined;
   return (
     <div
-      className={`mt-2 flex flex-wrap items-center gap-1.5 ${isLoading ? 'opacity-60' : ''}`}
+      className={`mt-2 flex flex-col gap-1.5 ${isLoading ? 'opacity-60' : ''}`}
     >
-      {pillFor('primary_language')}
-      {pillFor('package_manager')}
-      {pillFor('test_command')}
-      {pillFor('build_command')}
-      {pillFor('dev_command')}
+      <div className="flex flex-wrap items-center gap-1.5">
+        {pillFor('primary_language')}
+        {pillFor('package_manager')}
+        {pillFor('test_command')}
+        {pillFor('build_command')}
+        {pillFor('dev_command')}
+      </div>
+      {runtimes.length > 0 && (
+        <div className="flex flex-wrap items-center gap-1.5">
+          <span className="text-[10px] uppercase tracking-wide text-gray-500">
+            Runtimes
+          </span>
+          {runtimes.map((r) => (
+            <Pill
+              key={`${r.name}-${r.source}`}
+              label={r.version ? `${r.name} ${r.version}` : r.name}
+              mono
+              overridden={runtimesOverridden}
+            />
+          ))}
+        </div>
+      )}
+      {systemPackages.length > 0 && (
+        <div className="flex flex-wrap items-center gap-1.5">
+          <span className="text-[10px] uppercase tracking-wide text-gray-500">
+            System packages
+          </span>
+          {systemPackages.map((p) => (
+            <Pill key={p} label={p} mono overridden={sysPkgsOverridden} />
+          ))}
+        </div>
+      )}
     </div>
   );
 }

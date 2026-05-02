@@ -17,6 +17,7 @@ import httpx
 import redis.asyncio as redis_asyncio
 from db import mongo
 from orchestrator.app import app
+from orchestrator.services.reconciliation import Reconciler
 from orchestrator.services.sandbox_manager import SandboxManager
 from sandbox_provider import MockSandboxProvider
 
@@ -57,6 +58,7 @@ async def client() -> AsyncIterator[httpx.AsyncClient]:
     manager = SandboxManager(provider=provider, redis=None)
     app.state.sandbox_manager = manager
     app.state.sandbox_provider = provider
+    app.state.reconciler = Reconciler(provider)
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as c:

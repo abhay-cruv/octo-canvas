@@ -1047,16 +1047,16 @@ Sign-in flow + `User`/`Session` collections + protected route convention. Accept
 **Acceptance:** `POST /api/sandboxes` creates a `Sandbox` doc and immediately calls `provider.create()`; the sprite shows up `warm` with a public URL right away. `wake` issues a no-op exec to force `cold→running`. `pause` kills active exec sessions and returns whatever the provider currently reports (warm, then cold within seconds via Sprites' idle); idempotent on `cold`. `refresh` resyncs status from the provider. `reset` rotates `provider_handle.id` on the same `Sandbox._id`, increments `reset_count`, returns the sandbox to `warm`. `destroy` marks the doc `destroyed`; user must re-`POST /api/sandboxes` to provision a new one (new `_id`).
 **Out of scope:** WS endpoints (5a), cloning (5b), agent runs (6), PTY/file ops (8 — though Sprites already covers most of it, see §18 below).
 
-### Slice 5a — Web ↔ orchestrator WS (control + events)
+### Slice 5a — Web ↔ orchestrator WS (control + events) ✅ shipped
 
 The bridge↔orchestrator WS leg is **gone** — Sprites' SDK is outbound-driven. Only the web↔orchestrator WS remains.
 
-**Adds:** `/ws/web/tasks/{task_id}` (Pydantic discriminated unions per §10.4); `seq`-replay from Mongo via `Resume{after_seq}`; 30s/90s `Ping`/`Pong`; web-side reconnect loop with jittered backoff. Redis pub/sub for cross-instance event fan-out (`task:{task_id}` channel) so two orchestrator instances streaming the same agent run can both forward events to their local web subscribers.
-**Files:** `apps/orchestrator/src/orchestrator/ws/web.py` (handler); `python_packages/shared_models/wire_protocol/` (message types + TS codegen).
-**Risks:** keeping schemas in sync — codegen runs on schema change. Cross-instance fan-out via Redis pub/sub must not become the source of truth (Mongo stays canonical; pub/sub is the live broadcast channel).
-**Acceptance:** with no real agent yet, an internal-only test event posted to a fake `Task` shows up on a web subscriber connected to `/ws/web/tasks/{task_id}`. Disconnect the web client mid-stream → reconnect with `Resume{after_seq}` → catches up. Spin up two orchestrator instances; web client on instance A sees an event published by instance B.
+**Adds:** `/ws/web/tasks/{task_id}` (Pydantic discriminated unions per §10.4); `seq`-replay from Mongo via `Resume{after_seq}` against an atomic per-task allocator (`seq_counters` raw collection, `findOneAndUpdate {$inc: {next: 1}}` upsert); 30s/90s `Ping`/`Pong`; web-side reconnect loop with jittered backoff (1s → 16s, ±25%). Redis pub/sub for cross-instance event fan-out (`task:{task_id}` channel) via a per-instance `TaskFanout` polling its own `PubSub` — `listen()` was rejected because redis-py's async `listen()` blocks on an empty subscription set and doesn't wake reliably when channels are added mid-flight. Per-subscriber backpressure tracking (`Subscription.last_dropped_seq`) drives `BackpressureWarning` emission. Wire-protocol TS codegen via `gen_wire_schema.py` → `pnpm dlx json-schema-to-typescript` → `packages/api-types/generated/wire.d.ts`. Dev-only inject endpoints `POST /api/_internal/tasks` + `POST /api/_internal/tasks/{id}/events` gated by `ALLOW_INTERNAL_ENDPOINTS`.
+**Files:** `apps/orchestrator/src/orchestrator/ws/{web.py,task_fanout.py}`; `apps/orchestrator/src/orchestrator/services/event_store.py`; `apps/orchestrator/src/orchestrator/routes/internal.py`; `python_packages/shared_models/src/shared_models/wire_protocol/` (events.py, commands.py, adapters); `python_packages/shared_models/src/shared_models/scripts/gen_wire_schema.py`; `python_packages/db/src/db/models/{task.py,agent_event.py}`; `apps/web/src/hooks/useTaskStream.ts`; `apps/web/src/routes/_authed/tasks/$taskId.tsx`.
+**Risks:** discriminated-union evolution (mitigated by `extra="ignore"` on every variant); cross-instance fan-out via Redis pub/sub must not become the source of truth (Mongo stays canonical); WS handshake auth has no native `Depends` parity (wrapped in `_resolve_user_for_ws`); 4xxx close codes only meaningful **after** `accept()` (handler accepts first, then validates+closes).
+**Acceptance:** ✅ test event injected via internal endpoint shows up on the WS subscriber. Force-disconnect → jittered reconnect → `Resume{after_seq=lastSeq}` skips replay correctly. Two `TaskFanout` instances against one Redis cross-fan (in-process simulation; manual smoke for two real processes documented as followup). 82 orchestrator tests + 23 provider tests passing.
 
-### Slice 5b — Cloning + reconciliation
+### Slice 5b — Cloning + reconciliation + Reset = `/work` wipe ✅ shipped
 
 **Adds:** Provider widening — `fs_list`, `fs_read`, `fs_write`, `exec_oneshot` on `SandboxProvider` (Sprites impl wraps the SDK; mock implements an in-memory FS sufficient for tests). On connect-repo, orchestrator calls `provider.exec_oneshot(handle, ["git", "clone", ...], env={GITHUB_TOKEN: ...})` to clone into `/work/<full_name>/`. After successful clone+install, **create a `clean` checkpoint** via `provider.snapshot(handle, comment="clean")`. Reset switches to `provider.restore(handle, "clean")` instead of destroy+create — milliseconds, repo state preserved, see [python.md → Checkpoints](sprites/v0.0.1-rc43/python.md). Reconciliation: orchestrator periodically calls `provider.fs_list(handle, "/work")` and diffs against `Repo` rows where `sandbox_id == this`; issues clone/remove ops to converge.
 **Files:** `python_packages/sandbox_provider/src/sandbox_provider/{sprites.py,mock.py}` (widen the impls); `apps/orchestrator/src/orchestrator/services/reconciliation.py`.
@@ -1181,8 +1181,10 @@ Builds the orchestrator-hosted User Agent on top of slice 6. Off-by-default; use
 - **Slice 1** ✅ shipped (GitHub OAuth + user persistence)
 - **Slice 2** ✅ shipped (OAuth `repo` scope + repo connection)
 - **Slice 3** ✅ shipped (repo introspection — Trees + Contents detection, dev_command, per-field user overrides)
-- **Slice 4** 🟡 code shipped, awaiting sign-off (sandbox provisioning on Sprites SDK; opaque `SandboxHandle`; reset/destroy distinct; auto-hibernation delegated to Sprites)
-- **Slices 5a / 5b / 6 – 10** ⬜ not started; briefs to be authored slice-by-slice.
+- **Slice 4** ✅ shipped (sandbox provisioning on Sprites SDK; opaque `SandboxHandle`; 7-state machine; Reset/Pause/Destroy distinct; auto-hibernation delegated to Sprites)
+- **Slice 5a** ✅ shipped (web↔orchestrator WS `/ws/web/tasks/{task_id}`; Pydantic discriminated unions; atomic per-task seq via `seq_counters`; Mongo-replay → Redis pub/sub live mode via `TaskFanout`; 30/90s heartbeat; jittered FE reconnect; wire-protocol TS codegen; dev-only inject endpoints)
+- **Slice 5b** ✅ shipped (provider widened with exec/fs/snapshot/restore; reconciliation service event-driven with safety net + 15min wall-clock timeout; Reset = `rm -rf /work && mkdir -p /work` + reconcile re-clone preserving sprite identity; one-time git setup at fixed `/etc/octo-canvas/` paths via `GIT_CONFIG_GLOBAL`; `apt-get` via `sudo -n`; `exec_oneshot` retries WS-handshake timeouts up to 6× / 63s backoff; introspection deepened with runtimes + system_packages on `RepoIntrospection` and `IntrospectionOverrides`; activity banner on the dashboard for every reconciler phase)
+- **Slices 6 – 10** ⬜ not started; briefs to be authored slice-by-slice.
 
 **Plan rewrites on 2026-05-02** following the rc43 SDK docs:
 
@@ -1198,11 +1200,13 @@ Repo metrics (from latest [`/graphify`](../graphify-out/GRAPH_REPORT.md) run, 20
 
 ## 21. Concrete next steps (do these in order)
 
-1. **Sign off slice 4** — exercise the dashboard with `SANDBOX_PROVIDER=mock` end-to-end, then with a real `SPRITES_TOKEN`. Brief at [slice/slice4.md](slice/slice4.md). After sign-off, freeze the brief; corrections move to [progress.md](progress.md).
-2. **Author `slice5a.md`** — web↔orchestrator WS for control + events; cross-instance fan-out via Redis pub/sub. Use the slice 4 brief structure.
-3. **Implement slice 5a**, ship, sign off.
-4. **Author `slice5b.md`** — clone + reconciliation + checkpoint-based Reset; Provider Protocol widens with `fs_*` and `exec_*`.
-5. **Implement slice 5b.** After this, repos are warm-cloned in `/work/` and a `clean` checkpoint exists per sandbox.
-6. Repeat author-then-ship for slices 6 → 10.
+1. ~~**Sign off slice 4**~~ — done 2026-05-02; brief frozen.
+2. ~~**Author `slice5a.md`**~~ — done.
+3. ~~**Implement slice 5a**, ship, sign off.~~ — done 2026-05-02; brief frozen.
+4. ~~**Author `slice5b.md`**~~ — done.
+5. ~~**Implement slice 5b.**~~ — done 2026-05-02; brief frozen. **Reset semantics shifted mid-slice** from "checkpoint restore" to "wipe `/work` + reconcile re-clone" because the checkpoint path was visually indistinguishable from a no-op. Sprite identity (and all non-`/work` state — git config, apt cache) is preserved across Reset.
+6. **Author `slice6.md`** — Tasks + Sandbox-Agent invocation (passthrough), `Task` + `AgentRun` + `AgentEvent` collections widened, agent runs via `provider.exec_oneshot`, JSON-lines stdout parsed into `AgentEvent` records. **No User Agent yet** — slice 6b owns that.
+7. **Implement slice 6**, ship, sign off.
+8. Repeat author-then-ship for slices 6b → 10.
 
 Do **not** start slice N+1 implementation before the slice N brief is signed off and the slice N+1 brief is reviewed. Hard rule from every prior slice brief — "do not start the next task automatically" — applies for every slice transition.

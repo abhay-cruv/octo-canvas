@@ -116,6 +116,11 @@ class SandboxManager:
             return await self._mark_failed(sandbox, exc)
         sandbox.status = state.status
         sandbox.public_url = state.public_url
+        # Once Sprites confirms the sprite has actually idled, drop the
+        # "pausing" banner.
+        if sandbox.activity == "pausing" and sandbox.status == "cold":
+            sandbox.activity = None
+            sandbox.activity_detail = None
         await sandbox.save()
         await self._redis_write(sandbox)
         return sandbox
@@ -141,46 +146,138 @@ class SandboxManager:
         """Force the sandbox to release compute. Sprites has no explicit
         force-pause API; the provider implementation kills active exec
         sessions so Sprites' idle timer can fire. Returned status may still
-        be `warm` for a few seconds before going cold."""
+        be `warm` for a few seconds before going cold — the route
+        schedules a delayed re-sync to converge the doc to `cold`."""
         if sandbox.status == "cold":
             return sandbox  # idempotent — already paused
         if sandbox.status not in _PAUSE_FROM:
             raise IllegalSandboxTransitionError(sandbox.status, "pause")
+        # Set the activity banner *before* the provider call so the FE's
+        # next poll already shows "pausing…" rather than a misleading
+        # "warm".
+        sandbox.activity = "pausing"
+        sandbox.activity_detail = None
+        await sandbox.save()
         try:
             state = await self._provider.pause(_handle_of(sandbox))
         except SpritesError as exc:
             return await self._mark_failed(sandbox, exc)
         sandbox.status = state.status
         sandbox.public_url = state.public_url
+        if sandbox.status == "cold":
+            sandbox.activity = None
         await sandbox.save()
         await self._redis_write(sandbox)
         _logger.info("sandbox.paused", sandbox_id=str(sandbox.id), status=sandbox.status)
         return sandbox
 
     async def reset(self, sandbox: Sandbox) -> Sandbox:
-        """Tear down the current sprite, then provision a fresh one for the
-        *same* `Sandbox` doc. Same `_id`, new `provider_handle`, fresh
-        filesystem. Increments `reset_count`."""
+        """Wipe `/work` on the sprite and let reconciliation re-clone.
+
+        We don't destroy the sprite — that's wasteful and slow, and
+        loses the git config + apt cache + anything else the user has
+        installed. We also don't restore from checkpoint — that
+        preserves the repos verbatim, which makes Reset feel like a
+        no-op. Middle ground: `rm -rf /work` via exec (Sprites' own
+        fs/delete refuses to delete the work-root with 400), leave the
+        rest of the sprite alone, kick reconcile to re-clone fresh.
+
+        Same `Sandbox._id`, same `provider_handle`, `reset_count`
+        incremented, `last_reset_at` updated. If the sprite is cold,
+        we wake it first so the wipe + reconcile have somewhere to
+        run."""
         if sandbox.status not in _RESET_FROM:
             raise IllegalSandboxTransitionError(sandbox.status, "reset")
 
-        # Mark resetting before any provider call so a crash doesn't leave
-        # us in an alive state with a half-destroyed sprite.
+        was_cold = sandbox.status == "cold"
+        was_failed = sandbox.status == "failed"
         sandbox.status = "resetting"
         await sandbox.save()
         await self._redis_write(sandbox)
 
+        # Failed sandboxes have a broken sprite — wiping /work won't
+        # recover them. Fall back to destroy+create so the user gets a
+        # working sandbox.
+        if was_failed:
+            return await self._reset_via_recreate(sandbox)
+
+        # Wake if it was cold so fs_delete + reconcile actually run.
+        if was_cold:
+            try:
+                woken = await self._provider.wake(_handle_of(sandbox))
+                sandbox.status = woken.status
+                sandbox.public_url = woken.public_url
+            except SpritesError as exc:
+                _logger.warning(
+                    "sandbox.reset.wake_failed",
+                    sandbox_id=str(sandbox.id),
+                    error=str(exc),
+                )
+
+        # Wipe everything under `/work`. We can't use `fs_delete /work`
+        # directly — Sprites' fs/delete returns 400 for the work-root
+        # path itself. `rm -rf /work && mkdir -p /work` via exec is
+        # reliable: idempotent if the dir doesn't exist yet, and the
+        # next reconcile pass treats `/work` as fresh-empty.
+        try:
+            wipe = await self._provider.exec_oneshot(
+                _handle_of(sandbox),
+                ["sh", "-c", "rm -rf /work && mkdir -p /work"],
+                env={},
+                cwd="/",
+                timeout_s=60,
+            )
+        except SpritesError as exc:
+            return await self._mark_failed(sandbox, exc)
+        if wipe.exit_code != 0:
+            _logger.warning(
+                "sandbox.reset.wipe_nonzero",
+                sandbox_id=str(sandbox.id),
+                exit_code=wipe.exit_code,
+                stderr=wipe.stderr[-500:],
+            )
+
+        # Pull live status — the wipe doesn't change lifecycle but the
+        # sprite may have shifted (e.g., still warming after wake).
+        try:
+            state = await self._provider.status(_handle_of(sandbox))
+            sandbox.status = state.status
+            sandbox.public_url = state.public_url
+        except SpritesError as exc:
+            return await self._mark_failed(sandbox, exc)
+
+        sandbox.reset_count += 1
+        sandbox.last_reset_at = _now()
+        sandbox.last_active_at = _now()
+        sandbox.failure_reason = None
+        # /work is gone, so the previous checkpoint no longer reflects
+        # current state. Drop it; reconcile takes a fresh one.
+        sandbox.clean_checkpoint_id = None
+        await sandbox.save()
+        await self._redis_write(sandbox)
+        _logger.info(
+            "sandbox.reset.workdir_wiped",
+            sandbox_id=str(sandbox.id),
+            status=sandbox.status,
+        )
+        return sandbox
+
+    async def _reset_via_recreate(self, sandbox: Sandbox) -> Sandbox:
+        """Used only for `failed` sandboxes where the sprite itself is
+        broken and a `/work` wipe wouldn't recover it. Destroy and
+        provision a fresh one with the same `Sandbox._id`."""
         try:
             await self._provider.destroy(_handle_of(sandbox))
         except SpritesError as exc:
             return await self._mark_failed(sandbox, exc)
-
         sandbox.provider_handle = {}
         sandbox.public_url = None
         sandbox.reset_count += 1
         sandbox.last_reset_at = _now()
         sandbox.failure_reason = None
         sandbox.status = "provisioning"
+        sandbox.clean_checkpoint_id = None
+        sandbox.git_configured_token_fp = None
         await sandbox.save()
         return await self._provision(sandbox)
 

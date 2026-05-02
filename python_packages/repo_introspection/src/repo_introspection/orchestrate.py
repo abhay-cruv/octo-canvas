@@ -10,6 +10,8 @@ from repo_introspection.commands import detect_commands
 from repo_introspection.github_source import fetch_blob_text, fetch_tree
 from repo_introspection.language import detect_primary_language
 from repo_introspection.package_manager import detect_package_manager
+from repo_introspection.runtimes import detect_runtimes
+from repo_introspection.system_packages import detect_system_packages
 
 
 async def introspect_via_github(
@@ -21,6 +23,8 @@ async def introspect_via_github(
     language = detect_primary_language(paths)
     pm = await detect_package_manager(paths, fetch)
     test_cmd, build_cmd, dev_cmd = await detect_commands(paths, pm, fetch)
+    runtimes = await detect_runtimes(paths, fetch)
+    system_packages = await detect_system_packages(paths, fetch)
 
     return RepoIntrospection(
         primary_language=language,
@@ -28,5 +32,7 @@ async def introspect_via_github(
         test_command=test_cmd,
         build_command=build_cmd,
         dev_command=dev_cmd,
+        runtimes=runtimes,
+        system_packages=system_packages,
         detected_at=datetime.now(UTC),
     )

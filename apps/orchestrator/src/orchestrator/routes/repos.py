@@ -1,7 +1,8 @@
+import asyncio
 from typing import NoReturn
 
 from beanie import PydanticObjectId
-from db.models import Repo, User
+from db.models import Repo, Sandbox, User
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from github_integration import GithubReauthRequired, call_with_reauth, user_client
 from githubkit import GitHub, TokenAuthStrategy
@@ -17,6 +18,8 @@ from shared_models import (
 
 from ..lib.logger import logger
 from ..middleware.auth import require_user
+from ..services.reconciliation import Reconciler
+from .deps import get_reconciler
 
 router = APIRouter()
 
@@ -30,6 +33,10 @@ _OVERRIDE_FIELDS: tuple[str, ...] = (
     "test_command",
     "build_command",
     "dev_command",
+    # Slice 5b additions — list-typed overrides. `None` means "use detected";
+    # `[]` means "user wants no entries".
+    "runtimes",
+    "system_packages",
 )
 
 
@@ -63,6 +70,7 @@ def _to_response(doc: Repo) -> ConnectedRepo:
         default_branch=doc.default_branch,
         private=doc.private,
         clone_status=doc.clone_status,
+        clone_error=doc.clone_error,
         connected_at=doc.connected_at,
         introspection=_merge(doc.introspection_detected, doc.introspection_overrides),
         introspection_detected=doc.introspection_detected,
@@ -215,9 +223,40 @@ async def list_connected_repos(
     return [_to_response(d) for d in docs]
 
 
+_BACKGROUND_TASKS: set[asyncio.Task[None]] = set()
+
+
+def _kick_reconcile(reconciler: Reconciler, sandbox_id: PydanticObjectId) -> None:
+    """Schedule reconciliation in the background. Mirrors the helper in
+    `routes.sandbox` — kept duplicated here so each route module owns its
+    own background-task wrapper instead of depending on the other."""
+
+    async def _run() -> None:
+        try:
+            await reconciler.reconcile(sandbox_id)
+        except Exception as exc:
+            logger.warning(
+                "repos.reconcile_background_failed",
+                sandbox_id=str(sandbox_id),
+                error=str(exc),
+            )
+
+    task = asyncio.create_task(_run(), name=f"reconcile-{sandbox_id}")
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+
+
+async def _alive_sandbox_for(user_id: PydanticObjectId) -> Sandbox | None:
+    return await Sandbox.find(
+        Sandbox.user_id == user_id, {"status": {"$ne": "destroyed"}}
+    ).first_or_none()
+
+
 @router.post("/connect", response_model=ConnectedRepo, status_code=status.HTTP_201_CREATED)
 async def connect_repo(
-    body: ConnectRepoRequest, user: User = Depends(require_user)
+    body: ConnectRepoRequest,
+    user: User = Depends(require_user),
+    reconciler: Reconciler = Depends(get_reconciler),
 ) -> ConnectedRepo:
     token = await _require_token(user)
 
@@ -265,8 +304,10 @@ async def connect_repo(
             detail="full_name and github_repo_id mismatch",
         )
 
+    sandbox = await _alive_sandbox_for(user.id)
     doc = Repo(
         user_id=user.id,
+        sandbox_id=sandbox.id if sandbox is not None else None,
         github_repo_id=body.github_repo_id,
         full_name=repo_data.full_name,
         default_branch=repo_data.default_branch,
@@ -278,12 +319,19 @@ async def connect_repo(
         repo_id=str(doc.id),
         full_name=doc.full_name,
         user_id=str(user.id),
+        sandbox_id=str(sandbox.id) if sandbox is not None else None,
     )
 
     try:
         await _introspect_into(doc, gh, user)
     except GithubReauthRequired:
         await _on_reauth(user)
+
+    # Slice 5b: if the user already has an alive sandbox, kick reconciliation
+    # so the new repo gets cloned in the background. Otherwise the repo sits
+    # at `clone_status="pending"` until the user provisions a sandbox.
+    if sandbox is not None and sandbox.id is not None:
+        _kick_reconcile(reconciler, sandbox.id)
 
     return _to_response(doc)
 
@@ -308,6 +356,30 @@ async def reintrospect_repo(
         full_name=doc.full_name,
         user_id=str(user.id),
     )
+    return _to_response(doc)
+
+
+@router.post("/{repo_id}/retry-clone", response_model=ConnectedRepo)
+async def retry_clone(
+    repo_id: PydanticObjectId,
+    user: User = Depends(require_user),
+    reconciler: Reconciler = Depends(get_reconciler),
+) -> ConnectedRepo:
+    """Manual retry for a `failed` clone. Flips status back to `pending`
+    and kicks reconciliation. Auto-retry deliberately doesn't fire on
+    `failed` — see `routes/sandbox.py:wake_sandbox` for the reasoning."""
+    doc = await Repo.get(repo_id)
+    if doc is None or doc.user_id != user.id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="repo not found")
+    if doc.sandbox_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="repo not bound to a sandbox; provision one first",
+        )
+    doc.clone_status = "pending"
+    doc.clone_error = None
+    await doc.save()
+    _kick_reconcile(reconciler, doc.sandbox_id)
     return _to_response(doc)
 
 
@@ -341,11 +413,19 @@ async def update_introspection_overrides(
 
 @router.delete("/{repo_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def disconnect_repo(
-    repo_id: PydanticObjectId, user: User = Depends(require_user)
+    repo_id: PydanticObjectId,
+    user: User = Depends(require_user),
+    reconciler: Reconciler = Depends(get_reconciler),
 ) -> Response:
     doc = await Repo.get(repo_id)
     if doc is None or doc.user_id != user.id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="repo not found")
+    sandbox_id = doc.sandbox_id  # capture before delete
     await doc.delete()
     logger.info("repos.disconnected", repo_id=str(repo_id), user_id=str(user.id))
+    # If the repo was bound to a sandbox, kick reconciliation so the
+    # working tree is removed and a fresh `clean` checkpoint replaces the
+    # old one.
+    if sandbox_id is not None:
+        _kick_reconcile(reconciler, sandbox_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)

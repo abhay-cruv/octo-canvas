@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 PackageManager = Literal[
     "pnpm",
@@ -21,6 +21,15 @@ PackageManager = Literal[
     "other",
 ]
 
+# Slice 5b: runtimes detected per repo. Multiple supported (monorepo).
+RuntimeName = Literal["node", "python", "go", "ruby", "rust", "java"]
+
+
+class Runtime(BaseModel):
+    name: RuntimeName
+    version: str | None = None  # None when no version file present
+    source: str  # "package.json#engines.node", ".nvmrc", "go.mod", etc.
+
 
 class RepoIntrospection(BaseModel):
     primary_language: str | None
@@ -28,6 +37,10 @@ class RepoIntrospection(BaseModel):
     test_command: str | None
     build_command: str | None
     dev_command: str | None
+    # Slice 5b additions — `default_factory=list` so existing Mongo rows that
+    # don't yet have these fields read back as empty lists.
+    runtimes: list[Runtime] = Field(default_factory=list)
+    system_packages: list[str] = Field(default_factory=list)
     detected_at: datetime
 
 
@@ -48,3 +61,7 @@ class IntrospectionOverrides(BaseModel):
     test_command: str | None = None
     build_command: str | None = None
     dev_command: str | None = None
+    # Slice 5b: list-typed overrides — empty list `[]` means "user wants no
+    # detected entries"; `None` means "no override, use detected".
+    runtimes: list[Runtime] | None = None
+    system_packages: list[str] | None = None

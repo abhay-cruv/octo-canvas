@@ -30,6 +30,10 @@ class Repo(Document):
     introspection_overrides: IntrospectionOverrides | None = None
     clone_status: Literal["pending", "cloning", "ready", "failed"] = "pending"
     clone_path: str | None = None
+    # Slice 5b: human-readable failure reason. Set alongside
+    # `clone_status="failed"`; sanitized of tokens. Common values:
+    # "github_reauth_required", "network_error", "timeout".
+    clone_error: str | None = None
     last_synced_at: datetime | None = None
     connected_at: datetime = Field(default_factory=_now)
 
