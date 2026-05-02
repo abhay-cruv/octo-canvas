@@ -28,7 +28,7 @@ from pymongo.errors import PyMongoError
 
 from db.collections import ALL as ALL_COLLECTIONS
 from db.collections import Collections
-from db.models import Repo, Sandbox, Session, User
+from db.models import AgentEvent, Repo, Sandbox, Session, Task, User
 
 __all__ = ["ALL_COLLECTIONS", "Collections", "Mongo", "connect", "disconnect", "mongo"]
 
@@ -40,7 +40,7 @@ _logger = structlog.get_logger("db")
 _DEFAULT_DB_NAME = "octo_canvas"
 
 # Every Beanie Document must appear here or it silently fails to query.
-_DOCUMENT_MODELS: list[type] = [User, Session, Repo, Sandbox]
+_DOCUMENT_MODELS: list[type] = [User, Session, Repo, Sandbox, Task, AgentEvent]
 
 
 def _database_name(uri: str) -> str:
@@ -92,6 +92,18 @@ class Mongo:
     @property
     def sandboxes(self) -> "AsyncCollection[dict[str, object]]":
         return self.db[Collections.SANDBOXES]
+
+    @property
+    def tasks(self) -> "AsyncCollection[dict[str, object]]":
+        return self.db[Collections.TASKS]
+
+    @property
+    def agent_events(self) -> "AsyncCollection[dict[str, object]]":
+        return self.db[Collections.AGENT_EVENTS]
+
+    @property
+    def seq_counters(self) -> "AsyncCollection[dict[str, object]]":
+        return self.db[Collections.SEQ_COUNTERS]
 
     def collection(self, name: str) -> "AsyncCollection[dict[str, object]]":
         """Escape hatch for migrations / one-off scripts that need to touch a

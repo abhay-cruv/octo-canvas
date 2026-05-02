@@ -15,7 +15,7 @@ Sibling docs: [agent_context.md](agent_context.md) (quick-start) · [engineering
 | 2 | OAuth `repo` scope + repo connection | ✅ shipped | OAuth scope expanded to include `repo`; access token persisted on `User`; `Repo` collection; list/connect/disconnect endpoints; **401 → clear token + 403 `github_reauth_required`**; UI Reconnect flow. **No GitHub App, no smee, no webhooks** (rejected design). **No clone, no introspection, no sandbox** (slices 3 + 4). [slice2.md](slice/slice2.md) is now frozen — corrections live below. |
 | 3 | Repo introspection | ✅ shipped | GitHub Trees + Contents detection, no clone. Five fields incl. `dev_command`. Per-field user overrides via `PATCH /api/repos/{id}/introspection`. [slice3.md](slice/slice3.md) is now frozen — corrections live below. |
 | 4 | Sandbox provisioning (the box exists) | ✅ shipped | Sprites SDK behind opaque `SandboxHandle`. 7-state machine. Reset (destroy+create), Pause (kill exec sessions → Sprites idles), Destroy distinct. 64 orchestrator + 23 provider tests. [slice4.md](slice/slice4.md) is now frozen — corrections live below. |
-| 5a | WebSocket transport — control + events | ⬜ not started | Plan.md §10 rewritten with multi-WS architecture, disconnect handling, sticky routing. |
+| 5a | WebSocket transport — control + events | 🟡 code shipped, awaiting sign-off | `/ws/web/tasks/{task_id}` Pydantic discriminated unions, `seq`-replay from Mongo via atomic `findOneAndUpdate $inc` upsert on `SeqCounter`, 30/90s heartbeat, jittered backoff reconnect on the FE, Redis pub/sub fan-out across instances via `TaskFanout`. Dev-only `/api/_internal/tasks` + `/api/_internal/tasks/{id}/events`. Wire-protocol TS bindings via JSON-Schema → `json-schema-to-typescript` → `packages/api-types/generated/wire.d.ts`. 100 orchestrator tests (was 64) + 23 provider tests. [slice5a.md](slice/slice5a.md) brief drafted. |
 | 5b | Reconciliation + clone | ⬜ not started | `EnsureRepoCloned` / `RemoveRepo` directives; clone reconciliation on `ClientHello`. |
 | 6 | Tasks + Agent SDK invocation | ⬜ not started | |
 | 7 | Git ops + PR creation | ⬜ not started | |
@@ -25,11 +25,9 @@ Sibling docs: [agent_context.md](agent_context.md) (quick-start) · [engineering
 
 ---
 
-## Active slice — none
+## Active slice — 5a
 
-Slice 4 signed off **2026-05-02**. [slice4.md](slice/slice4.md) is frozen. Corrections / followups live in this file from now on.
-
-Next: slice 5a (web↔orchestrator WS for control + events). **Brief must be authored before any code** ([AGENTS.md §3.2](../AGENTS.md), [CLAUDE.md](../CLAUDE.md)). The Sandbox Agent → User Agent split (slice 6 / 6b) is documented in Plan.md §14; that's downstream of 5a.
+Slice 5a code shipped **2026-05-02**, awaiting user sign-off. [slice5a.md](slice/slice5a.md) drafted with 11 baked-in calls. Next: walk the debug page in a browser for manual smoke (`/_authed/tasks/$taskId` after creating a Task via the inject endpoint), then sign off and start slice 5b.
 
 ### Slice-4 corrections (post-freeze)
 

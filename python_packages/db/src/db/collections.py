@@ -30,6 +30,9 @@ class Collections:
     TASKS: Final = "tasks"
     AGENT_RUNS: Final = "agent_runs"
     AGENT_EVENTS: Final = "agent_events"
+    # Slice 5a: per-task atomic seq allocator. Raw collection (no Beanie) —
+    # `findOneAndUpdate {$inc: {next: 1}}` upsert is the only access pattern.
+    SEQ_COUNTERS: Final = "seq_counters"
 
 
 # Names of every collection currently materialized in Mongo. Iterate this in
@@ -39,4 +42,7 @@ ALL: Final[tuple[str, ...]] = (
     Collections.SESSIONS,
     Collections.REPOS,
     Collections.SANDBOXES,
+    Collections.TASKS,
+    Collections.AGENT_EVENTS,
+    Collections.SEQ_COUNTERS,
 )

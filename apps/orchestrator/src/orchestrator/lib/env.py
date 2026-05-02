@@ -33,6 +33,10 @@ class Settings(BaseSettings):
     sprites_base_url: str = Field(default="https://api.sprites.dev", alias="SPRITES_BASE_URL")
     redis_url: str = Field(default="redis://localhost:6379", alias="REDIS_URL")
 
+    # Slice 5a: gate the dev-only `/api/_internal/...` event-inject endpoint.
+    # Defaults true in dev. Set ALLOW_INTERNAL_ENDPOINTS=false in any prod env.
+    allow_internal_endpoints: bool = Field(default=True, alias="ALLOW_INTERNAL_ENDPOINTS")
+
     @property
     def is_production(self) -> bool:
         return False

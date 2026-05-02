@@ -12,7 +12,8 @@
     }
   },
   "scripts": {
-    "gen:api-types": "openapi-typescript http://localhost:3001/openapi.json -o generated/schema.d.ts",
+    "gen:api-types": "openapi-typescript http://localhost:3001/openapi.json -o generated/schema.d.ts && pnpm gen:wire-types",
+    "gen:wire-types": "cd ../.. && uv run python -m shared_models.scripts.gen_wire_schema > packages/api-types/generated/wire.schema.json && cd packages/api-types && pnpm dlx json-schema-to-typescript --unreachableDefinitions generated/wire.schema.json -o generated/wire.d.ts",
     "build": "tsc --build",
     "typecheck": "tsc --noEmit",
     "lint": "echo 'no lint for api-types'",

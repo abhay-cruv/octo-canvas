@@ -14,13 +14,28 @@ os.environ.setdefault("REDIS_URL", "redis://localhost:6379/15")
 os.environ.setdefault("SANDBOX_PROVIDER", "mock")
 
 import httpx
-from sandbox_provider import MockSandboxProvider
-
+import redis.asyncio as redis_asyncio
 from db import mongo
 from orchestrator.app import app
 from orchestrator.services.sandbox_manager import SandboxManager
+from sandbox_provider import MockSandboxProvider
 
 TEST_DB_NAME = "octo_canvas_test"
+
+
+@pytest_asyncio.fixture
+async def redis_client() -> AsyncIterator["redis_asyncio.Redis"]:
+    """Real Redis on the test DB (db 15). Flushes before AND after the test
+    so any leftover keys/channels from a prior run don't leak."""
+    client: redis_asyncio.Redis = redis_asyncio.from_url(  # pyright: ignore[reportUnknownMemberType]
+        os.environ["REDIS_URL"], decode_responses=True
+    )
+    await client.flushdb()  # type: ignore[misc]
+    try:
+        yield client
+    finally:
+        await client.flushdb()  # type: ignore[misc]
+        await client.aclose()
 
 
 @pytest_asyncio.fixture

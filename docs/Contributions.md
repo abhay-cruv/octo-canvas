@@ -40,6 +40,19 @@ For *what changed structurally*, read [progress.md](progress.md). For *who and w
 
 ## Log
 
+### 2026-05-02 — Claude Opus 4.7 via Claude Code (slice 5a — WS transport shipped, awaiting sign-off)
+
+- Authored [slice/slice5a.md](slice/slice5a.md) with 11 baked-in calls; user signed off on the calls list and asked to implement.
+- Wire protocol package filled in at [python_packages/shared_models/wire_protocol/](../python_packages/shared_models/src/shared_models/wire_protocol/) — two Pydantic v2 discriminated unions (`OrchestratorToWeb`, `WebToOrchestrator`), `extra="ignore"` on every variant for forward-compat, exported as `TypeAdapter`s.
+- Two new Beanie models — `Task` and `AgentEvent` — plus a raw `seq_counters` collection. `Collections.SEQ_COUNTERS` added to [db/collections.py](../python_packages/db/src/db/collections.py); typed accessors `mongo.tasks/agent_events/seq_counters`. Atomic seq allocation in [event_store.py](../apps/orchestrator/src/orchestrator/services/event_store.py) via `findOneAndUpdate {$inc: {next: 1}}` upsert.
+- WS handler at [`/ws/web/tasks/{task_id}`](../apps/orchestrator/src/orchestrator/ws/web.py): cookie auth (close 4001/4003/4004 post-accept), `Resume{after_seq}` first frame, replay-from-Mongo then live mode, 30/90s heartbeat, `BackpressureWarning` watcher driven by per-`Subscription` drop high-water mark.
+- [`TaskFanout`](../apps/orchestrator/src/orchestrator/ws/task_fanout.py) — per-instance `redis.asyncio.PubSub` multiplex polled via `get_message` (rejected `listen()` due to redis-py's empty-subscription-set wedge), lazy `subscribe()` / `unsubscribe()` on first/last subscriber per task, dispatches into per-subscriber bounded `asyncio.Queue`s with backpressure tracking. Lifespan-managed in [app.py](../apps/orchestrator/src/orchestrator/app.py).
+- Dev-only inject endpoints at [routes/internal.py](../apps/orchestrator/src/orchestrator/routes/internal.py) (`POST /api/_internal/tasks`, `POST /api/_internal/tasks/{id}/events`), gated on `ALLOW_INTERNAL_ENDPOINTS` env (default `True` in dev).
+- Wire-types codegen: new `gen_wire_schema.py` script dumps both adapters as JSON Schema with `$defs` hoisted to a shared `definitions` block; `packages/api-types/package.json gen:wire-types` pipes it through `pnpm dlx json-schema-to-typescript --unreachableDefinitions` into `generated/wire.d.ts`. Re-exported from `@octo-canvas/api-types`.
+- Frontend: [`useTaskStream(taskId)`](../apps/web/src/hooks/useTaskStream.ts) hook owns connect/replay/heartbeat/jittered exponential backoff (1s → 16s, ±25% jitter); debug page at [`/_authed/tasks/$taskId`](../apps/web/src/routes/_authed/tasks/$taskId.tsx) exposes "Inject event" + "Force disconnect" buttons.
+- 18 new pytest tests across [test_event_store.py](../apps/orchestrator/tests/test_event_store.py), [test_task_fanout.py](../apps/orchestrator/tests/test_task_fanout.py), [test_internal_inject.py](../apps/orchestrator/tests/test_internal_inject.py), [test_ws_web.py](../apps/orchestrator/tests/test_ws_web.py): atomic seq under 50 concurrent inserts, replay-after-cursor, two-`TaskFanout`-instances cross-instance fan-out (in-process simulation against real Redis), backpressure drop-tracking, WS auth (4001/4003/4004), happy-path replay, `Resume{after_seq=N}` skip, live event after replay, ping/pong. WS tests drive a real uvicorn server on the test loop because Beanie's `AsyncMongoClient` is loop-bound and `TestClient.websocket_connect` runs in a separate thread/loop. **82 orchestrator tests passing total** (was 64). `pnpm typecheck && lint && test && build` all clean.
+- [docs/progress.md](progress.md) row flipped to 🟡 with active-slice pointer; this Contributions entry added.
+
 ### 2026-05-02 — Claude Opus 4.7 via Claude Code (slice 4 sign-off)
 
 - Slice 4 signed off. [slice/slice4.md](slice/slice4.md) is now frozen — no further edits to that brief; corrections live under "Slice-4 corrections (post-freeze)" in [progress.md](progress.md).

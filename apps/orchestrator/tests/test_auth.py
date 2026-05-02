@@ -4,11 +4,10 @@ from unittest.mock import AsyncMock
 
 import httpx
 import pytest
-from pytest_mock import MockerFixture
-
 from db.models import Session, User
 from orchestrator.middleware.auth import SESSION_COOKIE_NAME
 from orchestrator.routes import auth as auth_route
+from pytest_mock import MockerFixture
 
 
 async def _seed_user_and_session() -> tuple[User, Session]:

@@ -11,8 +11,10 @@ from .lib.env import settings
 from .lib.logger import logger
 from .lib.provider_factory import build_sandbox_provider
 from .lib.redis_client import redis_client
-from .routes import auth, me, repos, sandbox
+from .routes import auth, internal, me, repos, sandbox
 from .services.sandbox_manager import SandboxManager
+from .ws import web as ws_web
+from .ws.task_fanout import TaskFanout
 
 
 @asynccontextmanager
@@ -32,12 +34,28 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     manager = SandboxManager(provider=provider, redis=redis_handle)
     app.state.sandbox_manager = manager
     app.state.sandbox_provider = provider
+    app.state.redis_handle = redis_handle
+
+    # TaskFanout (slice 5a) only spins up if Redis is connected. Without
+    # Redis, single-instance event delivery still works via direct
+    # in-process dispatch — but the WS endpoint will error on subscribe.
+    fanout: TaskFanout | None = None
+    if redis_handle is not None:
+        fanout = TaskFanout(redis_handle)
+        await fanout.start()
+    app.state.task_fanout = fanout
 
     logger.info("orchestrator.startup_complete")
 
     try:
         yield
     finally:
+        if fanout is not None:
+            try:
+                await fanout.stop()
+            except Exception as exc:
+                logger.warning("task_fanout.stop_failed", error=str(exc))
+
         if isinstance(provider, SpritesProvider):
             try:
                 await provider.aclose()
@@ -63,6 +81,10 @@ app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
 app.include_router(me.router, prefix="/api", tags=["me"])
 app.include_router(repos.router, prefix="/api/repos", tags=["repos"])
 app.include_router(sandbox.router, prefix="/api/sandboxes", tags=["sandboxes"])
+app.include_router(ws_web.router, tags=["ws"])
+
+if settings.allow_internal_endpoints:
+    app.include_router(internal.router, prefix="/api/_internal", tags=["internal"])
 
 
 @app.get("/health")
