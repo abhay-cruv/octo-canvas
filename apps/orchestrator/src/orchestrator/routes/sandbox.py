@@ -304,16 +304,31 @@ async def pause_sandbox(
 
 
 def _schedule_post_pause_refresh(manager: SandboxManager, sandbox_id: PydanticObjectId) -> None:
-    """Re-sync the sandbox's live status a few times after pause so the
-    Mongo doc converges to `cold` once Sprites has actually idled. The
-    user's UI polls Mongo via `GET /api/sandboxes`; this is what makes
-    the pill flip from "warm (releasing)" to "cold"."""
+    """Re-sync the sandbox's live status once after pause so the Mongo
+    doc converges to `cold` when Sprites has actually idled. The user's
+    UI polls Mongo via `GET /api/sandboxes`; this single refresh is
+    what makes the pill flip from "pausing…" to "cold".
+
+    Important: each `provider.status` call is an HTTP hit on Sprites'
+    API. Some Sprites configurations treat *any* API access as
+    activity that resets the idle timer — too-frequent polls here
+    would keep the sprite warm forever. So we wait a single 90s
+    window (well past Sprites' default idle threshold) and ask once.
+    If still not cold by then, schedule one more check 90s later;
+    after that, give up and let the user click Refresh manually.
+    """
 
     async def _resync_loop() -> None:
-        for delay in (5.0, 15.0, 45.0):
+        # Two checks max, 90s apart. Mongo reads in between are free
+        # (no Sprites API hit), so polling-from-FE keeps working.
+        for delay in (90.0, 90.0):
             await asyncio.sleep(delay)
             doc = await Sandbox.get(sandbox_id)
             if doc is None or doc.status in ("destroyed", "cold"):
+                return
+            # If user has already woken or reset since pause, stop —
+            # `wake` cancels this task, but a race could leave us here.
+            if doc.activity != "pausing":
                 return
             try:
                 await manager.refresh_status(doc)

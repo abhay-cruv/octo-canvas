@@ -34,6 +34,7 @@ Next: slice 6 (Tasks + Sandbox-Agent invocation, passthrough). **Brief must be a
 ### Slice-5b corrections (post-freeze)
 
 - **`SpritesProvider.snapshot` now retries on transient errors** (503, 502, 504, timeout, connection). Up to 3 attempts with 2s + 4s backoff. Sprites' `/checkpoint` endpoint occasionally returns 503; without retries, `Sandbox.clean_checkpoint_id` would silently stay null and any future code path that wants to use the checkpoint (e.g., a "Quick reset" button) would degrade. Implemented in [`python_packages/sandbox_provider/src/sandbox_provider/sprites.py`](../python_packages/sandbox_provider/src/sandbox_provider/sprites.py) — definitive errors (auth, 4xx, NotFound) still raise immediately.
+- **Pause-resync now polls sparsely** (single check at 90s, one more at 180s) instead of 5s/20s/65s. Each `provider.status` call hits Sprites' API; some Sprites runtimes treat any API access as activity that resets the idle timer, which kept paused sprites warm forever. Sparse polling lets Sprites actually idle. Mongo-only reads from the dashboard's polling are free (no Sprites API), so the FE doesn't lose visibility.
 
 ### Slice-5b open followups (not blockers; flag at slice-6 kickoff)
 
