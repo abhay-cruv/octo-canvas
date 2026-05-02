@@ -34,3 +34,12 @@ Entry point for Claude Code sessions in this repository. The actual rules live e
 - When the repo's "shape" changes (new pkg, app, boundary, type bridge, gotcha, common command, or stack invariant) or something important that the followup agent needs to know changes: [docs/agent_context.md](docs/agent_context.md) — keep it current so the next cold-start agent loads accurate context. Details in [AGENTS.md §1.1–§1.2](AGENTS.md).
 - Active slice brief at [docs/slice/slice{n}.md](docs/slice/) while it's in flight (frozen once user signs off)
 - Never (without explicit user direction): [docs/Plan.md](docs/Plan.md), this file, [README.md](README.md), [docs/scaffold.md](docs/scaffold.md), frozen slice briefs
+
+## graphify
+
+This project has a graphify knowledge graph at graphify-out/.
+
+Rules:
+- Before answering architecture or codebase questions, read graphify-out/GRAPH_REPORT.md for god nodes and community structure
+- If graphify-out/wiki/index.md exists, navigate it instead of reading raw files
+- After modifying code files in this session, run `graphify update .` to keep the graph current (AST-only, no API cost)
