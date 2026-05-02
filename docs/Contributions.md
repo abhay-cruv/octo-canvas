@@ -40,6 +40,12 @@ For *what changed structurally*, read [progress.md](progress.md). For *who and w
 
 ## Log
 
+### 2026-05-02 — Claude Opus 4.7 via Claude Code (slice 5a sign-off)
+
+- Slice 5a signed off after manual browser smoke confirmed end-to-end wire (FE sent `resume`, server-initiated `ping`/`pong` after 30s, inject → seq increments → debug page renders, force-disconnect → jittered reconnect → `Resume{after_seq=lastSeq}` skips replay correctly). [slice/slice5a.md](slice/slice5a.md) is now frozen.
+- [progress.md](progress.md) updated: slice 5a row → ✅ shipped; "Active slice" pointer back to none; three open followups carried forward (slice-10 archive cutover, manual multi-process smoke, backpressure threshold tuning).
+- [agent_context.md](agent_context.md) status line updated to "Slices 0–5a shipped." Repo gotcha worth noting for next agent: TanStack Router's `_authed` is a layout segment — URL paths drop it (visit `/tasks/<id>`, not `/_authed/tasks/<id>`).
+
 ### 2026-05-02 — Claude Opus 4.7 via Claude Code (slice 5a — WS transport shipped, awaiting sign-off)
 
 - Authored [slice/slice5a.md](slice/slice5a.md) with 11 baked-in calls; user signed off on the calls list and asked to implement.
