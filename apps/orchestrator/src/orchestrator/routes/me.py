@@ -1,5 +1,8 @@
+from typing import Literal
+
 from db.models import User
 from fastapi import APIRouter, Depends
+from pydantic import BaseModel
 from shared_models import UserResponse
 
 from ..middleware.auth import require_user
@@ -19,4 +22,53 @@ async def get_me(user: User = Depends(require_user)) -> UserResponse:
         created_at=user.created_at,
         last_signed_in_at=user.last_signed_in_at,
         needs_github_reauth=user.github_access_token is None,
+    )
+
+
+class UserSettingsResponse(BaseModel):
+    """Slice 8: user-agent settings surfaced separately from the
+    profile because they're agent-runtime config, not identity."""
+
+    user_agent_enabled: bool
+    user_agent_provider: Literal["anthropic", "openai", "google"]
+    user_agent_model: str
+
+
+class UpdateUserSettingsBody(BaseModel):
+    user_agent_enabled: bool | None = None
+    user_agent_provider: Literal["anthropic", "openai", "google"] | None = None
+    user_agent_model: str | None = None
+
+
+@router.get("/me/settings", response_model=UserSettingsResponse)
+async def get_settings(user: User = Depends(require_user)) -> UserSettingsResponse:
+    return UserSettingsResponse(
+        user_agent_enabled=user.user_agent_enabled,
+        user_agent_provider=user.user_agent_provider,
+        user_agent_model=user.user_agent_model,
+    )
+
+
+@router.patch("/me/settings", response_model=UserSettingsResponse)
+async def patch_settings(
+    body: UpdateUserSettingsBody, user: User = Depends(require_user)
+) -> UserSettingsResponse:
+    """Partial update — only fields the body sets are touched. The
+    user agent's provider Protocol means flipping `user_agent_provider`
+    swaps to a different `LLMProvider` impl on the next chat without
+    a schema migration (slice 8 §calls #3)."""
+    if body.user_agent_enabled is not None:
+        user.user_agent_enabled = body.user_agent_enabled
+    if body.user_agent_provider is not None:
+        user.user_agent_provider = body.user_agent_provider
+    if body.user_agent_model is not None:
+        # Defensive: cap at a reasonable length, reject empty.
+        model = body.user_agent_model.strip()
+        if model:
+            user.user_agent_model = model[:200]
+    await user.save()
+    return UserSettingsResponse(
+        user_agent_enabled=user.user_agent_enabled,
+        user_agent_provider=user.user_agent_provider,
+        user_agent_model=user.user_agent_model,
     )

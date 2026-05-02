@@ -225,6 +225,7 @@ async def post_message(
     chat = await _load_chat_for_user(chat_id, user)
     owner = _bridge_owner(request)
     provider = _user_agent_provider(request, user)
+    user_agent_loop = getattr(request.app.state, "user_agent_loop", None)
     try:
         turn, enhanced = await add_follow_up(
             user,
@@ -232,6 +233,7 @@ async def post_message(
             prompt=body.prompt,
             bridge_owner=owner,
             user_agent_provider=provider,
+            user_agent_loop=user_agent_loop,
         )
     except ChatRunnerError as exc:
         _raise_chat_error(exc)
@@ -258,40 +260,7 @@ async def post_cancel(
         raise
 
 
-class AnswerClarificationBody(BaseModel):
-    text: Annotated[str, Field(min_length=1, max_length=10000)]
-
-
-@router.post("/{chat_id}/clarifications/{clarification_id}/answer", status_code=204)
-async def post_answer_clarification(
-    chat_id: str,
-    clarification_id: str,
-    body: AnswerClarificationBody,
-    request: Request,
-    user: User = Depends(require_user),
-) -> None:
-    """Manual clarification answer — used both for "user types reply"
-    AND "user overrides a pending agent-answer". The bridge tells
-    the dev agent's `ask_user_clarification` future to resolve."""
-    chat = await _load_chat_for_user(chat_id, user)
-    owner = _bridge_owner(request)
-    from ..services.chat_runner import _user_sandbox
-
-    sandbox = await _user_sandbox(user)
-    if chat.id is None or sandbox.id is None:
-        raise HTTPException(500, detail="invalid state")
-    from shared_models.wire_protocol import (
-        AnswerClarification,
-        OrchestratorToBridgeAdapter,
-    )
-
-    msg = AnswerClarification(
-        chat_id=str(chat.id),
-        frame_id="",
-        clarification_id=clarification_id,
-        text=body.text,
-        source="user",
-    )
-    raw = OrchestratorToBridgeAdapter.dump_python(msg, mode="json")
-    if isinstance(raw, dict):
-        await owner.send(str(sandbox.id), raw)
+# Clarifications are not a separate channel: when the dev agent ends
+# a turn with a question, the user (or the orchestrator-side user
+# agent on their behalf) just sends another message via
+# `POST /api/chats/{id}/messages`. No special clarification route.

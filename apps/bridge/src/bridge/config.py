@@ -40,6 +40,9 @@ class BridgeSettings(BaseSettings):
 
     bridge_token: str = Field(default="", alias="BRIDGE_TOKEN")
     orchestrator_ws_url: str = Field(default="", alias="ORCHESTRATOR_WS_URL")
+    # Slice 8: sandbox identity for the WSS path. Orchestrator pipes
+    # this in alongside `BRIDGE_TOKEN` at bridge-launch time.
+    sandbox_id: str = Field(default="", alias="SANDBOX_ID")
     max_live_chats_per_sandbox: int = Field(
         default=5, alias="MAX_LIVE_CHATS_PER_SANDBOX"
     )
@@ -49,6 +52,9 @@ class BridgeSettings(BaseSettings):
     claude_auth_mode: ClaudeAuthMode = Field(
         default="platform_api_key", alias="CLAUDE_AUTH_MODE"
     )
+    # Slice 8: where chats run. Always `/work/` in v1 (no per-chat
+    # worktrees) — overridable for tests. Branching defers to slice 9.
+    work_root: str = Field(default="/work", alias="WORK_ROOT")
 
 
 def load_settings() -> BridgeSettings:

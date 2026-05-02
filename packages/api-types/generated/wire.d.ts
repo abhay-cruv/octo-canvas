@@ -62,6 +62,108 @@ export type SpritesSessionId = string;
 export type Cols2 = number;
 export type Rows2 = number;
 export type Reattached = boolean;
+export type Type17 = "assistant.delta";
+export type ChatId = string;
+export type Seq5 = number;
+export type Text = string;
+export type Type18 = "assistant.message";
+export type ChatId1 = string;
+export type Seq6 = number;
+export type Text1 = string;
+export type Type19 = "error";
+export type ChatId2 = string;
+export type Seq7 = number;
+export type Kind2 = string;
+export type Message2 = string;
+export type Type20 = "file.edit";
+export type ChatId3 = string;
+export type Seq8 = number;
+export type Path1 = string;
+export type BeforeSha = string | null;
+export type AfterSha = string;
+export type Summary = string;
+export type Type21 = "bridge.pong";
+export type Type22 = "chat.evicted";
+export type ChatId4 = string;
+export type Seq9 = number;
+export type Reason = "lru_cap" | "idle_grace" | "archived" | "explicit_cancel";
+export type Type23 = "chat.started";
+export type ChatId5 = string;
+export type Seq10 = number;
+export type ClaudeSessionId = string;
+export type Type24 = "bridge.goodbye";
+export type Reason1 = string;
+export type Type25 = "bridge.hello";
+export type BridgeVersion = string;
+export type Type26 = "result";
+export type ChatId6 = string;
+export type Seq11 = number;
+export type ClaudeSessionId1 = string;
+export type DurationMs = number;
+export type IsError = boolean;
+export type Error = string | null;
+export type Type27 = "shell.exec";
+export type ChatId7 = string;
+export type Seq12 = number;
+export type Cmd = string;
+export type ExitCode1 = number;
+export type StdoutTail = string;
+export type StderrTail = string;
+export type Type28 = "chat.status";
+export type ChatId8 = string;
+export type Seq13 = number;
+export type NewStatus1 = "pending" | "running" | "awaiting_input" | "completed" | "failed" | "cancelled";
+export type Type29 = "thinking";
+export type ChatId9 = string;
+export type Seq14 = number;
+export type Text2 = string;
+export type Type30 = "token.usage";
+export type ChatId10 = string;
+export type Seq15 = number;
+export type InputDelta = number;
+export type OutputDelta = number;
+export type CacheCreationDelta = number;
+export type CacheReadDelta = number;
+export type Type31 = "tool.finished";
+export type ChatId11 = string;
+export type Seq16 = number;
+export type ToolUseId = string;
+export type IsError1 = boolean;
+export type ResultPreview = string;
+export type Type32 = "tool.started";
+export type ChatId12 = string;
+export type Seq17 = number;
+export type ToolUseId1 = string;
+export type ToolName = string;
+export type Type33 = "user_agent.suggestion";
+export type ChatId13 = string;
+export type Seq18 = number;
+export type SuggestionId = string;
+export type SuggestedReply = string;
+export type Reason2 = string;
+export type OverrideDeadlineAt = string;
+export type Type34 = "bridge.ack";
+export type ChatId14 = string;
+export type AckSeq = number;
+export type Type35 = "bridge.ping";
+export type Type36 = "bridge.cancel";
+export type ChatId15 = string;
+export type FrameId = string;
+export type Type37 = "bridge.chat_state";
+export type ChatId16 = string;
+export type LastSeenSeq = number;
+export type ClaudeSessionId2 = string | null;
+export type Type38 = "bridge.pause";
+export type ChatId17 = string;
+export type FrameId1 = string;
+export type Type39 = "bridge.session_env";
+export type ChatId18 = string;
+export type FrameId2 = string;
+export type Type40 = "bridge.user_message";
+export type ChatId19 = string;
+export type FrameId3 = string;
+export type Text3 = string;
+export type ClaudeSessionId3 = string | null;
 /**
  * This interface was referenced by `OctoCanvasWireProtocol`'s JSON-Schema
  * via the `definition` "OrchestratorToWeb".
@@ -94,6 +196,33 @@ export type WebToPty = ResizePty | RequestOpenPty | RequestClosePty;
  * via the `definition` "PtyToWeb".
  */
 export type PtyToWeb = PtySessionInfo | PtyExit;
+/**
+ * This interface was referenced by `OctoCanvasWireProtocol`'s JSON-Schema
+ * via the `definition` "BridgeToOrchestrator".
+ */
+export type BridgeToOrchestrator =
+  | Hello
+  | Goodbye
+  | BridgePong
+  | ChatStarted
+  | ChatEvicted
+  | StatusChange
+  | AssistantMessageDelta
+  | BridgeAssistantMessage
+  | ThinkingBlock
+  | ToolCallStarted
+  | ToolCallFinished
+  | BridgeFileEditEvent
+  | ShellExecEvent
+  | TokenUsageEvent
+  | UserAgentSuggestion
+  | ResultMessage
+  | BridgeErrorEvent;
+/**
+ * This interface was referenced by `OctoCanvasWireProtocol`'s JSON-Schema
+ * via the `definition` "OrchestratorToBridge".
+ */
+export type OrchestratorToBridge = BridgePing | Ack | ChatState | UserMessage | CancelChat | PauseChat | SessionEnv;
 
 export interface OctoCanvasWireProtocol {
   [k: string]: unknown;
@@ -314,5 +443,368 @@ export interface PtySessionInfo {
   cols: Cols2;
   rows: Rows2;
   reattached: Reattached;
+  [k: string]: unknown;
+}
+/**
+ * A streaming text fragment from the dev agent. Multiple of these
+ * interleave with `ThinkingBlock` and `ToolCallStarted` until the
+ * `ResultMessage` closes the turn.
+ *
+ * This interface was referenced by `OctoCanvasWireProtocol`'s JSON-Schema
+ * via the `definition` "AssistantMessageDelta".
+ */
+export interface AssistantMessageDelta {
+  type?: Type17;
+  chat_id: ChatId;
+  seq: Seq5;
+  text: Text;
+  [k: string]: unknown;
+}
+/**
+ * Final non-streaming assistant block emitted at turn close. The
+ * full text of one assistant message — used by the user agent (it
+ * only sees `important` events, of which this is one).
+ *
+ * This interface was referenced by `OctoCanvasWireProtocol`'s JSON-Schema
+ * via the `definition` "BridgeAssistantMessage".
+ */
+export interface BridgeAssistantMessage {
+  type?: Type18;
+  chat_id: ChatId1;
+  seq: Seq6;
+  text: Text1;
+  [k: string]: unknown;
+}
+/**
+ * Bridge-side errors. `kind` lets the orchestrator route on
+ * well-known causes (`clarification_timeout`, `worktree_dirty_externally`,
+ * `cli_crash`, `cli_pin_mismatch`, ...).
+ *
+ * This interface was referenced by `OctoCanvasWireProtocol`'s JSON-Schema
+ * via the `definition` "BridgeErrorEvent".
+ */
+export interface BridgeErrorEvent {
+  type?: Type19;
+  chat_id: ChatId2;
+  seq: Seq7;
+  kind: Kind2;
+  message: Message2;
+  [k: string]: unknown;
+}
+/**
+ * Emitted after `Write` or `Edit` tool calls succeed. `before_sha`
+ * is null for newly created files.
+ *
+ * This interface was referenced by `OctoCanvasWireProtocol`'s JSON-Schema
+ * via the `definition` "BridgeFileEditEvent".
+ */
+export interface BridgeFileEditEvent {
+  type?: Type20;
+  chat_id: ChatId3;
+  seq: Seq8;
+  path: Path1;
+  before_sha: BeforeSha;
+  after_sha: AfterSha;
+  summary: Summary;
+  [k: string]: unknown;
+}
+/**
+ * This interface was referenced by `OctoCanvasWireProtocol`'s JSON-Schema
+ * via the `definition` "BridgePong".
+ */
+export interface BridgePong {
+  type?: Type21;
+  [k: string]: unknown;
+}
+/**
+ * Bridge evicted this chat's CLI session (LRU cap reached). The
+ * next user message will cold-start via `--resume`.
+ *
+ * This interface was referenced by `OctoCanvasWireProtocol`'s JSON-Schema
+ * via the `definition` "ChatEvicted".
+ */
+export interface ChatEvicted {
+  type?: Type22;
+  chat_id: ChatId4;
+  seq: Seq9;
+  reason: Reason;
+  [k: string]: unknown;
+}
+/**
+ * Emitted when a chat's underlying CLI session reports its
+ * `claude_session_id` for the first time (via `ResultMessage.session_id`).
+ * The orchestrator persists this onto `Chat.claude_session_id` so
+ * follow-ups can `--resume` without losing prompt cache.
+ *
+ * This interface was referenced by `OctoCanvasWireProtocol`'s JSON-Schema
+ * via the `definition` "ChatStarted".
+ */
+export interface ChatStarted {
+  type?: Type23;
+  chat_id: ChatId5;
+  seq: Seq10;
+  claude_session_id: ClaudeSessionId;
+  [k: string]: unknown;
+}
+/**
+ * Sent by the bridge before a clean shutdown (sprite hibernate /
+ * process exit). Orchestrator can release Redis ownership immediately.
+ *
+ * This interface was referenced by `OctoCanvasWireProtocol`'s JSON-Schema
+ * via the `definition` "Goodbye".
+ */
+export interface Goodbye {
+  type?: Type24;
+  reason: Reason1;
+  [k: string]: unknown;
+}
+/**
+ * First frame after WSS handshake. Carries the bridge's view of
+ * `last_acked_seq_per_chat` so the orchestrator can decide whether to
+ * request replay.
+ *
+ * This interface was referenced by `OctoCanvasWireProtocol`'s JSON-Schema
+ * via the `definition` "Hello".
+ */
+export interface Hello {
+  type?: Type25;
+  bridge_version: BridgeVersion;
+  last_acked_seq_per_chat?: LastAckedSeqPerChat;
+  [k: string]: unknown;
+}
+export interface LastAckedSeqPerChat {
+  [k: string]: number;
+}
+/**
+ * End-of-turn marker from the SDK. Carries the session id (used
+ * for `--resume`) and the cumulative usage. The user agent treats
+ * this as the "important conclusion" event for filter purposes.
+ *
+ * This interface was referenced by `OctoCanvasWireProtocol`'s JSON-Schema
+ * via the `definition` "ResultMessage".
+ */
+export interface ResultMessage {
+  type?: Type26;
+  chat_id: ChatId6;
+  seq: Seq11;
+  claude_session_id: ClaudeSessionId1;
+  duration_ms: DurationMs;
+  is_error: IsError;
+  error?: Error;
+  [k: string]: unknown;
+}
+/**
+ * Emitted after `Bash` tool calls finish — useful for the FE to
+ * show `git commit` / test runs / etc. as first-class events instead
+ * of generic tool calls.
+ *
+ * This interface was referenced by `OctoCanvasWireProtocol`'s JSON-Schema
+ * via the `definition` "ShellExecEvent".
+ */
+export interface ShellExecEvent {
+  type?: Type27;
+  chat_id: ChatId7;
+  seq: Seq12;
+  cmd: Cmd;
+  exit_code: ExitCode1;
+  stdout_tail: StdoutTail;
+  stderr_tail: StderrTail;
+  [k: string]: unknown;
+}
+/**
+ * This interface was referenced by `OctoCanvasWireProtocol`'s JSON-Schema
+ * via the `definition` "StatusChange".
+ */
+export interface StatusChange {
+  type?: Type28;
+  chat_id: ChatId8;
+  seq: Seq13;
+  new_status: NewStatus1;
+  [k: string]: unknown;
+}
+/**
+ * Extended-thinking block. Filtered out from the user-agent stream
+ * (too noisy for Haiku) but rendered on the FE.
+ *
+ * This interface was referenced by `OctoCanvasWireProtocol`'s JSON-Schema
+ * via the `definition` "ThinkingBlock".
+ */
+export interface ThinkingBlock {
+  type?: Type29;
+  chat_id: ChatId9;
+  seq: Seq14;
+  text: Text2;
+  [k: string]: unknown;
+}
+/**
+ * Per-`ResultMessage.usage` deltas. Per-chat budget enforcement
+ * lives in slice 8b — slice 8 emits warning events at 80%.
+ *
+ * This interface was referenced by `OctoCanvasWireProtocol`'s JSON-Schema
+ * via the `definition` "TokenUsageEvent".
+ */
+export interface TokenUsageEvent {
+  type?: Type30;
+  chat_id: ChatId10;
+  seq: Seq15;
+  input_delta: InputDelta;
+  output_delta: OutputDelta;
+  cache_creation_delta?: CacheCreationDelta;
+  cache_read_delta?: CacheReadDelta;
+  [k: string]: unknown;
+}
+/**
+ * This interface was referenced by `OctoCanvasWireProtocol`'s JSON-Schema
+ * via the `definition` "ToolCallFinished".
+ */
+export interface ToolCallFinished {
+  type?: Type31;
+  chat_id: ChatId11;
+  seq: Seq16;
+  tool_use_id: ToolUseId;
+  is_error?: IsError1;
+  result_preview: ResultPreview;
+  [k: string]: unknown;
+}
+/**
+ * This interface was referenced by `OctoCanvasWireProtocol`'s JSON-Schema
+ * via the `definition` "ToolCallStarted".
+ */
+export interface ToolCallStarted {
+  type?: Type32;
+  chat_id: ChatId12;
+  seq: Seq17;
+  tool_use_id: ToolUseId1;
+  tool_name: ToolName;
+  args: Args;
+  [k: string]: unknown;
+}
+export interface Args {
+  [k: string]: unknown;
+}
+/**
+ * The user agent (BE) decided to auto-answer the dev agent's most
+ * recent question. Informational frame for the FE — it shows the
+ * suggested reply with a countdown to `override_deadline_at`. If the
+ * user doesn't override, the orchestrator sends the suggested reply
+ * as a normal `UserMessage` to the bridge after the deadline.
+ *
+ * No round-trip needed at the bridge level — clarifications are just
+ * natural assistant text + next user message.
+ *
+ * This interface was referenced by `OctoCanvasWireProtocol`'s JSON-Schema
+ * via the `definition` "UserAgentSuggestion".
+ */
+export interface UserAgentSuggestion {
+  type?: Type33;
+  chat_id: ChatId13;
+  seq: Seq18;
+  suggestion_id: SuggestionId;
+  suggested_reply: SuggestedReply;
+  reason: Reason2;
+  override_deadline_at: OverrideDeadlineAt;
+  [k: string]: unknown;
+}
+/**
+ * Periodic acknowledgement of `(chat_id, ack_seq)`. The bridge
+ * drops persisted frames from its ring buffer up to `ack_seq` for the
+ * given chat.
+ *
+ * This interface was referenced by `OctoCanvasWireProtocol`'s JSON-Schema
+ * via the `definition` "Ack".
+ */
+export interface Ack {
+  type?: Type34;
+  chat_id: ChatId14;
+  ack_seq: AckSeq;
+  [k: string]: unknown;
+}
+/**
+ * This interface was referenced by `OctoCanvasWireProtocol`'s JSON-Schema
+ * via the `definition` "BridgePing".
+ */
+export interface BridgePing {
+  type?: Type35;
+  [k: string]: unknown;
+}
+/**
+ * Hard interrupt: bridge calls `client.interrupt()` then closes.
+ *
+ * This interface was referenced by `OctoCanvasWireProtocol`'s JSON-Schema
+ * via the `definition` "CancelChat".
+ */
+export interface CancelChat {
+  type?: Type36;
+  chat_id: ChatId15;
+  frame_id: FrameId;
+  [k: string]: unknown;
+}
+/**
+ * Reconciliation message the orchestrator sends in response to
+ * `Hello` — declares the canonical state for each chat the bridge
+ * reported. Used to converge after a reconnect.
+ *
+ * `last_seen_seq` tells the bridge "this is the highest seq I have
+ * persisted for this chat; resend anything beyond." A bridge with
+ * fewer frames than this can recover via Mongo replay (no-op locally).
+ *
+ * This interface was referenced by `OctoCanvasWireProtocol`'s JSON-Schema
+ * via the `definition` "ChatState".
+ */
+export interface ChatState {
+  type?: Type37;
+  chat_id: ChatId16;
+  last_seen_seq: LastSeenSeq;
+  claude_session_id?: ClaudeSessionId2;
+  [k: string]: unknown;
+}
+/**
+ * Soft pause: bridge stops feeding turns until `UserMessage` or
+ * `CancelChat` arrives. Slice 8 doesn't surface this in the UI but
+ * the wire variant is reserved.
+ *
+ * This interface was referenced by `OctoCanvasWireProtocol`'s JSON-Schema
+ * via the `definition` "PauseChat".
+ */
+export interface PauseChat {
+  type?: Type38;
+  chat_id: ChatId17;
+  frame_id: FrameId1;
+  [k: string]: unknown;
+}
+/**
+ * Reserved for v1+ user-scoped credentials (OAuth / BYOK). v1
+ * bridges receive this and ignore the contents — `extra="ignore"`
+ * keeps them forward-compatible. Declared in the union so the
+ * schema is stable.
+ *
+ * This interface was referenced by `OctoCanvasWireProtocol`'s JSON-Schema
+ * via the `definition` "SessionEnv".
+ */
+export interface SessionEnv {
+  type?: Type39;
+  chat_id: ChatId18;
+  frame_id: FrameId2;
+  env?: Env;
+  [k: string]: unknown;
+}
+export interface Env {
+  [k: string]: string;
+}
+/**
+ * User-sent (or user-agent-enhanced) prompt for a chat. First
+ * message: `claude_session_id=None` and the bridge spawns a fresh
+ * `ClaudeSDKClient`. Follow-ups: the bridge feeds text to the live
+ * client OR `--resume`s if cold.
+ *
+ * This interface was referenced by `OctoCanvasWireProtocol`'s JSON-Schema
+ * via the `definition` "UserMessage".
+ */
+export interface UserMessage {
+  type?: Type40;
+  chat_id: ChatId19;
+  frame_id: FrameId3;
+  text: Text3;
+  claude_session_id?: ClaudeSessionId3;
   [k: string]: unknown;
 }

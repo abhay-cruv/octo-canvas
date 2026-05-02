@@ -63,14 +63,9 @@ def _print_version() -> int:
 
 
 async def _idle_loop(settings: BridgeSettings) -> None:
+    """Slice 7 fallback when no orchestrator URL is set — just logs a
+    heartbeat. Slice 8's `_run_dialer` is what actually does work."""
     logger = get_logger("bridge.idle")
-    if settings.orchestrator_ws_url:
-        # Slice 7 doesn't dial yet; slice 8 will. Logging a warn here
-        # makes the eventual cutover obvious in dev logs.
-        logger.warning(
-            "bridge.idle.url_present_but_dialer_not_implemented",
-            url=settings.orchestrator_ws_url,
-        )
     while True:
         logger.info(
             "bridge.idle.heartbeat",
@@ -78,6 +73,75 @@ async def _idle_loop(settings: BridgeSettings) -> None:
             cli_version=baked_cli_version(),
         )
         await asyncio.sleep(_HEARTBEAT_INTERVAL_S)
+
+
+async def _run_dialer(settings: BridgeSettings) -> None:
+    """Slice 8: dial `/ws/bridge/{sandbox_id}` and run the bridge."""
+    from shared_models.wire_protocol import (
+        CancelChat,
+        OrchestratorToBridge,
+        UserMessage as WireUserMessage,
+    )
+
+    from bridge.chat_mux import ChatMux
+    from bridge.ws_client import WsClient
+
+    logger = get_logger("bridge.dialer")
+    credentials = _build_credentials(settings.claude_auth_mode)
+
+    ws_holder: dict[str, WsClient] = {}
+    mux_holder: dict[str, ChatMux] = {}
+
+    async def emit(chat_id: str, frame_type: str, payload: dict[str, object]) -> None:
+        ws = ws_holder.get("ws")
+        if ws is not None:
+            await ws.emit(chat_id, frame_type, payload)
+
+    async def handle_command(frame: OrchestratorToBridge) -> None:
+        mux = mux_holder.get("mux")
+        if mux is None:
+            return
+        if isinstance(frame, WireUserMessage):
+            await mux.handle_user_message(
+                chat_id=frame.chat_id,
+                text=frame.text,
+                claude_session_id=frame.claude_session_id,
+            )
+        elif isinstance(frame, CancelChat):
+            await mux.cancel(frame.chat_id)
+        # Ping / Ack / ChatState handled inside `WsClient`. PauseChat /
+        # SessionEnv are reserved variants — dropped on the floor in v1.
+
+    mux = ChatMux(
+        cwd=settings.work_root,
+        credentials=credentials,
+        emit=emit,
+        max_live_chats=settings.max_live_chats_per_sandbox,
+    )
+    mux_holder["mux"] = mux
+
+    ws_url = (
+        settings.orchestrator_ws_url.rstrip("/")
+        + f"/ws/bridge/{settings.sandbox_id}"
+    )
+    ws = WsClient(
+        url=ws_url,
+        bridge_token=settings.bridge_token,
+        bridge_version=BRIDGE_VERSION,
+        handle_command=handle_command,
+    )
+    ws_holder["ws"] = ws
+
+    logger.info(
+        "bridge.dialer.start",
+        url=ws_url,
+        sandbox_id=settings.sandbox_id,
+        max_live_chats=settings.max_live_chats_per_sandbox,
+    )
+    try:
+        await ws.run()
+    finally:
+        await mux.shutdown()
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -126,6 +190,12 @@ def main(argv: list[str] | None = None) -> int:
             ),
         )
         return 2
+    if settings.orchestrator_ws_url and not settings.sandbox_id:
+        get_logger("bridge.startup").error(
+            "bridge.config.missing_sandbox_id",
+            hint="ORCHESTRATOR_WS_URL requires SANDBOX_ID to build the WSS path.",
+        )
+        return 2
 
     get_logger("bridge.startup").info(
         "bridge.started",
@@ -135,7 +205,10 @@ def main(argv: list[str] | None = None) -> int:
         orchestrator_ws_url=settings.orchestrator_ws_url or "(unset — idling)",
     )
     try:
-        asyncio.run(_idle_loop(settings))
+        if settings.orchestrator_ws_url:
+            asyncio.run(_run_dialer(settings))
+        else:
+            asyncio.run(_idle_loop(settings))
     except KeyboardInterrupt:
         return 0
     return 0

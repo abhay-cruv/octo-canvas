@@ -11,6 +11,8 @@ enforced bridge-side, not here — the orchestrator just queues
 
 from __future__ import annotations
 
+import inspect
+
 import structlog
 from agent_config.llm_provider import LLMProvider
 from beanie import PydanticObjectId
@@ -144,6 +146,7 @@ async def add_follow_up(
     prompt: str,
     bridge_owner: BridgeOwner,
     user_agent_provider: LLMProvider | None,
+    user_agent_loop: object | None = None,
 ) -> tuple[ChatTurn, EnhancedPrompt | None]:
     if user.id is None or chat.user_id != user.id:
         raise ChatRunnerError("not_owner", "not your chat")
@@ -151,6 +154,20 @@ async def add_follow_up(
         raise ChatRunnerError(
             "chat_closed", f"chat is {chat.status} — start a new one"
         )
+    # User typing their own message cancels any pending user-agent
+    # auto-reply timer for this chat (slice 8 Phase 8b override path).
+    if user_agent_loop is not None and chat.id is not None:
+        cancel = getattr(user_agent_loop, "cancel_pending_suggestion", None)
+        if cancel is not None:
+            try:
+                result = cancel(chat.id)
+                if inspect.isawaitable(result):
+                    await result
+            except Exception as exc:  # noqa: BLE001
+                _logger.warning(
+                    "chat_runner.cancel_pending_suggestion_failed",
+                    error=str(exc)[:200],
+                )
     sandbox = await _user_sandbox(user)
 
     enhanced: EnhancedPrompt | None = None

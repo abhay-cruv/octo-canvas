@@ -47,7 +47,7 @@ class Goodbye(_BridgeFrame):
     reason: str
 
 
-class Pong(_BridgeFrame):
+class BridgePong(_BridgeFrame):
     type: Literal["bridge.pong"] = "bridge.pong"
 
 
@@ -93,7 +93,7 @@ class AssistantMessageDelta(_BridgeFrame):
     text: str
 
 
-class AssistantMessage(_BridgeFrame):
+class BridgeAssistantMessage(_BridgeFrame):
     """Final non-streaming assistant block emitted at turn close. The
     full text of one assistant message — used by the user agent (it
     only sees `important` events, of which this is one)."""
@@ -134,7 +134,7 @@ class ToolCallFinished(_BridgeFrame):
     result_preview: str
 
 
-class FileEditEvent(_BridgeFrame):
+class BridgeFileEditEvent(_BridgeFrame):
     """Emitted after `Write` or `Edit` tool calls succeed. `before_sha`
     is null for newly created files."""
 
@@ -174,20 +174,23 @@ class TokenUsageEvent(_BridgeFrame):
     cache_read_delta: int = 0
 
 
-class AskUserClarification(_BridgeFrame):
-    """The dev agent called the `ask_user_clarification` MCP tool.
-    Routed:
-      - if user agent enabled: to user agent first; it may auto-answer
-        with `AgentAnsweredClarification` (10s override countdown).
-      - else: directly to FE for manual reply.
-    5-min hard timeout → `ErrorEvent{kind:'clarification_timeout'}`."""
+class UserAgentSuggestion(_BridgeFrame):
+    """The user agent (BE) decided to auto-answer the dev agent's most
+    recent question. Informational frame for the FE — it shows the
+    suggested reply with a countdown to `override_deadline_at`. If the
+    user doesn't override, the orchestrator sends the suggested reply
+    as a normal `UserMessage` to the bridge after the deadline.
 
-    type: Literal["ask_user_clarification"] = "ask_user_clarification"
+    No round-trip needed at the bridge level — clarifications are just
+    natural assistant text + next user message."""
+
+    type: Literal["user_agent.suggestion"] = "user_agent.suggestion"
     chat_id: str
     seq: int
-    clarification_id: str
-    question: str
-    context: str | None = None
+    suggestion_id: str
+    suggested_reply: str
+    reason: str
+    override_deadline_at: str  # ISO-8601 UTC
 
 
 class ResultMessage(_BridgeFrame):
@@ -204,7 +207,7 @@ class ResultMessage(_BridgeFrame):
     error: str | None = None
 
 
-class ErrorEvent(_BridgeFrame):
+class BridgeErrorEvent(_BridgeFrame):
     """Bridge-side errors. `kind` lets the orchestrator route on
     well-known causes (`clarification_timeout`, `worktree_dirty_externally`,
     `cli_crash`, `cli_pin_mismatch`, ...)."""
@@ -219,21 +222,21 @@ class ErrorEvent(_BridgeFrame):
 BridgeToOrchestrator = Annotated[
     Hello
     | Goodbye
-    | Pong
+    | BridgePong
     | ChatStarted
     | ChatEvicted
     | StatusChange
     | AssistantMessageDelta
-    | AssistantMessage
+    | BridgeAssistantMessage
     | ThinkingBlock
     | ToolCallStarted
     | ToolCallFinished
-    | FileEditEvent
+    | BridgeFileEditEvent
     | ShellExecEvent
     | TokenUsageEvent
-    | AskUserClarification
+    | UserAgentSuggestion
     | ResultMessage
-    | ErrorEvent,
+    | BridgeErrorEvent,
     Field(discriminator="type"),
 ]
 
@@ -241,7 +244,7 @@ BridgeToOrchestrator = Annotated[
 # ── Orchestrator → Bridge (commands) ─────────────────────────────────
 
 
-class Ping(_BridgeFrame):
+class BridgePing(_BridgeFrame):
     type: Literal["bridge.ping"] = "bridge.ping"
 
 
@@ -283,19 +286,6 @@ class UserMessage(_BridgeFrame):
     claude_session_id: str | None = None
 
 
-class AnswerClarification(_BridgeFrame):
-    """Resolves a pending `ask_user_clarification` future on the
-    bridge. `source` is informational — the bridge doesn't care, but
-    the FE may surface "answered by user agent" vs "answered by you"."""
-
-    type: Literal["bridge.answer_clarification"] = "bridge.answer_clarification"
-    chat_id: str
-    frame_id: str
-    clarification_id: str
-    text: str
-    source: Literal["user", "user_agent"] = "user"
-
-
 class CancelChat(_BridgeFrame):
     """Hard interrupt: bridge calls `client.interrupt()` then closes."""
 
@@ -327,8 +317,7 @@ class SessionEnv(_BridgeFrame):
 
 
 OrchestratorToBridge = Annotated[
-    Ping | Ack | ChatState | UserMessage | AnswerClarification | CancelChat | PauseChat
-    | SessionEnv,
+    BridgePing | Ack | ChatState | UserMessage | CancelChat | PauseChat | SessionEnv,
     Field(discriminator="type"),
 ]
 

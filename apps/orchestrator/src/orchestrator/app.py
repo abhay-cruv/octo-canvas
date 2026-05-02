@@ -27,10 +27,13 @@ from .services.bridge_owner import BridgeOwner
 from .services.fs_watcher import FsWatcher
 from .services.reconciliation import Reconciler
 from .services.sandbox_manager import BridgeRuntimeConfig, SandboxManager
+from .services.user_agent.loop import UserAgentLoop
 from .ws import bridge as ws_bridge
+from .ws import chats as ws_chats
 from .ws import fs_watch as ws_fs_watch
 from .ws import pty as ws_pty
 from .ws import web as ws_web
+from .ws.chat_fanout import ChatFanout
 from .ws.task_fanout import TaskFanout
 
 
@@ -86,11 +89,30 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         await fanout.start()
     app.state.task_fanout = fanout
 
+    # Slice 8 Phase 8b: chat-keyed pub/sub fanout for `/ws/web/chats/{id}`.
+    chat_fanout: ChatFanout | None = None
+    if redis_handle is not None:
+        chat_fanout = ChatFanout(redis_handle)
+        await chat_fanout.start()
+    app.state.chat_fanout = chat_fanout
+
     # Slice 8: cross-instance bridge ownership singleton. Tolerates a
     # missing Redis (single-instance dev path).
     bridge_owner = BridgeOwner(redis=redis_handle)
     await bridge_owner.start()
     app.state.bridge_owner = bridge_owner
+
+    # Slice 8 Phase 8b: BE user-agent loop subscribes to `chat:*:ua`
+    # and emits `UserAgentSuggestion` + auto-reply timers. Tolerates
+    # missing Redis (no-op without it — passthrough chat path still
+    # works).
+    user_agent_loop = UserAgentLoop(
+        redis=redis_handle,
+        bridge_owner=bridge_owner,
+        anthropic_api_key=settings.anthropic_api_key.get_secret_value(),
+    )
+    await user_agent_loop.start()
+    app.state.user_agent_loop = user_agent_loop
 
     # Slice 7: clear any stale `activity` / `activity_started_at` /
     # `last_reconcile_error` left over from a prior process that died
@@ -137,6 +159,17 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
             except Exception as exc:
                 logger.warning("task_fanout.stop_failed", error=str(exc))
 
+        if chat_fanout is not None:
+            try:
+                await chat_fanout.stop()
+            except Exception as exc:
+                logger.warning("chat_fanout.stop_failed", error=str(exc))
+
+        try:
+            await user_agent_loop.stop()
+        except Exception as exc:
+            logger.warning("user_agent_loop.stop_failed", error=str(exc))
+
         try:
             await bridge_owner.stop()
         except Exception as exc:
@@ -179,6 +212,7 @@ app.include_router(ws_web.router, tags=["ws"])
 app.include_router(ws_pty.router, tags=["ws-pty"])
 app.include_router(ws_fs_watch.router, tags=["ws-fs-watch"])
 app.include_router(ws_bridge.router, tags=["ws-bridge"])
+app.include_router(ws_chats.router, tags=["ws-chats"])
 
 # Slice 8 §4: Anthropic reverse proxy. Production-required (it's how the
 # bridge talks to Anthropic without ever holding the real key) — NOT

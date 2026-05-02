@@ -40,23 +40,26 @@ class AgentEvent(Document):
     class Settings:
         name = Collections.AGENT_EVENTS
         indexes: ClassVar[list[IndexModel]] = [
-            # Sparse on task_id so chat-keyed rows don't violate the
-            # uniqueness on (task_id=None, seq).
+            # Partial-filter on task_id != null so chat-keyed rows
+            # (task_id=None) don't share the index space with
+            # slice-5a task-keyed rows. Sparse alone wouldn't work —
+            # Mongo treats explicit `null` as a value (only absent
+            # fields are excluded from a sparse index).
             IndexModel(
                 [("task_id", ASCENDING), ("seq", ASCENDING)],
                 unique=True,
-                sparse=True,
-                name="task_id_seq_unique_sparse",
+                partialFilterExpression={"task_id": {"$type": "objectId"}},
+                name="task_id_seq_unique_partial",
             ),
             IndexModel(
                 [("task_id", ASCENDING), ("created_at", ASCENDING)],
-                sparse=True,
-                name="task_id_created_at_sparse",
+                partialFilterExpression={"task_id": {"$type": "objectId"}},
+                name="task_id_created_at_partial",
             ),
-            # Slice 8 — chat-keyed replay. Sparse so task-keyed rows
-            # don't index here. Compound on `claude_session_id` so
-            # `--resume`-spawned sessions get distinct seq spaces from
-            # cold-spawned ones (matches `seq_counters` keying).
+            # Slice 8 — chat-keyed replay. Same partial-filter trick on
+            # chat_id. Compound on `claude_session_id` so post-resume
+            # sessions get distinct seq spaces from cold-spawned ones
+            # (matches `seq_counters` keying).
             IndexModel(
                 [
                     ("chat_id", ASCENDING),
@@ -64,12 +67,12 @@ class AgentEvent(Document):
                     ("seq", ASCENDING),
                 ],
                 unique=True,
-                sparse=True,
-                name="chat_session_seq_unique_sparse",
+                partialFilterExpression={"chat_id": {"$type": "objectId"}},
+                name="chat_session_seq_unique_partial",
             ),
             IndexModel(
                 [("chat_id", ASCENDING), ("created_at", ASCENDING)],
-                sparse=True,
-                name="chat_id_created_at_sparse",
+                partialFilterExpression={"chat_id": {"$type": "objectId"}},
+                name="chat_id_created_at_partial",
             ),
         ]

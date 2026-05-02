@@ -150,9 +150,13 @@ async def _allocate_chat_seq(
 # Slice 8 §5: the user-agent filter rule. Defined as a frozen set of
 # wire `type` discriminators so the routing layer can decide cheaply
 # without re-importing the payload classes.
+#
+# v1: there's no separate `ask_user_clarification` frame — clarifications
+# are just questions in the dev agent's `assistant.message` text. The
+# user agent reviews each finalized assistant message + result and
+# decides whether the dev agent ended on a question worth auto-answering.
 _USER_AGENT_IMPORTANT_TYPES: frozenset[str] = frozenset(
     {
-        "ask_user_clarification",
         "result",
         "assistant.message",  # final block, NOT `assistant.delta`
         "error",

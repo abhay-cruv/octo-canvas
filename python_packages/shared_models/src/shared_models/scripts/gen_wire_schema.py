@@ -13,7 +13,9 @@ import sys
 from typing import Any
 
 from shared_models.wire_protocol import (
+    BridgeToOrchestratorAdapter,
     FsWatchToWebAdapter,
+    OrchestratorToBridgeAdapter,
     OrchestratorToWebAdapter,
     PtyToWebAdapter,
     WebToOrchestratorAdapter,
@@ -38,11 +40,15 @@ def main() -> int:
     fs_watch = _hoist(FsWatchToWebAdapter.json_schema(), all_defs)
     pty_in = _hoist(WebToPtyAdapter.json_schema(), all_defs)
     pty_out = _hoist(PtyToWebAdapter.json_schema(), all_defs)
+    bridge_to_orch = _hoist(BridgeToOrchestratorAdapter.json_schema(), all_defs)
+    orch_to_bridge = _hoist(OrchestratorToBridgeAdapter.json_schema(), all_defs)
     all_defs["OrchestratorToWeb"] = out_to_web
     all_defs["WebToOrchestrator"] = web_to_out
     all_defs["FsWatchToWeb"] = fs_watch
     all_defs["WebToPty"] = pty_in
     all_defs["PtyToWeb"] = pty_out
+    all_defs["BridgeToOrchestrator"] = bridge_to_orch
+    all_defs["OrchestratorToBridge"] = orch_to_bridge
 
     blob = json.dumps(
         {
