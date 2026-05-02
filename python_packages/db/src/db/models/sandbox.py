@@ -54,6 +54,20 @@ class Sandbox(Document):
     # the activity banner together so the user sees what's in flight.
     activity: str | None = None
     activity_detail: str | None = None
+    # Slice 7: bridge wiring. The orchestrator mints a per-sandbox token
+    # at bridge-launch time (`secrets.token_urlsafe(32)`), pipes the
+    # plaintext into the bridge's env as `BRIDGE_TOKEN` via
+    # `exec_oneshot`, and persists only the SHA-256 hash here. The bridge
+    # presents the plaintext at the (slice-8) WSS handshake; the
+    # orchestrator hashes + compares. `None` until the reconciler's
+    # bridge-setup phase has launched the daemon for this sandbox.
+    bridge_token_hash: str | None = None
+    # Slice 7: fingerprint of what the reconciler's `installing_bridge`
+    # phase last installed (claude CLI version + nvm/pyenv/rbenv pins).
+    # When this matches the orchestrator's current pin set, the
+    # bridge-setup phase is a no-op. `None` until first install. When it
+    # mismatches (e.g. CLI version bump), the phase re-runs.
+    bridge_setup_fingerprint: str | None = None
     # Populated when status="failed". Sanitized — never contains tokens.
     failure_reason: str | None = None
     created_at: datetime = Field(default_factory=_now)

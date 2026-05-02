@@ -1,8 +1,10 @@
-# Slice 7 — Sprite image bake + runtime installation + agent_config bootstrap
+# Slice 7 — Bridge prereqs + runtime installation + agent_config bootstrap
 
-The "make the sandbox ready for the agent" slice. Slice 6 just shipped an IDE shell that proves the sandbox is reachable end-to-end (FS panel, file editor, terminal). Slice 7 makes it ready for **slice 8**'s agent runtime by baking everything the agent will need into the sprite image and installing language runtimes on demand. This is the slice that turns "we have a Linux box" into "we have a developer workstation pre-loaded for any of the user's repos."
+The "make the sandbox ready for the agent" slice. Slice 6 just shipped an IDE shell that proves the sandbox is reachable end-to-end (FS panel, file editor, terminal). Slice 7 makes it ready for **slice 8**'s agent runtime by extending the reconciler with bridge prerequisites (nvm/pyenv/rbenv + pinned `claude` CLI) and language-runtime installs.
 
-This slice ends at "**a user-connected repo's detected runtimes (Node X, Python Y) and system packages get installed in the sandbox; the sprite image carries Node ≥ 20, the pinned `claude` CLI binary, the bridge wheel, runtime managers (nvm/pyenv/etc), and a working bridge entrypoint that boots cleanly even though there's no orchestrator-side bridge handler yet (slice 8 adds that).**" It deliberately does **not** include the bridge↔orchestrator WSS handler, the Chat data model, or any agent invocation — those are slice 8.
+> **Note on the original brief.** This slice was drafted around a baked Docker image (`apps/bridge/Dockerfile.sprite` + a CI workflow + `image_tag` plumbing on the provider). Mid-slice we ripped that out — Sprites is already a VM and the existing reconciler is already where we install per-sandbox stuff. Everything that would have lived in the image now lives in the reconciler's idempotent `installing_bridge` phase. References to "image bake", `BRIDGE_IMAGE_TAG`, `Dockerfile.sprite`, and the `sprite-image.yml` workflow in earlier drafts are obsolete.
+
+This slice ends at "**a user-connected repo's detected runtimes (Node X, Python Y) and system packages get installed in the sandbox; the reconciler has installed the pinned `claude` CLI + nvm/pyenv/rbenv into the sprite once and skipped reinstall on subsequent passes; `python -m bridge --self-check` exits 0; the agent_config Protocol + dev-agent prompt template + tool allowlist are importable.**" It deliberately does **not** include the bridge wheel install / bridge daemon launch / WSS handler / Chat data model / agent invocation — those are slice 8.
 
 **Do not build features beyond this slice.** No `/ws/bridge/{sandbox_id}` handler. No `Chat` model. No `claude-agent-sdk` invocation. No agent UI wiring beyond what slice 6 already shipped (the dummy panel stays dummy until slice 8).
 
@@ -13,25 +15,29 @@ This slice ends at "**a user-connected repo's detected runtimes (Node X, Python 
 Three previously-deferred items collapse into this slice:
 
 1. **Slice-5b followup**: "Runtime install deferred to slice 6 — `nvm`/`pyenv`/etc owned by agent runtime" ([progress.md](../progress.md) "Slice-5b open followups"). That responsibility lands here, decoupled from agent runtime so we can verify it independently.
-2. **Sprite image bake** that the slice-8 agent depends on: Node + `claude` CLI + bridge wheel. The earlier slice-6 draft owned this; we moved it here so slice 8 just consumes a ready image.
+2. **Bridge prereqs (`claude` CLI + nvm/pyenv/rbenv)** that the slice-8 agent depends on. **Originally planned as a Docker image bake; rejected mid-slice** because Sprites is already a VM and the reconciler is already where we install per-sandbox stuff. Now an `installing_bridge` reconciler phase, idempotent via `Sandbox.bridge_setup_fingerprint`. Bridge wheel install + daemon launch defer to slice 8.
 3. **`python_packages/agent_config/`** scaffolding (currently empty per agent_context.md repo-map): the `ClaudeCredentials` Protocol, the system-prompt templates, the dev-agent prompt — all the static config the agent will need. Slice 7 fills the package; slice 8 consumes it.
 
 ---
 
 ## Calls baked in (push back if any are wrong)
 
-1. **Sprite image is the canonical artifact.** A new `apps/bridge/Dockerfile.sprite` is the source of truth for what's inside every sprite. Built and pushed in CI on every merge to main. Tagged with the git commit SHA + a `latest` floating tag. The orchestrator's `SandboxProvider.create()` accepts an image tag (slice 5b's `Sandbox` provision call gets a new `image_tag: str | None = None` arg defaulting to `BRIDGE_IMAGE_TAG` env var). Build steps:
-   - **Base**: Sprites' image expectation (Ubuntu LTS + passwordless sudo, per slice 5b's `apt-get` convention).
-   - **System**: `apt-get install -y curl ca-certificates git build-essential` plus the slice-3+5b `system_packages` baseline (`libpq-dev`, `libxml2-dev`, etc — derived from a static "v1 baseline" list curated in `apps/bridge/sprite-baseline-packages.txt`).
-   - **Python 3.12** + `uv` (already required by the bridge). `uv` installs to `/usr/local/bin/uv`.
-   - **Node ≥ 20** via NodeSource (`curl -fsSL https://deb.nodesource.com/setup_20.x | bash -` then `apt-get install -y nodejs`). Pin major version in the Dockerfile.
-   - **`claude` CLI** at a pinned version: `npm i -g @anthropic-ai/claude-code@<pinned>`. Pin recorded in `apps/bridge/CLAUDE_CLI_VERSION` (one-line file). Boot-time check: bridge runs `claude --version` and refuses to start on mismatch.
-   - **Runtime managers** preinstalled but no language versions (those install on demand per repo): `nvm` at `/usr/local/nvm`, `pyenv` at `/usr/local/pyenv`, `rbenv` at `/usr/local/rbenv`. Activated via `/etc/profile.d/octo-runtimes.sh` so `bash -l` and `bash -i` both pick them up. Verified by smoke test: `bash -l -c 'nvm --version && pyenv --version'` exits 0.
-   - **Bridge wheel**: built from `apps/bridge/` workspace (`uv build`), copied into image as `/opt/bridge/octo_bridge-<v>.whl`, installed via `uv pip install --system /opt/bridge/octo_bridge-<v>.whl`.
-   - **Entrypoint**: `python -m bridge.main`. The bridge is allowed to start with no orchestrator URL configured (in slice 7 it just logs "no `ORCHESTRATOR_WS_URL`, idling" and stays alive). Slice 8 flips this to "dial home, fail fast if unreachable."
-2. **Image build runs in CI on every main-branch merge.** New GitHub Actions workflow `.github/workflows/sprite-image.yml`. Steps: build the bridge wheel from a clean checkout, `docker build`, push to a registry (env-configured: `SPRITE_IMAGE_REGISTRY` — for v1 we use Sprites' image registry per their docs; if Sprites accepts external registries, GHCR is the fallback). Tag pattern: `sha-<short>` + `latest`. Failed builds block merge. Smoke test inside the build: `docker run --rm <image> bash -l -c 'claude --version && python -m bridge.main --self-check && nvm --version'` exits 0; `--self-check` is a new bridge flag that loads the package, checks env-var schema, and exits 0 (no WSS connect).
-3. **Runtime install is per-chat, on-demand, by the agent — not by the reconciler.** Slice 5b reconciler stays focused on `apt-get install` for `system_packages`. Language-runtime install (`nvm install 20.11.0`, `pyenv install 3.12.4`, etc.) happens **inside the agent's working session** in slice 8. Slice 7's job is to make sure the *managers* exist, the activation script is correct, and the agent has a documented procedure (in the dev-agent system prompt, see #5 below). **Do not build a server-side runtime-install endpoint.** The agent's `Bash` tool runs `nvm install <version>` itself when needed; the result goes into the worktree's `.nvmrc` etc. Persistence: `nvm`/`pyenv` install caches live under `/usr/local/nvm/versions/` and `/usr/local/pyenv/versions/` — survives sandbox hibernation, lost on `Reset` (slice 5b's `rm -rf /work` doesn't touch them; that's deliberate).
-4. **Introspection-derived `runtimes` field is the *target*, not auto-installed.** Slice 5b ships `RepoIntrospection.runtimes: list[Runtime]`. Slice 7 surfaces these on the dashboard repo card with a "Runtimes the agent will install on first chat" hint, but installs nothing eagerly. The dev-agent prompt (#5) tells the agent to consult `runtimes` and call `nvm install` / `pyenv install` once before any work that needs them. **No new server-side endpoint, no new state.** Just UI surfacing + prompt instruction.
+1. **Reconciler installs the bridge prerequisites — there is no image bake.** Sprites is already a VM, and the existing reconciler is already where we install per-sandbox stuff (apt packages, git config, runtimes). The phase is split into two scripts so the slow part runs in parallel with `git clone`:
+   - **`installing_bridge` (pre)** — fast (~30s on first sprite, near-zero on subsequent passes). `apt-get install` the baseline (`git`, `curl`, `wget`, `ca-certificates`, `gnupg`, `build-essential`, cpython build deps, common-stack natives), register the Adoptium apt repo (Java), and create the rust/go install roots. Sequential with `installing_packages` (both grab dpkg lock).
+   - **`installing_bridge` (rest)** — slow (~3-5 min on first sprite). Clones nvm/pyenv/rbenv at pinned refs into `/usr/local/{nvm,pyenv,rbenv}`. Installs system Node 20 (NodeSource) + the pinned `claude` CLI (`npm install -g @anthropic-ai/claude-code@<pin>`) + `rustup` (no toolchain). Writes the unified `/etc/profile.d/octo-runtimes.sh` (covers nvm + pyenv + rbenv + cargo env + the `/usr/local/go-current` symlink). **Runs concurrently with `git clone`** of the user's repos via `asyncio.create_task`; clones only need git from `pre`, no contention with `/usr/local/*`.
+   - **Idempotency** at both the reconciler level (skip both scripts when `Sandbox.bridge_setup_fingerprint` matches) and the shell level (every step is a no-op when its target is already on disk).
+   - **Pins** rotate `BRIDGE_SETUP_FINGERPRINT` (`nvm=…;pyenv=…;rbenv=…;claude=<pin>`); existing sprites pick up new pins on the next reconcile pass without restart.
+2. **Bridge daemon install + launch land in slice 8** (when there's actually a `/ws/bridge/{sandbox_id}` to dial). Slice 7 ships the bridge code in `apps/bridge/`, the `--self-check` smoke, and the `ClaudeCredentials` Protocol — but the reconciler does NOT yet build the bridge wheel + push it into the sprite + launch the daemon. That belongs alongside the WSS handler in slice 8 so we can token-rotate at launch and verify the handshake end-to-end in one slice.
+3. **Runtime install is reconciler-driven, eager, server-side, all 6 standard runtimes.** Slice 5b reconciler already runs `apt-get install` for `system_packages`; slice 7 widens it with a sibling phase `installing_runtimes` that installs each `Runtime` from `RepoIntrospection.runtimes`:
+   - **Node**: `nvm install <ver>`
+   - **Python**: `pyenv install -s <ver>` (with retry-after-`git pull` for versions postdating the pyenv pin)
+   - **Ruby**: `rbenv install -s <ver>` (same retry pattern via the `ruby-build` plugin)
+   - **Java**: `apt-get install -y temurin-<major>-jdk` from the Adoptium repo registered in `installing_bridge` pre. Multiple majors coexist as separate packages under `/usr/lib/jvm/`.
+   - **Rust**: `rustup toolchain install <ver> --profile minimal` (rustup self-updates, no retry pattern needed)
+   - **Go**: download the prebuilt amd64 tarball from `go.dev/dl/`, extract to `/usr/local/go-versions/<ver>/`, and re-point `/usr/local/go-current` at the highest installed version. The activation script puts `go-current/bin` on PATH.
+
+   Runs once per pass, deduped across repos. Best-effort: failure logs + sets `Repo.runtime_install_error`, does **not** block clone. Persistence: install caches live under `/usr/local/{nvm,pyenv,rbenv}/versions/`, `/usr/lib/jvm/`, `/usr/local/go-versions/`, and `/usr/local/{rustup,cargo}/` — all survive sandbox hibernation and Reset (slice 5b's `rm -rf /work` doesn't touch `/usr/local`).
+4. **Introspection-derived `runtimes` field is auto-installed.** Slice 5b ships `RepoIntrospection.runtimes: list[Runtime]`. Slice 7 (a) surfaces them on the dashboard repo card with an "Agent setup" banner showing what's installed/installing, and (b) installs them eagerly via the reconciler (call #3 above). The dev-agent prompt (#5) still mentions the runtimes (so the agent knows which `nvm use <ver>` / `pyenv shell <ver>` to activate per shell), but does **not** instruct it to install — they are already on disk by the time the agent boots. If the agent encounters a missing version (e.g. introspection missed a sub-repo), its `Bash` tool can still `nvm install <ver>` ad-hoc; that's a fallback, not the steady-state path.
 5. **`python_packages/agent_config/` filled in** with everything slice 8 will consume statically. New layout:
    ```
    python_packages/agent_config/
@@ -53,21 +59,59 @@ Three previously-deferred items collapse into this slice:
    - `src/bridge/config.py` — pydantic-settings model for env vars. Single source of truth for `BRIDGE_TOKEN`, `ORCHESTRATOR_WS_URL`, `MAX_LIVE_CHATS_PER_SANDBOX`, `IDLE_AFTER_DISCONNECT_S`, `CLAUDE_AUTH_MODE`.
    - `tests/test_self_check.py` — smoke test for `--self-check`.
    No WSS client, no MCP, no session mux — those are slice 8.
-7. **Sprite-provisioning passes the new env vars and image tag.** Slice 5b's `SandboxProvider.create()` widens to accept `image_tag: str | None`. Slice 7 widens it again (callsite-only): orchestrator's `SandboxManager.get_or_create` mints a `BRIDGE_TOKEN` (256-bit token, `secrets.token_urlsafe(32)`), hashes it (`Sandbox.bridge_token_hash`), and passes the plaintext + `ORCHESTRATOR_WS_URL` + `ANTHROPIC_API_KEY` (from orchestrator env) + `CLAUDE_AUTH_MODE="platform_api_key"` into the sprite's env at provision time. **The bridge does not connect yet** (`ORCHESTRATOR_WS_URL` may even be left blank in slice 7 to avoid noise; bridge will idle), but the env wiring is verified. Slice 8 flips on the WSS handler and the bridge connects.
-8. **Sandbox doc widening** (subset of [slice8.md](slice8.md) call #11; the rest lands in slice 8): `bridge_token_hash: str | None`, `bridge_image_tag: str | None`. NOT yet adding `bridge_version`, `bridge_connected_at`, or `bridge_last_acked_seq_per_chat` — those are slice 8's because they require a running connection.
-9. **Frontend repo card surfaces `runtimes` + the "agent will install on first chat" hint.** Replaces the slice-5b "detected runtimes" pill row with a small banner that says "Agent will install: Node 20, Python 3.12 (cached after first use)" or similar. Editable overrides already exist (slice-5b `IntrospectionOverrides.runtimes`).
+6b. **The Anthropic API key NEVER enters the sprite.** Hard slice-7 invariant; slice 8's bridge-launch + proxy implementation must respect it. The user has terminal + agent-Bash access inside the sprite, so anything readable from process env / `/proc/<pid>/environ` / on-disk config is presumed leaked. The design (verified against the `claude` CLI v2.1.118 binary's env-var parsing 2026-05; sources at end):
+
+   **Orchestrator side (slice 7 — shipped):**
+   - `Settings.anthropic_api_key` is `pydantic.SecretStr` — masks on every `repr` / `model_dump` / log line. Same treatment for `auth_secret`, `github_oauth_client_secret`, `sprites_token`. Read with `.get_secret_value()` only at the call site that needs the plaintext.
+   - `BridgeRuntimeConfig._anthropic_api_key` (leading underscore + custom `__repr__` mask) holds the secret for the slice-8 proxy route. `env_for(...)` deliberately omits it from the dict it builds for the bridge.
+   - `env_for(sandbox_id, bridge_token)` returns these env vars (and only these — audited by `test_env_for_never_leaks_real_anthropic_key`):
+     - `CLAUDE_CODE_API_BASE_URL = <orch>/api/_internal/anthropic-proxy/<sandbox_id>` — the **priority** base-URL var the CLI v2.1.118 checks first (falls back to `ANTHROPIC_BASE_URL`, then `api.anthropic.com`). Hedges against the known interactive-mode regression where `ANTHROPIC_BASE_URL` alone got ignored ([anthropics/claude-code#36998](https://github.com/anthropics/claude-code/issues/36998)).
+     - `ANTHROPIC_BASE_URL = <same proxy URL>` — fallback for older CLI builds and the underlying Anthropic SDKs.
+     - `ANTHROPIC_AUTH_TOKEN = <bridge_token>` — Bearer-mode auth (CLI sends `Authorization: Bearer <bridge_token>`). Per the LiteLLM convention; takes priority over `ANTHROPIC_API_KEY` in the CLI's auth resolution. We deliberately omit `ANTHROPIC_API_KEY` to keep the auth shape unambiguous.
+
+   **Sprite side (slice 8 — to implement):** the `claude-agent-sdk`-spawned CLI subprocess inherits these vars from the bridge process. CLI builds requests at `<base_url>/v1/messages` etc. with `Authorization: Bearer <bridge_token>` — that landed at the orchestrator proxy.
+
+   **Proxy route (slice 8 — to implement at `/api/_internal/anthropic-proxy/{sandbox_id}/{path:path}`):**
+   - **Auth**: read `Authorization: Bearer <token>`, sha256, `hmac.compare_digest` against `Sandbox(sandbox_id).bridge_token_hash`. 401 on mismatch. Constant-time compare prevents token-prefix timing leaks.
+   - **Header swap**: strip `Authorization` from the inbound request. Set outbound `x-api-key: <real_key>` from `BridgeRuntimeConfig._anthropic_api_key`. Anthropic's API expects `x-api-key` for direct API-key auth; using Bearer outbound would 401 (Anthropic's API rejects OAuth-style Bearer for non-OAuth tokens).
+   - **Async streaming end-to-end** — the CLI uses SSE for `messages.stream` + agent token streaming, so this is the **hot path** and must not block the event loop:
+     - Single shared `httpx.AsyncClient(http2=True, timeout=httpx.Timeout(connect=10, read=600, write=60, pool=10))` lives at `app.state.anthropic_proxy_client`, started in `app.lifespan`, closed on shutdown. Connection pool reuse → no per-call TLS handshake.
+     - Inbound body forwarded as `content=request.stream()` (Starlette async iterator). **Never** `await request.body()` / `await request.json()` — those buffer.
+     - Upstream call: `req = client.build_request(...); upstream = await client.send(req, stream=True)`. **Never** `client.post(...)` / `await response.aread()`.
+     - Response relayed via `async def relay(): try: async for chunk in upstream.aiter_raw(): yield chunk; finally: await upstream.aclose()` wrapped in `fastapi.responses.StreamingResponse(relay(), status_code=upstream.status_code, headers=filter_outbound(upstream.headers), background=BackgroundTask(upstream.aclose))`. The `try/finally` ensures client disconnect cancels the upstream HTTP/2 stream cleanly so Anthropic stops billing.
+     - SSE-friendly response headers: pass through upstream's `content-type: text/event-stream` verbatim; **add** `Cache-Control: no-cache` and `X-Accel-Buffering: no` so any nginx/CDN in front of the orchestrator doesn't buffer SSE chunks.
+   - **Header filtering**: drop hop-by-hop headers (RFC 7230 §6.1) on both directions: `connection`, `keep-alive`, `proxy-authenticate`, `proxy-authorization`, `te`, `trailers`, `transfer-encoding`, `upgrade`, `host`, `content-length`. Plus `authorization` and `x-api-key` on inbound (we set them) and `x-api-key` on outbound (Anthropic doesn't echo it but defense-in-depth).
+   - **Path & query**: forward `path` verbatim; preserve `request.url.query` so e.g. `?beta=true` survives.
+   - **Methods**: allow `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `OPTIONS`. Anthropic only uses POST today but allowing the standard set future-proofs.
+   - **Cancellation propagation**: if the bridge disconnects, FastAPI cancels the route handler → the `async for` raises → `finally: aclose()` runs → the upstream HTTP/2 stream is RST_STREAM'd → Anthropic stops generating tokens.
+   - **Per-sandbox quota / rate limit**: defer to a slice-8 followup but design with a hook (e.g. `await rate_limiter.acquire(sandbox_id)` before `client.send`).
+   - **Error mapping**: upstream 5xx + `httpx.RequestError` → 502. Real-key missing on the orchestrator → 503. Validation failure → 401. Never echo upstream error bodies that might mention key prefixes.
+   - **Async-correctness audit**: nothing in the proxy module imports `requests` / `urllib` / `time.sleep`. Any sync I/O is a regression. The tests exercise both happy-path streaming (assert chunks arrive incrementally, not buffered) and cancellation (assert `upstream.aclose` ran on disconnect).
+
+   **Test surface (slice 8 — to add):** streaming chunks arrive ≤100ms after upstream emits each (uses an in-process fake-Anthropic SSE generator), 401 on token mismatch, 503 on missing real key, real-key string never appears in any response header/body sent back to the bridge, header filter drops hop-by-hop, client disconnect triggers `aclose`.
+
+   **Sources verified 2026-05:**
+   - [`claude-code` v2.1.118 env-var reference (gist)](https://gist.github.com/unkn0wncode/f87295d055dd0f0e8082358a0b5cc467) — confirms `CLAUDE_CODE_API_BASE_URL` is the priority var, `ANTHROPIC_AUTH_TOKEN` is Bearer-mode auth taking priority over `ANTHROPIC_API_KEY`.
+   - [`anthropics/claude-code#36998`](https://github.com/anthropics/claude-code/issues/36998) — interactive-mode regression on `ANTHROPIC_BASE_URL`; closed but exact fix unverified, hence the dual-var hedge.
+   - [LiteLLM Claude Code tutorial](https://docs.litellm.ai/docs/tutorials/claude_responses_api) — established proxy pattern using `ANTHROPIC_AUTH_TOKEN` + `Authorization: Bearer`.
+   - [HTTPX async streaming](https://www.python-httpx.org/async/) + [FastAPI streaming discussion](https://github.com/fastapi/fastapi/discussions/9599) — canonical `aiter_raw` + `StreamingResponse` + `BackgroundTask(aclose)` pattern.
+   - [Anthropic auth header semantics](https://github.com/anthropics/anthropic-sdk-csharp/issues/47) — `x-api-key` for API keys, `Authorization: Bearer` for OAuth/proxy tokens; `x-api-key` takes precedence when both are present.
+
+7. **`SandboxProvider.create()` stays narrow.** Original brief widened it with `image_tag` + `env`; **dropped** mid-slice when the image bake was rejected. The signature is back to `create(*, sandbox_id, labels)` as in slice 4. Bridge env (`BRIDGE_TOKEN`, `ANTHROPIC_API_KEY`, etc.) is delivered at slice-8 bridge-launch time via `exec_oneshot` env overlay; `BridgeRuntimeConfig.env_for(sandbox_id, bridge_token)` is the helper that builds the dict. Token minting moves with it — no longer at provision; the reconciler/launcher mints `secrets.token_urlsafe(32)` when it spawns the daemon, persists SHA-256 on `Sandbox.bridge_token_hash`, and rotates on every relaunch.
+8. **Sandbox doc widening:** `bridge_token_hash: str | None` (set at bridge-launch time, slice 8) + `bridge_setup_fingerprint: str | None` (set when `installing_bridge` succeeds; comparison key for next-pass skip). NOT adding `bridge_image_tag` (no image), `bridge_version`, `bridge_connected_at`, or `bridge_last_acked_seq_per_chat` — those are slice 8's because they require a running connection.
+9. **Frontend repo card surfaces `runtimes` + an "Agent setup" banner.** Replaces the slice-5b "detected runtimes" pill row with a small banner driven by `Repo.runtime_install_error`: `Installed: Node 20.x, Python 3.12.x` when null; `Install failed: …` (red) when not. Empty runtimes → "agent will use system defaults". Editable overrides already exist (slice-5b `IntrospectionOverrides.runtimes`).
 10. **Verification**. Slice 7 ships green when:
-    - The image builds in CI on a clean checkout.
-    - `docker run --rm <image> bash -l -c 'claude --version && python -m bridge.main --self-check'` exits 0.
-    - Provisioning a sandbox in dev (with `BRIDGE_IMAGE_TAG` pointing at the new image) results in a running sprite where `provider.exec_oneshot(['bash', '-l', '-c', 'nvm --version && claude --version'])` exits 0.
-    - The bridge process inside the sprite is alive and emitting heartbeat logs (no WSS connection — that's expected in slice 7).
-    - `python_packages/agent_config/` imports cleanly, `PlatformApiKeyCredentials().env()` returns `{"ANTHROPIC_API_KEY": "..."}` when `ANTHROPIC_API_KEY` is set.
+    - `python_packages/agent_config/` imports cleanly; `PlatformApiKeyCredentials().env()` returns `{"ANTHROPIC_API_KEY": "..."}` when `ANTHROPIC_API_KEY` is set.
+    - `python -m bridge --self-check` exits 0 from a clean dev checkout.
+    - Provisioning a sandbox in dev results in a running sprite. After the reconciler's `installing_bridge` phase, `provider.exec_oneshot(['bash', '-l', '-c', 'claude --version && nvm --version && pyenv --version'])` exits 0; `Sandbox.bridge_setup_fingerprint` is populated.
+    - Connecting a repo with `runtimes=[node@20]` causes the reconciler to run `nvm install 20` and the activity banner to flash `installing_runtimes`; subsequent `bash -l -c 'nvm use 20 && node --version'` exits 0.
+    - The dashboard repo card shows the "Agent setup" banner. `Repo.runtime_install_error` round-trips through the API.
 
 ---
 
 ## Context from slice 5b (and slice 6)
 
-- **Slice 5b**: passwordless sudo, `apt-get` deduped, fixed git config at `/etc/octo-canvas/gitconfig` via `GIT_CONFIG_GLOBAL`. Slice 7's image preserves this; the Dockerfile sources/installs into the same paths the reconciler expects.
+- **Slice 5b**: passwordless sudo, `apt-get` deduped, fixed git config at `/etc/octo-canvas/gitconfig` via `GIT_CONFIG_GLOBAL`. Slice 7 layers on top — the new `installing_bridge` phase uses the same `sudo -n` convention and writes to the same paths.
 - **Slice 5b**: `RepoIntrospection.runtimes` + `system_packages` already detected. Slice 7 *uses* runtimes (banner UI + dev-agent prompt input) and *consumes* `system_packages` baked into the image (a static curated baseline; per-repo additions still install via reconciler).
 - **Slice 6**: IDE shell shipped — file tree, file editor, terminal. Slice 7 doesn't change them. The terminal is the manual escape hatch for verifying nvm/pyenv work; the user can `nvm install 20` from the terminal in slice 6 to prove the pipeline before slice 8 even ships.
 - **Slice 5a**: WS plumbing for `/ws/web/...`. Slice 7 doesn't touch it.
@@ -79,35 +123,53 @@ Three previously-deferred items collapse into this slice:
 
 After this slice:
 
-1. CI builds and pushes the sprite image on every main-branch merge.
-2. A developer can `docker run` the image locally and `bash -l -c 'claude --version'` works.
-3. Provisioning a fresh sandbox via `POST /api/sandboxes` boots a sprite from the new image; `bridge --self-check` passes inside it; the bridge process idles cleanly.
-4. The web dashboard's repo card shows the "agent will install" banner driven by `runtimes` introspection.
-5. From the slice-6 terminal, the user can run `nvm install 20 && node --version` and it works (proves runtime managers are wired).
-6. `python_packages/agent_config/` is importable; `PlatformApiKeyCredentials` resolves env when `ANTHROPIC_API_KEY` is set.
+1. The reconciler's `installing_bridge` phase installs `claude` CLI + nvm/pyenv/rbenv into a freshly-provisioned sprite. Idempotent: subsequent reconciles skip when `Sandbox.bridge_setup_fingerprint` matches.
+2. Provisioning a fresh sandbox via `POST /api/sandboxes` ends with a sprite where `provider.exec_oneshot(['bash','-l','-c','claude --version && nvm --version && pyenv --version'])` exits 0.
+3. The web dashboard's repo card shows the "Agent setup" banner driven by `Repo.runtime_install_error`.
+4. From the slice-6 terminal, the user can run `nvm install 20 && node --version` and it works.
+5. `python_packages/agent_config/` is importable; `PlatformApiKeyCredentials` resolves env when `ANTHROPIC_API_KEY` is set.
+6. `python -m bridge --self-check` exits 0 from a clean dev checkout (no in-sprite daemon launch yet — that's slice 8).
 7. `pnpm typecheck && pnpm lint && pnpm test && pnpm build` all green.
-8. Bridge `pytest` (just `--self-check` smoke for now) green.
 
 ---
 
 ## What to build
 
-### 1. Sprite image — `apps/bridge/Dockerfile.sprite`
+### 1. Reconciler `installing_bridge` phase — `apps/orchestrator/src/orchestrator/services/reconciliation.py`
 
-New file. Multi-stage: builder stage builds the bridge wheel via `uv build`; final stage installs system deps + Node + CLI + runtime managers + the wheel. Documented base assumptions (Sprites' image expectation; `sudo -n` available).
+Two methods on `Reconciler`, both gated by `Sandbox.bridge_setup_fingerprint == BRIDGE_SETUP_FINGERPRINT`:
 
-Pin the Node major in the Dockerfile and the CLI version in `apps/bridge/CLAUDE_CLI_VERSION`. Pin pyenv/nvm/rbenv to specific commits (security + reproducibility).
+- **`_bridge_setup_pre(sandbox) -> bool`** runs `_BRIDGE_SETUP_PRE` (apt baseline + Adoptium repo + rust/go install roots) via `exec_oneshot`. Sequential with `installing_packages` because both touch dpkg. Returns `True` on clean exit so the caller knows clones are safe to start.
+- **`_bridge_setup_rest(sandbox)`** runs `_BRIDGE_SETUP_REST` (nvm/pyenv/rbenv at pinned tags into `/usr/local/{nvm,pyenv,rbenv}`, system Node 20 via NodeSource, `npm install -g @anthropic-ai/claude-code@<pin>`, rustup at `/usr/local/{rustup,cargo}`, and the unified `/etc/profile.d/octo-runtimes.sh`). Kicked off as `asyncio.create_task` after `_bridge_setup_pre` returns; clones run concurrently.
 
-### 2. CI workflow — `.github/workflows/sprite-image.yml`
+The fingerprint is the colon-joined string of `nvm/pyenv/rbenv/claude` pins; bumping any pin re-triggers install on the next pass. On non-zero exit or `SpritesError`, log + leave fingerprint unset so the next pass retries; clones still proceed.
 
-Trigger on `push: branches: [main]` and `workflow_dispatch`. Steps:
-1. Checkout.
-2. Build bridge wheel (`uv build apps/bridge/`).
-3. `docker build -t <registry>/octo-sprite:sha-${SHA::8} -t <registry>/octo-sprite:latest -f apps/bridge/Dockerfile.sprite .`.
-4. In-build smoke test (RUN line in Dockerfile): `bash -l -c 'claude --version && python -m bridge.main --self-check && nvm --version && pyenv --version'`.
-5. Push (gated on registry creds being available; PRs build but don't push).
+`_RUNTIME_INSTALL_CMDS` covers all six `RuntimeName` values:
 
-Output: image SHA tag committed back to `apps/bridge/CURRENT_IMAGE.txt` for traceability (or just relied on as a registry artifact).
+- **node** → `nvm install <ver>`
+- **python** → `pyenv install -s <ver>` (with `git pull` retry for versions postdating the pin)
+- **ruby** → `rbenv install -s <ver>` (same retry via `ruby-build`)
+- **java** → `apt-get install temurin-<major>-jdk` (Adoptium repo registered in pre)
+- **rust** → `rustup toolchain install <ver> --profile minimal --no-self-update`
+- **go** → curl tarball from `go.dev/dl/go<ver>.linux-amd64.tar.gz` to `/usr/local/go-versions/<ver>/`; re-point `/usr/local/go-current`
+
+Pin file: `apps/bridge/CLAUDE_CLI_VERSION` (one-line); the reconciler reads it at module import. nvm/pyenv/rbenv pins are constants at the top of [`reconciliation.py`](../../apps/orchestrator/src/orchestrator/services/reconciliation.py).
+
+### 2. Activity labels rendered human-readable in the UI
+
+`Sandbox.activity` stays a stable snake_case wire ID (logs, tests, persisted state all rely on it). The dashboard's [`SandboxPanel`](../../apps/web/src/components/SandboxPanel.tsx) keeps an `ACTIVITY_LABELS` map that translates each value to a short status string:
+
+| activity | UI label |
+| --- | --- |
+| `configuring_git` | "Setting up git…" |
+| `installing_bridge` | "Setting up sandbox tools…" |
+| `installing_packages` | "Installing system packages…" |
+| `installing_runtimes` | "Installing language runtimes…" |
+| `cloning` | "Cloning repository…" |
+| `checkpointing` | "Snapshotting clean state…" |
+| `pausing` | "Releasing compute (waiting for idle)…" |
+
+Any unknown future activity falls back to the raw value so we never silently hide state.
 
 ### 3. `agent_config` package — `python_packages/agent_config/`
 
@@ -128,38 +190,32 @@ Per call #6. Files:
 - Config via pydantic-settings: required `BRIDGE_TOKEN`, optional `ORCHESTRATOR_WS_URL` (no error if blank in slice 7), optional bounds (`MAX_LIVE_CHATS_PER_SANDBOX=5`, `IDLE_AFTER_DISCONNECT_S=300`, `CLAUDE_AUTH_MODE="platform_api_key"`).
 - Default loop without `ORCHESTRATOR_WS_URL`: log every 60s `bridge: idle (no ORCHESTRATOR_WS_URL configured)`, sleep, repeat. Slice 8 replaces this with the WSS dialer.
 
-### 5. Sandbox provisioning — `apps/orchestrator/src/orchestrator/services/sandbox_manager.py`
+### 5. Bridge runtime config — `apps/orchestrator/src/orchestrator/services/sandbox_manager.py`
 
-Widen `get_or_create` to:
-1. Mint `bridge_token = secrets.token_urlsafe(32)`; hash with sha256; persist `Sandbox.bridge_token_hash`.
-2. Pass into `provider.create()` env: `BRIDGE_TOKEN`, `ORCHESTRATOR_WS_URL` (from `ORCHESTRATOR_BASE_URL` + `/ws/bridge/{sandbox_id}`; may be blank in slice 7 dev), `ANTHROPIC_API_KEY` (from orchestrator env), `CLAUDE_AUTH_MODE="platform_api_key"`, `MAX_LIVE_CHATS_PER_SANDBOX`, `IDLE_AFTER_DISCONNECT_S`.
-3. Pass `image_tag = settings.bridge_image_tag` (new `Settings` field, default `"latest"`).
+`SandboxManager.get_or_create` is **unchanged** structurally — slice 4's signature stands. Slice 7 only adds `BridgeRuntimeConfig` (a frozen dataclass) + `mint_bridge_token()` + `_hash_bridge_token()` helpers used at slice-8 bridge-launch time. `BridgeRuntimeConfig.env_for(sandbox_id, bridge_token)` builds the env dict (`BRIDGE_TOKEN`, `ORCHESTRATOR_WS_URL`, `ANTHROPIC_API_KEY`, `CLAUDE_AUTH_MODE`, `MAX_LIVE_CHATS_PER_SANDBOX`, `IDLE_AFTER_DISCONNECT_S`) so the same construction works whether slice 8 launches the bridge from the reconciler or a dedicated supervisor service.
 
-### 6. Provider widening — `python_packages/sandbox_provider/`
-
-Add `image_tag: str | None` to `SandboxProvider.create()`'s signature. `SpritesProvider` forwards it to the Sprites SDK's spawn call (Sprites supports a `image` parameter per their docs). `MockSandboxProvider` records it for assertion in tests.
+### 6. (Removed: was "Provider widening with image_tag"). `SandboxProvider.create()` keeps the slice-4 `(sandbox_id, labels)` signature.
 
 ### 7. Frontend repo card — `apps/web/src/components/RepoCard.tsx` (or wherever the introspection pills live)
 
 Replace the slice-5b "detected runtimes" pill row with a banner:
 - Title: "Agent setup"
-- Body: "Will install on first chat: Node 20.x, Python 3.12.x" (joined from `repo.introspection.runtimes`).
+- Body: "Installing: Node 20.x, Python 3.12.x" while the reconciler's `installing_runtimes` phase is in flight; "Installed: Node 20.x, Python 3.12.x" once the phase has succeeded for this repo (joined from `repo.introspection.runtimes`).
 - Edit button hooks the existing slice-5b override flow.
 
 If `runtimes` is empty: show "No language runtimes detected — agent will use system defaults".
 
 ### 8. Tests
 
-- Bridge unit tests (`apps/bridge/tests/`): `--self-check` exits 0; missing `BRIDGE_TOKEN` exits non-zero with helpful error.
+- Bridge unit tests (`apps/bridge/tests/`): `--self-check` exits 0 with no env; `BRIDGE_TOKEN` is required only when `ORCHESTRATOR_WS_URL` is set; `--version` prints bridge + baked CLI versions.
 - Agent_config unit tests: `PlatformApiKeyCredentials.env()` returns the right dict; missing env raises; `render_dev_agent_prompt` produces stable output for a fixture introspection.
-- Orchestrator tests: `SandboxManager.get_or_create` writes `bridge_token_hash` (verified non-empty, 64 hex chars); env vars passed to provider include `BRIDGE_TOKEN`.
-- CI: image-build smoke is its own GitHub Actions test; not in pytest.
+- Orchestrator tests: `BridgeRuntimeConfig.env_for(...)` builds the right env dict; `mint_bridge_token` + `_hash_bridge_token` are stable; reconciler `installing_bridge` runs once and skips when fingerprint matches; reconciler `installing_runtimes` dedupes across repos and records per-repo failures on `Repo.runtime_install_error`.
 - Manual smoke (documented): provision a sandbox; from the slice-6 terminal run `claude --version`, `nvm install 20`, verify they work.
 
 ### 9. Docs
 
-- Update [docs/agent_context.md](../agent_context.md) gotchas: add a row noting the sprite image bake + version-pin location (`apps/bridge/CLAUDE_CLI_VERSION`).
-- Update [docs/engineering.md](../engineering.md) with the sprite-image-rebuild recipe (when do you bump the CLI version, how do you redeploy).
+- Update [docs/agent_context.md](../agent_context.md) gotchas: add rows for the reconciler `installing_bridge` phase + `Sandbox.bridge_setup_fingerprint` + `apps/bridge/CLAUDE_CLI_VERSION` pin location.
+- Update [docs/engineering.md](../engineering.md) with the bridge-pin-bump recipe (bump `CLAUDE_CLI_VERSION` → reconciler installs the new pin on the next pass; no image rebuild).
 - Update [docs/progress.md](../progress.md) row.
 - Update [docs/Contributions.md](../Contributions.md) entry.
 
@@ -180,14 +236,12 @@ If `runtimes` is empty: show "No language runtimes detected — agent will use s
 
 ## Risks
 
-1. **Sprites' image-registry constraints.** Sprites may require images from their own registry / specific format. Verify before writing CI: confirm with [docs/sprites/v0.0.1-rc43/python.md](../sprites/v0.0.1-rc43/python.md) and Sprites support if unclear. Fallback: bake at the `cmd` level instead of image (run install scripts via `exec_oneshot` on first boot) — slower but works without a registry. **Decide at slice kickoff.**
-2. **CLI binary version drift between dev (laptop) and sprite.** Boot-time `claude --version` check refuses to start on mismatch. Pin in `CLAUDE_CLI_VERSION`; bump = image rebuild.
-3. **Image bloat.** nvm + pyenv + rbenv + Node + Python 3.12 + apt baseline = a few hundred MB. Acceptable for v1; revisit if cold-spawn latency bites.
-4. **Runtime managers conflict with `apt-get`-installed Node/Python.** Don't install Node from `apt` — use NodeSource only. Don't install Python from `apt` outside what Ubuntu ships. nvm/pyenv add to PATH via the activation script.
-5. **`/etc/profile.d/octo-runtimes.sh` only runs in login shells.** Some Sprites Exec invocations use `bash -c`, not `bash -l`. Document the gotcha; the slice-5b `exec_oneshot` already passes `bash -l -c` per convention. The `claude` CLI's own `Bash` tool should run with login shells (slice 8 verifies).
-6. **CI registry creds in PRs.** Build-but-don't-push for forks; full push only on `main`. Don't accidentally let a malicious PR push to the registry.
-7. **`agent_config` package becoming a dumping ground.** Keep it scoped: credentials Protocol + prompts + tool allowlist. Anything chat- or session-shaped belongs in slice 8's `apps/bridge/`.
-8. **Bridge wheel build in CI is slow on cold cache.** Cache `uv` + `pip` layers. Consider building the wheel as a separate workflow step, then `COPY --from=builder` into the sprite image.
+1. **First-provision latency.** The `installing_bridge` script runs apt + 3 git clones + a NodeSource install + `npm install -g claude`. On a fresh sprite this is several minutes. Mitigation: it's once-per-sprite (idempotent via fingerprint), survives hibernation, and runs while the activity banner shows `installing_bridge` so the user sees what's in flight. If it becomes the cold-start bottleneck, revisit a baked image.
+2. **CLI binary version drift between dev (laptop) and sprite.** No image to enforce match. Pin in `CLAUDE_CLI_VERSION`; bumping the pin rotates `BRIDGE_SETUP_FINGERPRINT` → reconciler reinstalls on next pass. Slice 8's bridge boot-time check still gates handshake on version match.
+3. **Runtime managers conflict with `apt-get`-installed Node/Python.** Don't install Node from `apt` — the script uses NodeSource only. Don't install Python from `apt` outside what Ubuntu ships. nvm/pyenv add to PATH via the activation script.
+4. **`/etc/profile.d/octo-runtimes.sh` only runs in login shells.** Some Sprites Exec invocations use `bash -c`, not `bash -l`. Document the gotcha; the slice-5b `exec_oneshot` already passes `bash -l -c` per convention. The `claude` CLI's own `Bash` tool should run with login shells (slice 8 verifies).
+5. **`agent_config` package becoming a dumping ground.** Keep it scoped: credentials Protocol + prompts + tool allowlist. Anything chat- or session-shaped belongs in slice 8's `apps/bridge/`.
+6. **Sprite hibernation persistence.** `Sandbox.bridge_setup_fingerprint` survives hibernation, but if Sprites ever destroys the underlying VM filesystem on idle (instead of just stopping it), the reconciler will reinstall on next reconcile — fingerprint check catches mismatch when the fs is gone (best-effort: we re-run the script). Document the assumption.
 
 ---
 
@@ -196,16 +250,14 @@ If `runtimes` is empty: show "No language runtimes detected — agent will use s
 - [ ] `pnpm typecheck` clean.
 - [ ] `pnpm lint` clean.
 - [ ] `pnpm test` green; new orchestrator + agent_config + bridge tests included.
-- [ ] `uv build apps/bridge/` produces a wheel locally.
-- [ ] `docker build -f apps/bridge/Dockerfile.sprite .` succeeds locally.
-- [ ] `docker run --rm <image> bash -l -c 'claude --version && python -m bridge.main --self-check && nvm --version && pyenv --version'` exits 0.
-- [ ] CI workflow `.github/workflows/sprite-image.yml` green on a test branch (push-only-on-main behaviour verified).
-- [ ] Provisioning a sandbox in dev with `BRIDGE_IMAGE_TAG=<new-sha>` results in a sprite where `provider.exec_oneshot(['bash', '-l', '-c', 'claude --version'])` exits 0.
+- [ ] `python -m bridge --self-check` exits 0 from a clean dev checkout.
+- [ ] Provisioning a sandbox in dev runs the reconciler's `installing_bridge` phase; afterwards `provider.exec_oneshot(['bash', '-l', '-c', 'claude --version && nvm --version'])` exits 0.
+- [ ] `Sandbox.bridge_setup_fingerprint` is populated after the first reconcile pass; second pass is a no-op (fingerprint match).
+- [ ] Connecting a repo with pinned `runtimes` triggers `installing_runtimes`; failures land on `Repo.runtime_install_error`; clones still proceed.
 - [ ] From the slice-6 terminal, `nvm install 20 && node --version` works.
-- [ ] `Sandbox.bridge_token_hash` is populated after provision; never logged or returned in API responses.
-- [ ] Repo card "Agent setup" banner renders with detected runtimes.
+- [ ] Repo card "Agent setup" banner renders with detected runtimes; reflects `runtime_install_error` when set.
 - [ ] [docs/progress.md](../progress.md) row updated.
 - [ ] [docs/Contributions.md](../Contributions.md) entry added.
 - [ ] [docs/agent_context.md](../agent_context.md) gotchas + status line updated.
-- [ ] [docs/engineering.md](../engineering.md) gains the sprite-image-rebuild recipe.
+- [ ] [docs/engineering.md](../engineering.md) gains the bridge-pin-bump recipe.
 - [ ] User signs off → this brief is frozen; corrections live in `progress.md`.

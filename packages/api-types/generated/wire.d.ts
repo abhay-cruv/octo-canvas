@@ -33,6 +33,35 @@ export type Type8 = "pong";
 export type Nonce3 = string;
 export type Type9 = "resume";
 export type AfterSeq = number;
+export type Type10 = "file.edit";
+export type Path = string;
+export type Kind1 = "create" | "modify" | "delete" | "rename";
+export type IsDir = boolean;
+export type Size = number | null;
+export type TimestampMs = number;
+export type Type11 = "fswatch.subscribed";
+export type SandboxId1 = string;
+export type RootPath = string;
+export type Type12 = "pty.close";
+export type TerminalId = string;
+export type Type13 = "pty.open";
+export type SandboxId2 = string;
+export type TerminalId1 = string;
+export type Cwd = string | null;
+export type Cols = number;
+export type Rows = number;
+export type Type14 = "pty.resize";
+export type Cols1 = number;
+export type Rows1 = number;
+export type Type15 = "pty.exit";
+export type TerminalId2 = string;
+export type ExitCode = number;
+export type Type16 = "pty.session_info";
+export type TerminalId3 = string;
+export type SpritesSessionId = string;
+export type Cols2 = number;
+export type Rows2 = number;
+export type Reattached = boolean;
 /**
  * This interface was referenced by `OctoCanvasWireProtocol`'s JSON-Schema
  * via the `definition` "OrchestratorToWeb".
@@ -50,6 +79,21 @@ export type OrchestratorToWeb =
  * via the `definition` "WebToOrchestrator".
  */
 export type WebToOrchestrator = Resume | ClientPing | ClientPong;
+/**
+ * This interface was referenced by `OctoCanvasWireProtocol`'s JSON-Schema
+ * via the `definition` "FsWatchToWeb".
+ */
+export type FsWatchToWeb = FileEditEvent | FsWatchSubscribed;
+/**
+ * This interface was referenced by `OctoCanvasWireProtocol`'s JSON-Schema
+ * via the `definition` "WebToPty".
+ */
+export type WebToPty = ResizePty | RequestOpenPty | RequestClosePty;
+/**
+ * This interface was referenced by `OctoCanvasWireProtocol`'s JSON-Schema
+ * via the `definition` "PtyToWeb".
+ */
+export type PtyToWeb = PtySessionInfo | PtyExit;
 
 export interface OctoCanvasWireProtocol {
   [k: string]: unknown;
@@ -167,5 +211,108 @@ export interface ClientPong {
 export interface Resume {
   type?: Type9;
   after_seq: AfterSeq;
+  [k: string]: unknown;
+}
+/**
+ * One filesystem change observed inside the sandbox. Emitted by the
+ * orchestrator's fs-watch broker after coalescing per [Plan.md §10.6].
+ *
+ * This interface was referenced by `OctoCanvasWireProtocol`'s JSON-Schema
+ * via the `definition` "FileEditEvent".
+ */
+export interface FileEditEvent {
+  type?: Type10;
+  path: Path;
+  kind: Kind1;
+  is_dir?: IsDir;
+  size?: Size;
+  timestamp_ms: TimestampMs;
+  [k: string]: unknown;
+}
+/**
+ * Sent immediately after the channel handshake completes so the FE has
+ * a deterministic point to remove its 'connecting…' state.
+ *
+ * This interface was referenced by `OctoCanvasWireProtocol`'s JSON-Schema
+ * via the `definition` "FsWatchSubscribed".
+ */
+export interface FsWatchSubscribed {
+  type?: Type11;
+  sandbox_id: SandboxId1;
+  root_path: RootPath;
+  [k: string]: unknown;
+}
+/**
+ * Web → orchestrator: kill this PTY (the user closed the terminal tab).
+ * The orchestrator drops its Sprites Exec session and clears the Redis
+ * reattach record.
+ *
+ * This interface was referenced by `OctoCanvasWireProtocol`'s JSON-Schema
+ * via the `definition` "RequestClosePty".
+ */
+export interface RequestClosePty {
+  type?: Type12;
+  terminal_id: TerminalId;
+  [k: string]: unknown;
+}
+/**
+ * Reserved for a future task-WS-driven PTY open. Slice 6 opens PTYs by
+ * dialling the per-PTY URL directly; this frame is unused on the wire
+ * until the task WS gains PTY-control responsibilities.
+ *
+ * This interface was referenced by `OctoCanvasWireProtocol`'s JSON-Schema
+ * via the `definition` "RequestOpenPty".
+ */
+export interface RequestOpenPty {
+  type?: Type13;
+  sandbox_id: SandboxId2;
+  terminal_id: TerminalId1;
+  cwd?: Cwd;
+  cols?: Cols;
+  rows?: Rows;
+  [k: string]: unknown;
+}
+/**
+ * Web → orchestrator: tell the underlying PTY its new dimensions. The
+ * orchestrator forwards verbatim to Sprites' Exec channel.
+ *
+ * This interface was referenced by `OctoCanvasWireProtocol`'s JSON-Schema
+ * via the `definition` "ResizePty".
+ */
+export interface ResizePty {
+  type?: Type14;
+  cols: Cols1;
+  rows: Rows1;
+  [k: string]: unknown;
+}
+/**
+ * Orchestrator → web: the upstream shell exited. The web side typically
+ * leaves the tab open so the user can read final output, then closes the
+ * socket on user action.
+ *
+ * This interface was referenced by `OctoCanvasWireProtocol`'s JSON-Schema
+ * via the `definition` "PtyExit".
+ */
+export interface PtyExit {
+  type?: Type15;
+  terminal_id: TerminalId2;
+  exit_code: ExitCode;
+  [k: string]: unknown;
+}
+/**
+ * Orchestrator → web: emitted once after the upstream Sprites Exec
+ * session is up. Mirrors Sprites' `session_info` plus the orchestrator's
+ * own correlation id so reattach can be reasoned about end-to-end.
+ *
+ * This interface was referenced by `OctoCanvasWireProtocol`'s JSON-Schema
+ * via the `definition` "PtySessionInfo".
+ */
+export interface PtySessionInfo {
+  type?: Type16;
+  terminal_id: TerminalId3;
+  sprites_session_id: SpritesSessionId;
+  cols: Cols2;
+  rows: Rows2;
+  reattached: Reattached;
   [k: string]: unknown;
 }

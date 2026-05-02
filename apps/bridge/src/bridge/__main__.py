@@ -1,11 +1,6 @@
-from bridge.lib.logger import configure_logging, get_logger
+import sys
 
-
-def main() -> None:
-    configure_logging()
-    logger = get_logger(__name__)
-    logger.info("bridge.started")
-
+from bridge.main import main
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

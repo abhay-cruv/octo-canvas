@@ -29,10 +29,14 @@ version = "0.1.0"
 source = { editable = "python_packages/agent_config" }
 dependencies = [
     { name = "pydantic" },
+    { name = "shared-models" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "pydantic", specifier = ">=2.9" }]
+requires-dist = [
+    { name = "pydantic", specifier = ">=2.9" },
+    { name = "shared-models", editable = "python_packages/shared_models" },
+]
 
 [[package]]
 name = "annotated-doc"
@@ -1555,14 +1559,18 @@ name = "sandbox-provider"
 version = "0.1.0"
 source = { editable = "python_packages/sandbox_provider" }
 dependencies = [
+    { name = "httpx" },
     { name = "pydantic" },
     { name = "sprites-py" },
+    { name = "websockets" },
 ]
 
 [package.metadata]
 requires-dist = [
+    { name = "httpx", specifier = ">=0.27" },
     { name = "pydantic", specifier = ">=2.9" },
     { name = "sprites-py", specifier = ">=0.0.1rc37" },
+    { name = "websockets", specifier = ">=13.0" },
 ]
 
 [[package]]

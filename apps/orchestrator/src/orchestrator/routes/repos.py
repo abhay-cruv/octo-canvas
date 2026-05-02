@@ -71,6 +71,8 @@ def _to_response(doc: Repo) -> ConnectedRepo:
         private=doc.private,
         clone_status=doc.clone_status,
         clone_error=doc.clone_error,
+        runtime_install_error=doc.runtime_install_error,
+        runtimes_installed_at=doc.runtimes_installed_at,
         connected_at=doc.connected_at,
         introspection=_merge(doc.introspection_detected, doc.introspection_overrides),
         introspection_detected=doc.introspection_detected,

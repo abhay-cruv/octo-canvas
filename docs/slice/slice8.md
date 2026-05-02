@@ -50,7 +50,14 @@ This slice ends at "**a user opens a Chat → bridge spawns a CLI session → ag
 3. **One bridge↔orchestrator WSS per sprite, multiplexing all sessions.** Endpoint `/ws/bridge/{sandbox_id}`. Bridge dials home; orchestrator never opens. Auth: `Authorization: Bearer ${BRIDGE_TOKEN}` minted at sprite provision time, persisted as `Sandbox.bridge_token_hash` (sha256). All inbound/outbound frames (except `Hello`/`Goodbye`/`Ping`/`Pong`) carry `session_id`. Wire schema: Pydantic discriminated union in `python_packages/shared_models/src/shared_models/wire_protocol/bridge.py` per [Plan.md §10.4b](../Plan.md). `seq` is per `(sandbox_id, session_id)`.
 4. **Bridge owns ring-buffer replay.** 1000 frames or 1 MB per session, whichever smaller. On WSS reconnect: `Hello{last_acked_seq}` → orchestrator replies with the last `seq` it has in Mongo for that session and what state to converge to (`SessionState[]`). Bridge re-emits any frames with `seq > orchestrator_last_seq`. Inbound commands are idempotent on `frame_id` (uuid4 from orchestrator).
 5. **Cross-instance bridge ownership via Redis.** Bridge connects to whichever orchestrator instance Fly's LB picks; that instance writes `bridge_owner:{sandbox_id} = {instance_id, expires_at}` (TTL 60s, refreshed every 20s). Other instances forward outbound commands (`UserMessage`, `AnswerClarification`, `Cancel`, `Pause`) via Redis pub/sub on `bridge_in:{sandbox_id}`. Inbound bridge events publish to `task:{task_id}` (looked up via `session_id → task_id` from `SessionStarted`). Mongo is canonical.
-6. **`ClaudeCredentials` is a Protocol; v1 ships only `PlatformApiKeyCredentials`.** `User.claude_auth_mode: Literal["platform_api_key","user_oauth","user_api_key"] = "platform_api_key"` is added in this slice (§8 schema migration) but is hard-coded to `platform_api_key`; UI to flip it is post-v1. The Protocol lives at `python_packages/agent_config/src/agent_config/credentials.py`. **Anthropic key flows via sprite env**, set at provision time. NEVER baked into the image. The reserved `SessionEnv` WSS frame (orchestrator → bridge) is declared in the wire schema but unused in v1 — it's the path for user-scoped credentials in future modes.
+6. **`ClaudeCredentials` is a Protocol; v1 ships only `PlatformApiKeyCredentials`.** `User.claude_auth_mode: Literal["platform_api_key","user_oauth","user_api_key"] = "platform_api_key"` is added in this slice (§8 schema migration) but is hard-coded to `platform_api_key`; UI to flip it is post-v1. The Protocol lives at `python_packages/agent_config/src/agent_config/credentials.py`.
+
+   **Anthropic key NEVER enters the sprite (slice-7 invariant; slice 8 honors it).** The user has terminal + agent-Bash access inside the sprite, so anything in process env / `/proc/<pid>/environ` is presumed leaked. The bridge talks to api.anthropic.com via the orchestrator's reverse proxy at `/api/_internal/anthropic-proxy/{sandbox_id}/{path:path}` (built in this slice — see "What to build" §3a). Env piped to the bridge from `BridgeRuntimeConfig.env_for(sandbox_id, bridge_token)`:
+   - `CLAUDE_CODE_API_BASE_URL = <orch>/api/_internal/anthropic-proxy/<sandbox_id>` (priority var the CLI v2.1.118 checks first)
+   - `ANTHROPIC_BASE_URL = <same>` (fallback for older CLI builds + the SDK)
+   - `ANTHROPIC_AUTH_TOKEN = <bridge_token>` (Bearer mode; takes priority over `ANTHROPIC_API_KEY` which we deliberately omit)
+
+   The proxy validates `Authorization: Bearer <bridge_token>` (sha256 + `hmac.compare_digest` against `Sandbox.bridge_token_hash`), strips it, sets `x-api-key: <real_key>` outbound, reverse-proxies streaming to api.anthropic.com. Async-correctness contract is in [slice7.md #6b](slice7.md) — must be honored verbatim. The reserved `SessionEnv` WSS frame (orchestrator → bridge) is declared in the wire schema but unused in v1 — path for user-scoped credentials in future modes (still proxied; they swap a different upstream auth).
 7. **CLI tools = built-ins, plus one custom MCP tool.** Built-in: `Read`, `Write`, `Edit`, `Bash`, `Glob`, `Grep`. Custom (registered via in-process MCP server): `ask_user_clarification(question, context?) -> str`. **No `read_file`/`write_file`/`apply_patch`/`run_shell` re-implementations** — that was the old subprocess-per-run design. Permission mode: `acceptEdits`. Hooks:
    - `PreToolUse[Bash]` — parse the command; reject `cd /etc`, paths outside `/work/<repo>/`, `git push` to base branch, `rm -rf /` patterns. Cap wall-clock at 5 min, output at 50 KB.
    - `PreToolUse[Write|Edit]` — reject paths outside the session's repo subdir.
@@ -146,6 +153,27 @@ Widen `append_event(task_id, session_id, payload, *, redis)`:
 4. Return the event.
 
 Add `ack_bridge_session(sandbox_id, session_id, seq)` — writes `Sandbox.bridge_last_acked_seq_per_session[session_id] = seq` (used by bridge owner to know what to ack back).
+
+### 3a. Anthropic reverse proxy — `apps/orchestrator/src/orchestrator/routes/anthropic_proxy.py`
+
+The slice-7 invariant ("real Anthropic key never enters the sprite") rests on this route. Implementation contract is locked in [slice7.md §6b](slice7.md) — read it before writing a line. Summary:
+
+- Route: `@router.api_route("/api/_internal/anthropic-proxy/{sandbox_id}/{path:path}", methods=["GET","POST","PUT","DELETE","PATCH","OPTIONS"], include_in_schema=False)`.
+- Auth: read `Authorization: Bearer <token>`; reject if missing. `hashlib.sha256(token).hexdigest()` + `hmac.compare_digest` against `Sandbox(sandbox_id).bridge_token_hash`. 401 on any mismatch (no diagnostic detail — same response for missing-sandbox / wrong-token / wrong-format to deny probe info).
+- Real-key swap: strip `Authorization` from inbound; set outbound `x-api-key: <real>` from `request.app.state.bridge_config._anthropic_api_key`. 503 on missing real key.
+- Lifespan: `app.state.anthropic_proxy_client = httpx.AsyncClient(http2=True, timeout=httpx.Timeout(connect=10, read=600, write=60, pool=10))` started in `app.lifespan`, `await client.aclose()` on shutdown.
+- Async streaming end-to-end (the *only* acceptable shape):
+  - Inbound body: `content=request.stream()` — never `request.body()`/`request.json()`.
+  - Upstream: `req = client.build_request(method=request.method, url=upstream_url, headers=swapped_headers, content=request.stream()); upstream = await client.send(req, stream=True)` — never `client.post(...)`/`response.aread()`.
+  - Response: `async def relay(): try: async for chunk in upstream.aiter_raw(): yield chunk; finally: await upstream.aclose()` wrapped in `StreamingResponse(relay(), status_code=upstream.status_code, headers=filtered_outbound, background=BackgroundTask(upstream.aclose))`.
+  - Inject `Cache-Control: no-cache` + `X-Accel-Buffering: no` on the response so any nginx in front doesn't buffer SSE.
+- Header filtering (both directions): drop hop-by-hop (`connection`, `keep-alive`, `proxy-authenticate`, `proxy-authorization`, `te`, `trailers`, `transfer-encoding`, `upgrade`, `host`, `content-length`) + `authorization` + `x-api-key`. Forward everything else verbatim (incl. `anthropic-version`, `anthropic-beta`, `content-type`).
+- Path / query: forward `path` verbatim; preserve `request.url.query`.
+- Cancellation: bridge disconnect → handler cancelled → `finally: aclose()` → upstream HTTP/2 RST → Anthropic stops billing.
+- Error mapping: upstream 5xx + `httpx.RequestError` → 502; real-key missing → 503; auth failure → 401. Never echo upstream error bodies that might mention key prefixes.
+- **Async-correctness audit**: nothing in the module imports `requests`, `urllib`, or `time.sleep`. Any sync I/O is a regression — CI grep should fail on those imports in this file.
+
+Verified-2026-05 against `claude` CLI v2.1.118 binary env-parsing. The CLI sends `Authorization: Bearer <ANTHROPIC_AUTH_TOKEN>` (we omit `ANTHROPIC_API_KEY`); the proxy validates Bearer, swaps to `x-api-key` for upstream because Anthropic's API expects `x-api-key` for non-OAuth tokens.
 
 ### 4. Bridge WSS handler — `apps/orchestrator/src/orchestrator/ws/bridge.py`
 
@@ -251,9 +279,18 @@ Orchestrator tests (`apps/orchestrator/tests/`):
 - `test_task_followup.py`: second message reuses `claude_session_id` from `SessionStarted`.
 - `test_bridge_owner.py`: two orchestrator instances + one Redis; commands routed to owner via pub/sub.
 - `test_clarification_routing.py`: passthrough mode (slice 8) — `AskUserClarification` from bridge → `chat:{id}` Redis → web subscriber sees it; `AnswerClarification` from web → bridge frame.
+- `test_anthropic_proxy.py`:
+  - 401 on missing/wrong/badly-formatted `Authorization: Bearer ...` (single response shape — no probe channel).
+  - Valid bearer → upstream call made with `x-api-key: <real_key>`, `Authorization` stripped.
+  - Real-key string never appears in any response body or header sent back to the bridge (audit assertion against a sentinel `sk-ant-real-secret`).
+  - SSE streaming: in-process fake-Anthropic emits 10 chunks 50ms apart; assert each chunk arrives at the bridge mock within 100ms of being emitted (proves no buffering). Use `httpx.MockTransport` or a tiny ASGI stub.
+  - Bridge disconnect mid-stream → `upstream.aclose()` runs (assert via spy on the mock). Anthropic stops billing.
+  - Header filter drops hop-by-hop on both directions. Verify `Cache-Control: no-cache` + `X-Accel-Buffering: no` set on the response.
+  - Static check: `import requests` / `import urllib` / `time.sleep` absent from the proxy module.
 
 Full-stack smoke (manual, documented):
 - One real sprite, one orchestrator, one web tab. File a task → see PR-less commits. Follow-up.
+- Inside the sprite: `env | grep -i anthrop` shows only `CLAUDE_CODE_API_BASE_URL`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`. The real `sk-ant-...` key is absent. `cat /proc/$(pgrep -f bridge)/environ | tr '\\0' '\\n' | grep -i sk-ant` returns nothing.
 
 ---
 

@@ -11,9 +11,12 @@ from .lib.env import settings
 from .lib.logger import logger
 from .lib.provider_factory import build_sandbox_provider
 from .lib.redis_client import redis_client
-from .routes import auth, internal, me, repos, sandbox
+from .routes import auth, internal, me, repos, sandbox, sandbox_fs, sandbox_git
+from .services.fs_watcher import FsWatcher
 from .services.reconciliation import Reconciler
-from .services.sandbox_manager import SandboxManager
+from .services.sandbox_manager import BridgeRuntimeConfig, SandboxManager
+from .ws import fs_watch as ws_fs_watch
+from .ws import pty as ws_pty
 from .ws import web as ws_web
 from .ws.task_fanout import TaskFanout
 
@@ -32,11 +35,24 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         logger.warning("redis.connect_failed", url=settings.redis_url, error=str(exc))
 
     provider = build_sandbox_provider()
+    bridge_config = BridgeRuntimeConfig(
+        orchestrator_base_url=settings.orchestrator_base_url,
+        # SecretStr → plain str only here, used by the slice-8
+        # Anthropic proxy route. NEVER goes into the bridge env.
+        _anthropic_api_key=settings.anthropic_api_key.get_secret_value(),
+        claude_auth_mode=settings.claude_auth_mode,
+        max_live_chats_per_sandbox=settings.bridge_max_live_chats_per_sandbox,
+        idle_after_disconnect_s=settings.bridge_idle_after_disconnect_s,
+    )
     manager = SandboxManager(provider=provider, redis=redis_handle)
     app.state.sandbox_manager = manager
     app.state.sandbox_provider = provider
-    app.state.reconciler = Reconciler(provider)
+    app.state.bridge_config = bridge_config
+    app.state.reconciler = Reconciler(provider, bridge_config=bridge_config)
     app.state.redis_handle = redis_handle
+    fs_watcher = FsWatcher(provider, redis=redis_handle)
+    await fs_watcher.start()
+    app.state.fs_watcher = fs_watcher
 
     # TaskFanout (slice 5a) only spins up if Redis is connected. Without
     # Redis, single-instance event delivery still works via direct
@@ -52,6 +68,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     try:
         yield
     finally:
+        try:
+            await fs_watcher.stop()
+        except Exception as exc:
+            logger.warning("fs_watcher.stop_failed", error=str(exc))
+
         if fanout is not None:
             try:
                 await fanout.stop()
@@ -83,7 +104,11 @@ app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
 app.include_router(me.router, prefix="/api", tags=["me"])
 app.include_router(repos.router, prefix="/api/repos", tags=["repos"])
 app.include_router(sandbox.router, prefix="/api/sandboxes", tags=["sandboxes"])
+app.include_router(sandbox_fs.router, prefix="/api/sandboxes", tags=["sandbox-fs"])
+app.include_router(sandbox_git.router, prefix="/api/sandboxes", tags=["sandbox-git"])
 app.include_router(ws_web.router, tags=["ws"])
+app.include_router(ws_pty.router, tags=["ws-pty"])
+app.include_router(ws_fs_watch.router, tags=["ws-fs-watch"])
 
 if settings.allow_internal_endpoints:
     app.include_router(internal.router, prefix="/api/_internal", tags=["internal"])

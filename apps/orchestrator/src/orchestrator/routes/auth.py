@@ -44,7 +44,7 @@ def _callback_url() -> str:
 def _make_oauth_client() -> AsyncOAuth2Client:
     return AsyncOAuth2Client(
         client_id=settings.github_oauth_client_id,
-        client_secret=settings.github_oauth_client_secret,
+        client_secret=settings.github_oauth_client_secret.get_secret_value(),
         scope=OAUTH_SCOPE,
         redirect_uri=_callback_url(),
     )

@@ -433,6 +433,27 @@ pnpm --filter @octo-canvas/web add -D some-library
 
 Both ecosystems automatically pick up new workspace packages because of the glob in [pnpm-workspace.yaml](pnpm-workspace.yaml) and [pyproject.toml](pyproject.toml).
 
+### Bumping bridge / runtime pins (slice 7+)
+
+There is **no sprite image bake**. The reconciler's `installing_bridge` phase ([`reconciliation.py`](../apps/orchestrator/src/orchestrator/services/reconciliation.py) `_ensure_bridge_setup`) installs the `claude` CLI + nvm/pyenv/rbenv into each sprite via `exec_oneshot`. Pins live alongside the bridge source:
+
+- [`apps/bridge/CLAUDE_CLI_VERSION`](../apps/bridge/CLAUDE_CLI_VERSION) — one-line `claude` CLI version pin.
+- `_NVM_PIN` / `_PYENV_PIN` / `_RBENV_PIN` constants at the top of [`reconciliation.py`](../apps/orchestrator/src/orchestrator/services/reconciliation.py) — git tag refs for the runtime managers.
+
+Bumping any of these:
+
+1. Edit the pin (file or constant).
+2. Restart the orchestrator (so `BRIDGE_SETUP_FINGERPRINT` re-reads `CLAUDE_CLI_VERSION`).
+3. The next reconcile pass on every sprite sees the fingerprint mismatch and re-runs `_ensure_bridge_setup`. Idempotent shell guards mean the steps that don't depend on the bumped pin are no-ops; only the affected install runs.
+
+No image rebuild, no registry, no Reset required. Existing sprites pick up the new pin in-place. The first reconcile after a bump runs the install script (a few minutes for a cold pin); subsequent reconciles skip when the fingerprint matches.
+
+Local sanity check that the install script + pins are coherent (without a real sprite):
+
+```bash
+uv run python -c "from orchestrator.services.reconciliation import BRIDGE_SETUP_FINGERPRINT, _BRIDGE_SETUP_SCRIPT; print(BRIDGE_SETUP_FINGERPRINT); print(_BRIDGE_SETUP_SCRIPT[:500])"
+```
+
 ---
 
 ## Testing your change

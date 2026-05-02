@@ -33,6 +33,14 @@ class ConnectedRepo(BaseModel):
     # Sanitized of tokens before persisting; values like
     # "github_reauth_required", "branch_not_found", or a stderr-tail prefix.
     clone_error: str | None = None
+    # Slice 7: per-repo language-runtime install status (set by the
+    # reconciler's `installing_runtimes` phase). `None` once the most
+    # recent install attempt succeeded; non-None on the most recent
+    # failure. Sanitized — never contains tokens.
+    runtime_install_error: str | None = None
+    # Slice 7: timestamp of the most recent successful runtime install.
+    # `None` before first success and after sandbox reset/destroy.
+    runtimes_installed_at: datetime | None = None
     connected_at: datetime
     # Effective values: detected merged with user overrides. Slice 4+ callers
     # (bridge, agent runs) read this — they don't care which fields were user-set.

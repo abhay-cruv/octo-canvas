@@ -24,11 +24,15 @@ state from Redis as primary in this slice. Slice 5a's WS hot path will read
 from Redis for sticky-routing decisions.
 """
 
+import hashlib
+import secrets
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 import structlog
 from beanie import PydanticObjectId
+from db import mongo
 from db.models import Sandbox
 from sandbox_provider import SandboxHandle, SandboxProvider, SpritesError
 from shared_models.sandbox import SandboxStatus
@@ -70,8 +74,144 @@ def _handle_of(sandbox: Sandbox) -> SandboxHandle:
     )
 
 
+@dataclass(frozen=True)
+class BridgeRuntimeConfig:
+    """Slice 7 — values the reconciler's `installing_bridge` phase needs
+    when it launches the bridge daemon inside the sprite. Sprites is
+    already a VM, so there is no image bake; the reconciler installs
+    the `claude` CLI + bridge wheel + nvm/pyenv/rbenv via `exec_oneshot`
+    and launches the daemon with these env vars overlaid.
+
+    **The real Anthropic API key never enters the sprite.** `env_for(...)`
+    emits `ANTHROPIC_BASE_URL` pointing at the orchestrator's
+    `/api/_internal/anthropic-proxy/<sandbox_id>` route (slice 8) and
+    `ANTHROPIC_API_KEY=<bridge_token>` — a sandbox-scoped synthetic
+    token only valid through our proxy. The proxy validates the token
+    against `Sandbox.bridge_token_hash` and forwards to api.anthropic.com
+    with the real key from the orchestrator's env. The user has terminal
+    + agent-Bash access inside the sprite, so anything readable from
+    process env / `/proc/<pid>/environ` is presumed leaked — only the
+    proxy approach is safe.
+
+    `_anthropic_api_key` stays on the dataclass so the proxy route
+    (server-side) can read it. The leading underscore + the `__repr__`
+    override below ensure it never appears in logs.
+    """
+
+    orchestrator_base_url: str
+    # Pydantic SecretStr from the orchestrator's `Settings`; converted
+    # to plain str only by the proxy route, never by anything that
+    # serializes to a sprite.
+    _anthropic_api_key: str = ""
+    claude_auth_mode: str = "platform_api_key"
+    max_live_chats_per_sandbox: int = 5
+    idle_after_disconnect_s: int = 300
+
+    def env_for(self, *, sandbox_id: str, bridge_token: str) -> dict[str, str]:
+        """Build the env-var overlay applied at bridge-launch time.
+
+        `ORCHESTRATOR_WS_URL` / `ANTHROPIC_BASE_URL` may resolve to
+        empty strings in dev (no public URL configured); the bridge
+        tolerates this in slice 7 by idling. Slice 8 will require them.
+
+        The returned dict NEVER contains the real `_anthropic_api_key`.
+
+        Anthropic env-var design (verified 2026-05; passes forward to
+        slice 8's proxy implementation):
+
+        - `CLAUDE_CODE_API_BASE_URL` is the *priority* env var the
+          `claude` CLI v2.1.118 checks first. It falls back to
+          `ANTHROPIC_BASE_URL`, then `api.anthropic.com`. We set
+          BOTH because `ANTHROPIC_BASE_URL` alone has a known bug
+          where the CLI's interactive mode ignored it
+          (anthropics/claude-code#36998); setting the higher-
+          priority var hedges against future regressions.
+        - `ANTHROPIC_AUTH_TOKEN` (Bearer mode) is what proxies use,
+          per the LiteLLM convention. The CLI sends it as
+          `Authorization: Bearer <token>`. Takes priority over
+          `ANTHROPIC_API_KEY` when both are set, so we deliberately
+          omit `ANTHROPIC_API_KEY` to keep the auth shape
+          unambiguous.
+
+        The `bridge_token` is the per-sandbox synthetic token —
+        readable from sprite env / agent's Bash tool, but only
+        valid against our proxy. The proxy validates the SHA-256
+        against `Sandbox.bridge_token_hash` and swaps in the real
+        `_anthropic_api_key` from `BridgeRuntimeConfig` (held only
+        on the orchestrator, never piped).
+        """
+        base = (self.orchestrator_base_url or "").rstrip("/")
+        ws_url = ""
+        proxy_base = ""
+        if base:
+            ws_url = base.replace("https://", "wss://", 1).replace("http://", "ws://", 1)
+            ws_url = f"{ws_url}/ws/bridge/{sandbox_id}"
+            proxy_base = f"{base}/api/_internal/anthropic-proxy/{sandbox_id}"
+        return {
+            "BRIDGE_TOKEN": bridge_token,
+            "ORCHESTRATOR_WS_URL": ws_url,
+            "CLAUDE_AUTH_MODE": self.claude_auth_mode,
+            "MAX_LIVE_CHATS_PER_SANDBOX": str(self.max_live_chats_per_sandbox),
+            "IDLE_AFTER_DISCONNECT_S": str(self.idle_after_disconnect_s),
+            # Priority var (CLI v2.1.118 checks this first) — hedge
+            # against the interactive-mode regression where
+            # `ANTHROPIC_BASE_URL` alone got ignored.
+            "CLAUDE_CODE_API_BASE_URL": proxy_base,
+            "ANTHROPIC_BASE_URL": proxy_base,
+            # Bearer-mode auth: the CLI sends
+            # `Authorization: Bearer <bridge_token>`. The proxy
+            # validates this header (NOT `x-api-key`) and swaps in
+            # the real key as `x-api-key` for the upstream call.
+            "ANTHROPIC_AUTH_TOKEN": bridge_token,
+        }
+
+    def __repr__(self) -> str:
+        # Default dataclass repr would print the secret. Mask it.
+        return (
+            f"BridgeRuntimeConfig(orchestrator_base_url={self.orchestrator_base_url!r}, "
+            f"_anthropic_api_key={'***' if self._anthropic_api_key else ''!r}, "
+            f"claude_auth_mode={self.claude_auth_mode!r}, "
+            f"max_live_chats_per_sandbox={self.max_live_chats_per_sandbox}, "
+            f"idle_after_disconnect_s={self.idle_after_disconnect_s})"
+        )
+
+
+async def _clear_runtime_install_state(sandbox_id: PydanticObjectId | None) -> None:
+    """Slice 7: clear `Repo.runtime_install_error` + `runtimes_installed_at`
+    on every Repo bound to this sandbox so the dashboard "Agent setup"
+    banner doesn't show stale state after a reset/destroy. Reconcile
+    re-populates them on the next pass.
+
+    Uses raw `mongo.repos.update_many` because Beanie's `find().update()`
+    chain silently no-ops in some configurations — the slice-5b lesson
+    that's documented in [agent_context.md](../../../../docs/agent_context.md).
+    """
+    if sandbox_id is None:
+        return
+    await mongo.repos.update_many(
+        {"sandbox_id": sandbox_id},
+        {"$set": {"runtime_install_error": None, "runtimes_installed_at": None}},
+    )
+
+
+def _hash_bridge_token(token: str) -> str:
+    """SHA-256 hex of the plaintext bridge token. Persisted on the
+    Sandbox doc; the bridge presents the plaintext at the slice-8 WSS
+    handshake and the orchestrator hashes + compares."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def mint_bridge_token() -> str:
+    """Fresh URL-safe token (~256 bits). Use at bridge-launch time."""
+    return secrets.token_urlsafe(32)
+
+
 class SandboxManager:
-    def __init__(self, provider: SandboxProvider, redis: "Redis | None") -> None:
+    def __init__(
+        self,
+        provider: SandboxProvider,
+        redis: "Redis | None",
+    ) -> None:
         self._provider = provider
         self._redis = redis
 
@@ -255,6 +395,12 @@ class SandboxManager:
         sandbox.clean_checkpoint_id = None
         await sandbox.save()
         await self._redis_write(sandbox)
+        # Reset wipes /work but leaves /usr/local/{nvm,pyenv,rbenv,cargo,
+        # rustup,go-versions} intact (slice 5b's design). The reconciler's
+        # `installing_runtimes` phase is idempotent, so repos that were
+        # already "Installed: …" stay accurate after reset — keep the
+        # banner. We only clear runtime-install state when the sprite
+        # itself is destroyed (see `destroy()` and `_reset_via_recreate`).
         _logger.info(
             "sandbox.reset.workdir_wiped",
             sandbox_id=str(sandbox.id),
@@ -278,7 +424,12 @@ class SandboxManager:
         sandbox.status = "provisioning"
         sandbox.clean_checkpoint_id = None
         sandbox.git_configured_token_fp = None
+        # Sprite is gone, so the bridge prerequisites need reinstalling
+        # too — clear the fingerprint so the next reconcile re-runs
+        # `installing_bridge` from scratch.
+        sandbox.bridge_setup_fingerprint = None
         await sandbox.save()
+        await _clear_runtime_install_state(sandbox.id)
         return await self._provision(sandbox)
 
     async def destroy(self, sandbox: Sandbox) -> Sandbox:
@@ -307,6 +458,10 @@ class SandboxManager:
         sandbox.public_url = None
         await sandbox.save()
         await self._redis_clear(sandbox)
+        # Drop runtime-install banners on the connected Repos —
+        # there's no sandbox to be installed in anymore. Repo docs
+        # themselves stay (slice 2's connect/disconnect lifecycle).
+        await _clear_runtime_install_state(sandbox.id)
         _logger.info("sandbox.destroyed", sandbox_id=str(sandbox.id))
         return sandbox
 

@@ -20,17 +20,21 @@ status enum, and the per-sprite URL.
 """
 
 import asyncio
+import json
 import time
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
 from typing import Any
+from urllib.parse import urlencode, urlsplit, urlunsplit
 
 import httpx
 import structlog
+import websockets
 from sprites import (
     AuthenticationError as SDKAuthenticationError,
 )
 from sprites import (
     ExecError,
+    FilesystemError,
     NotFoundError,
     Sprite,
     SpriteError,
@@ -42,8 +46,10 @@ from sandbox_provider.interface import (
     CheckpointId,
     ExecResult,
     FsEntry,
+    FsEvent,
     ProviderName,
     ProviderStatus,
+    PtyDialInfo,
     SandboxHandle,
     SandboxState,
     SpritesError,
@@ -348,7 +354,7 @@ class SpritesProvider:
                 out.append(FsEntry(name=name, kind=kind, size=size))  # type: ignore[arg-type]
             return out
 
-        return await asyncio.to_thread(_list)
+        return await _retry_transient(lambda: asyncio.to_thread(_list), op="fs_list")
 
     async def fs_delete(self, handle: SandboxHandle, path: str, *, recursive: bool = False) -> None:
         sprite_name = _require_name(handle)
@@ -374,7 +380,7 @@ class SpritesProvider:
                     f"fs_delete failed: {resp.status_code}", retriable=resp.status_code >= 500
                 )
 
-        await asyncio.to_thread(_delete)
+        await _retry_transient(lambda: asyncio.to_thread(_delete), op="fs_delete")
 
     async def snapshot(self, handle: SandboxHandle, *, comment: str) -> CheckpointId:
         """Take a checkpoint via the SDK. `create_checkpoint` returns a
@@ -466,6 +472,165 @@ class SpritesProvider:
         # the type checker happy.
         raise SpritesError(f"snapshot exhausted retries: {last_err}", retriable=True)
 
+    # ── Slice 6 additions ────────────────────────────────────────────────
+
+    async def fs_read(self, handle: SandboxHandle, path: str) -> bytes:
+        """Read file bytes via the SDK's `SpritePath.read_bytes`."""
+        sprite_name = _require_name(handle)
+
+        def _read() -> bytes:
+            sprite = self._client.sprite(sprite_name)
+            try:
+                return sprite.filesystem().path(path).read_bytes()
+            except FilesystemError as exc:
+                raise SpritesError(_sanitize(exc), retriable=False) from exc
+            except SpriteError as exc:
+                raise SpritesError(_sanitize(exc), retriable=_is_retriable(exc)) from exc
+
+        return await _retry_transient(lambda: asyncio.to_thread(_read), op="fs_read")
+
+    async def fs_write(
+        self,
+        handle: SandboxHandle,
+        path: str,
+        content: bytes,
+        *,
+        mode: int = 0o644,
+        mkdir: bool = True,
+    ) -> int:
+        """Write file bytes via the SDK's `SpritePath.write_bytes`."""
+        sprite_name = _require_name(handle)
+
+        def _write() -> int:
+            sprite = self._client.sprite(sprite_name)
+            try:
+                sprite.filesystem().path(path).write_bytes(content, mode=mode, mkdir_parents=mkdir)
+            except FilesystemError as exc:
+                raise SpritesError(_sanitize(exc), retriable=False) from exc
+            except SpriteError as exc:
+                raise SpritesError(_sanitize(exc), retriable=_is_retriable(exc)) from exc
+            return len(content)
+
+        return await _retry_transient(lambda: asyncio.to_thread(_write), op="fs_write")
+
+    async def fs_rename(self, handle: SandboxHandle, src: str, dst: str) -> None:
+        """Rename via the SDK's `SpritePath.rename`."""
+        sprite_name = _require_name(handle)
+
+        def _rename() -> None:
+            sprite = self._client.sprite(sprite_name)
+            try:
+                sprite.filesystem().path(src).rename(dst)
+            except FilesystemError as exc:
+                raise SpritesError(_sanitize(exc), retriable=False) from exc
+            except SpriteError as exc:
+                raise SpritesError(_sanitize(exc), retriable=_is_retriable(exc)) from exc
+
+        await _retry_transient(lambda: asyncio.to_thread(_rename), op="fs_rename")
+
+    async def pty_dial_info(
+        self,
+        handle: SandboxHandle,
+        *,
+        cwd: str = "/work",
+        cols: int = 80,
+        rows: int = 24,
+        attach_session_id: str | None = None,
+    ) -> PtyDialInfo:
+        sprite_name = _require_name(handle)
+        token = _client_token(self._client)
+        parts = urlsplit(self._client.base_url)
+        scheme = "wss" if parts.scheme == "https" else "ws"
+        if attach_session_id:
+            path = f"/v1/sprites/{sprite_name}/exec/{attach_session_id}"
+            qs = ""
+        else:
+            path = f"/v1/sprites/{sprite_name}/exec"
+            # Launch a login shell that first `cd`s into the workspace and
+            # then `exec`s a fresh login bash so the user lands in `cwd`
+            # without a transient HOME prompt or a child process.
+            # `bash -l` so the agent runtime's nvm/pyenv shims (slice 7)
+            # are sourced. `max_run_after_disconnect=0` keeps the session
+            # alive forever so a browser refresh can reattach via the
+            # session id we'll cache in Redis.
+            #
+            # Sprites' Exec ignores `cwd` as a WSS query param per rc43,
+            # so we bake the directory change into the command itself.
+            safe_cwd = cwd if cwd and cwd.startswith("/") else "/work"
+            cd_cmd = f"cd {_shell_quote(safe_cwd)} 2>/dev/null || cd /work; exec bash -l"
+            qs = urlencode(
+                [
+                    ("cmd", "bash"),
+                    ("cmd", "-lc"),
+                    ("cmd", cd_cmd),
+                    ("tty", "true"),
+                    ("cols", str(cols)),
+                    ("rows", str(rows)),
+                    ("max_run_after_disconnect", "0"),
+                ]
+            )
+        url = urlunsplit((scheme, parts.netloc, path, qs, ""))
+        return PtyDialInfo(url=url, headers=[("Authorization", f"Bearer {token}")])
+
+    async def fs_watch_subscribe(
+        self,
+        handle: SandboxHandle,
+        path: str,
+        *,
+        recursive: bool = True,
+    ) -> AsyncIterator[FsEvent]:
+        """Subscribe to filesystem-change events via raw WSS.
+
+        The SDK doesn't expose `fs/watch`. We open the WSS directly using
+        the `websockets` library, send a `subscribe` frame, and yield each
+        incoming `event` frame as an `FsEvent`. On consumer cancellation
+        the websocket is closed in `finally` so the underlying connection
+        doesn't leak.
+        """
+        sprite_name = _require_name(handle)
+        url = _watch_url(self._client.base_url, sprite_name, path, recursive=recursive)
+        token = _client_token(self._client)
+        headers = [("Authorization", f"Bearer {token}")]
+
+        try:
+            ws = await websockets.connect(url, additional_headers=headers, max_size=2**24)
+        except (OSError, websockets.exceptions.WebSocketException) as exc:
+            raise SpritesError(f"fs_watch connect failed: {exc}", retriable=True) from exc
+
+        # Sprites' fs/watch protocol: client opens, server begins streaming
+        # events. The schema lists a `subscribe` client→server message but
+        # the WSS query params (path, recursive) already carry the same
+        # information; sending an explicit subscribe is harmless and lets
+        # us refresh the path set later if needed.
+        try:
+            await ws.send(
+                json.dumps(
+                    {
+                        "type": "subscribe",
+                        "paths": [path],
+                        "recursive": recursive,
+                        "workingDir": "/",
+                    }
+                )
+            )
+        except websockets.exceptions.WebSocketException:
+            await ws.close()
+            raise
+
+        try:
+            async for raw in ws:
+                if isinstance(raw, bytes):
+                    # fs/watch is JSON-only; ignore stray binary frames.
+                    continue
+                event = _parse_watch_frame(raw)
+                if event is not None:
+                    yield event
+        finally:
+            try:
+                await ws.close()
+            except Exception:
+                pass
+
     async def restore(self, handle: SandboxHandle, checkpoint_id: CheckpointId) -> SandboxState:
         sprite_name = _require_name(handle)
 
@@ -486,6 +651,11 @@ class SpritesProvider:
         except SpriteError as exc:
             raise SpritesError(_sanitize(exc), retriable=_is_retriable(exc)) from exc
         return _to_state(sprite)
+
+
+def _shell_quote(s: str) -> str:
+    """Single-quote a string for safe inclusion in a shell command."""
+    return "'" + s.replace("'", "'\\''") + "'"
 
 
 def _name_for(sandbox_id: str) -> str:
@@ -550,6 +720,109 @@ def _sanitize(exc: BaseException) -> str:
     if "Bearer " in text:
         text = text.split("Bearer ")[0] + "Bearer <redacted>"
     return text[:500]
+
+
+def _watch_url(base_url: str, sprite_name: str, path: str, *, recursive: bool) -> str:
+    """Build the wss:// URL for `/v1/sprites/{name}/fs/watch` given the
+    SDK's https base_url. Swaps scheme http→ws / https→wss."""
+    parts = urlsplit(base_url)
+    scheme = "wss" if parts.scheme == "https" else "ws"
+    qs = urlencode({"path": path, "recursive": str(recursive).lower(), "workingDir": "/"})
+    return urlunsplit((scheme, parts.netloc, f"/v1/sprites/{sprite_name}/fs/watch", qs, ""))
+
+
+def _client_token(client: SpritesClient) -> str:
+    """Pull the bearer token off the SDK client. The SDK exposes it as
+    `client._token` (no public accessor in rc37) — same private-attribute
+    pattern we already use elsewhere in this module."""
+    token = getattr(client, "_token", None) or getattr(client, "token", None)
+    if not isinstance(token, str) or not token:
+        raise SpritesError("SpritesClient missing token", retriable=False)
+    return token
+
+
+def _parse_watch_frame(raw: str) -> FsEvent | None:
+    """Decode a single WatchMessage frame. Returns None for control frames
+    (`subscribed`, `error`, etc.) — the iterator skips them silently."""
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    msg_type = data.get("type")
+    if msg_type != "event":
+        return None
+    raw_event = data.get("event")
+    # Sprites' rc43 schema doesn't pin event names; map common Linux
+    # inotify shapes onto our four canonical kinds. Use a token match
+    # rather than substring (substring "move" would match "remove").
+    _event_map = {
+        "create": "create",
+        "created": "create",
+        "add": "create",
+        "added": "create",
+        "modify": "modify",
+        "modified": "modify",
+        "write": "modify",
+        "change": "modify",
+        "changed": "modify",
+        "delete": "delete",
+        "deleted": "delete",
+        "remove": "delete",
+        "removed": "delete",
+        "rename": "rename",
+        "renamed": "rename",
+        "move": "rename",
+        "moved": "rename",
+    }
+    kind = _event_map.get(raw_event.lower() if isinstance(raw_event, str) else "", "modify")
+    path = data.get("path")
+    if not isinstance(path, str):
+        return None
+    is_dir = bool(data.get("isDir", False))
+    size_raw = data.get("size")
+    size: int | None = int(size_raw) if isinstance(size_raw, (int, float)) else None
+    ts_raw = data.get("timestamp")
+    timestamp_ms: int
+    if isinstance(ts_raw, (int, float)):
+        timestamp_ms = int(ts_raw)
+    elif isinstance(ts_raw, str):
+        # ISO-8601 fallback. We don't import dateutil; just store 0 if we
+        # can't parse — orchestrator stamps its own arrival time anyway.
+        timestamp_ms = 0
+    else:
+        timestamp_ms = 0
+    return FsEvent(path=path, kind=kind, is_dir=is_dir, size=size, timestamp_ms=timestamp_ms)  # type: ignore[arg-type]
+
+
+_FS_RETRY_DELAYS_S: tuple[float, ...] = (1.0, 2.0, 4.0)
+
+
+async def _retry_transient(thunk, *, op: str):  # type: ignore[no-untyped-def]
+    """Retry an async fs op on transient `SpritesError(retriable=True)`.
+    3 attempts with 1+2+4s backoff (7s total) — same shape as
+    `SpritesProvider.snapshot`. `_is_retriable` already classifies 5xx /
+    timeout / connection errors as retriable; non-retriable errors (404
+    / auth / 4xx) bubble immediately."""
+    last: SpritesError | None = None
+    for attempt, delay in enumerate(_FS_RETRY_DELAYS_S + (0.0,)):
+        try:
+            return await thunk()
+        except SpritesError as exc:
+            last = exc
+            if not exc.retriable or attempt == len(_FS_RETRY_DELAYS_S):
+                raise
+            _logger.warning(
+                "sprites.fs_retry",
+                op=op,
+                attempt=attempt + 1,
+                error=str(exc)[:200],
+            )
+            await asyncio.sleep(delay)
+    if last is not None:
+        raise last
+    raise SpritesError(f"{op} retry loop exhausted with no error", retriable=True)
 
 
 def _is_retriable(exc: SpriteError) -> bool:

@@ -4,6 +4,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   connectedReposQueryOptions,
   meQueryOptions,
+  sandboxesQueryOptions,
 } from '../../lib/queries';
 import { logout, manageGithubAccessUrl, startGithubLogin } from '../../lib/auth';
 import {
@@ -23,13 +24,20 @@ const PANEL_KEY = 'octo.dashboardPanelOpen';
 
 function DashboardPage() {
   const { data: me } = useQuery(meQueryOptions);
+  const sandboxes = useQuery(sandboxesQueryOptions);
+  const hasLiveSandbox =
+    Array.isArray(sandboxes.data) &&
+    sandboxes.data.some((s) => s.status !== 'destroyed');
   const connected = useQuery({
     ...connectedReposQueryOptions,
     // Poll while any repo is mid-clone — the reconciler flips
     // clone_status from pending → cloning → ready/failed in the
     // background, and without a refetch the card never updates. Stops
-    // polling once everything settles to ready/failed.
+    // polling once everything settles to ready/failed AND when there's
+    // no live sandbox at all (a destroyed/missing sandbox can't make
+    // pending → ready transitions, so polling would never terminate).
     refetchInterval: (query) => {
+      if (!hasLiveSandbox) return false;
       const data = query.state.data;
       if (!data || !Array.isArray(data)) return false;
       const inFlight = data.some(
@@ -342,6 +350,77 @@ type Repo = Awaited<
 >[number];
 
 type Introspection = NonNullable<Repo['introspection']>;
+type RuntimeEntry = NonNullable<Introspection['runtimes']>[number];
+
+function AgentSetupBanner({
+  runtimes,
+  runtimeInstallError,
+  runtimesInstalledAt,
+  runtimesOverridden,
+}: {
+  runtimes: ReadonlyArray<RuntimeEntry>;
+  runtimeInstallError: string | null;
+  runtimesInstalledAt: string | null;
+  runtimesOverridden: boolean;
+}) {
+  // Slice 7: three states driven by reconciler bookkeeping.
+  //   - error: most recent install attempt failed (red banner).
+  //   - installed: most recent attempt succeeded (timestamp present).
+  //   - none: neither set — sandbox just reset/destroyed/never reconciled
+  //     (banner hidden so the dashboard doesn't show stale "Installed").
+  // The "no runtimes detected" hint stays even in the none-state so the
+  // user knows the agent will fall back to system defaults.
+  const hasError = runtimeInstallError !== null && runtimeInstallError !== '';
+  const isInstalled = !hasError && runtimesInstalledAt !== null;
+  const labels = runtimes.map((r) => (r.version ? `${r.name} ${r.version}` : r.name));
+
+  if (runtimes.length === 0) {
+    return (
+      <div className="mt-1 rounded-md border border-gray-200 bg-gray-50 px-2 py-1.5 text-xs text-gray-700">
+        <div className="text-[10px] uppercase tracking-wide text-gray-500">
+          Agent setup
+        </div>
+        <div className="mt-0.5">
+          No language runtimes detected — agent will use system defaults.
+        </div>
+      </div>
+    );
+  }
+  if (!hasError && !isInstalled) {
+    // No install state for this sandbox session yet — hide entirely.
+    return null;
+  }
+  return (
+    <div
+      className={`mt-1 rounded-md border px-2 py-1.5 text-xs ${
+        hasError
+          ? 'border-red-200 bg-red-50 text-red-800'
+          : 'border-gray-200 bg-gray-50 text-gray-700'
+      }`}
+    >
+      <div className="text-[10px] uppercase tracking-wide text-gray-500">
+        Agent setup
+      </div>
+      {hasError ? (
+        <div className="mt-0.5">
+          <div>
+            <span className="font-medium">Install failed:</span>{' '}
+            {runtimeInstallError}
+          </div>
+          <div className="mt-0.5 text-red-700">
+            Targets: {labels.join(', ')}
+            {runtimesOverridden ? ' (custom)' : ''}
+          </div>
+        </div>
+      ) : (
+        <div className="mt-0.5">
+          <span className="font-medium">Installed:</span> {labels.join(', ')}
+          {runtimesOverridden ? ' (custom)' : ''}
+        </div>
+      )}
+    </div>
+  );
+}
 
 const OVERRIDE_FIELDS: ReadonlyArray<{
   key: keyof IntrospectionOverrides;
@@ -397,6 +476,8 @@ function RepoRow({
           <IntrospectionPills
             effective={effective}
             overrides={overrides}
+            runtimeInstallError={repo.runtime_install_error ?? null}
+            runtimesInstalledAt={repo.runtimes_installed_at ?? null}
             isLoading={isReintrospecting}
           />
         </div>
@@ -638,10 +719,14 @@ function OverrideEditor({
 function IntrospectionPills({
   effective,
   overrides,
+  runtimeInstallError,
+  runtimesInstalledAt,
   isLoading,
 }: {
   effective: Introspection | null;
   overrides: IntrospectionOverrides | null;
+  runtimeInstallError: string | null;
+  runtimesInstalledAt: string | null;
   isLoading: boolean;
 }) {
   if (effective === null && overrides === null) {
@@ -685,21 +770,12 @@ function IntrospectionPills({
         {pillFor('build_command')}
         {pillFor('dev_command')}
       </div>
-      {runtimes.length > 0 && (
-        <div className="flex flex-wrap items-center gap-1.5">
-          <span className="text-[10px] uppercase tracking-wide text-gray-500">
-            Runtimes
-          </span>
-          {runtimes.map((r) => (
-            <Pill
-              key={`${r.name}-${r.source}`}
-              label={r.version ? `${r.name} ${r.version}` : r.name}
-              mono
-              overridden={runtimesOverridden}
-            />
-          ))}
-        </div>
-      )}
+      <AgentSetupBanner
+        runtimes={runtimes}
+        runtimeInstallError={runtimeInstallError}
+        runtimesInstalledAt={runtimesInstalledAt}
+        runtimesOverridden={runtimesOverridden}
+      />
       {systemPackages.length > 0 && (
         <div className="flex flex-wrap items-center gap-1.5">
           <span className="text-[10px] uppercase tracking-wide text-gray-500">

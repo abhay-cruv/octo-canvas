@@ -21,15 +21,19 @@ import asyncio
 import hashlib
 import time
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 import structlog
 from beanie import PydanticObjectId
 from db import mongo
 from db.models import Repo, Sandbox, User
+from pathlib import Path
+
 from sandbox_provider import SandboxHandle, SpritesError
 
 if TYPE_CHECKING:
+    from orchestrator.services.sandbox_manager import BridgeRuntimeConfig
     from sandbox_provider import SandboxProvider
 
 _logger = structlog.get_logger("reconciliation")
@@ -59,10 +63,273 @@ class ReconciliationResult:
     removed: list[str] = field(default_factory=lambda: [])
     failed: list[tuple[str, str]] = field(default_factory=lambda: [])
     apt_installed: list[str] = field(default_factory=lambda: [])
+    # Slice 7: list of (manager, version) pairs the reconciler installed
+    # in the `installing_runtimes` phase. Empty when nothing to install.
+    runtimes_installed: list[tuple[str, str]] = field(default_factory=lambda: [])
     checkpoint_taken: bool = False
     new_checkpoint_id: str | None = None
     skipped: bool = False
     skipped_reason: str | None = None
+
+
+# Slice 7: bridge prerequisites installed once per sprite by the
+# `installing_bridge` phase. Sprites is already a VM, so we install nvm/
+# pyenv/rbenv + the pinned `claude` CLI directly via `exec_oneshot`
+# rather than baking a custom image. Pins live alongside the bridge
+# source so a single PR bumps them. Bumping any of these rotates
+# `BRIDGE_SETUP_FINGERPRINT` → reconciler re-runs `installing_bridge` on
+# next pass; existing sprites pick up the new pin without a restart.
+_NVM_PIN = "v0.40.3"
+_PYENV_PIN = "v2.5.5"
+_RBENV_PIN = "v1.3.2"
+# rustup-init is one curl call; no version pin (rustup self-updates).
+# `RUSTUP_HOME` / `CARGO_HOME` go to /usr/local so installs survive
+# `rm -rf /work` (Reset).
+_RUSTUP_HOME = "/usr/local/rustup"
+_CARGO_HOME = "/usr/local/cargo"
+# Go tarballs from go.dev/dl/. We install per-version into
+# `/usr/local/go-versions/<version>` and symlink the highest-installed
+# at `/usr/local/go-current` for the activation script's PATH.
+_GO_INSTALL_ROOT = "/usr/local/go-versions"
+
+
+def _read_cli_pin() -> str:
+    """Read `apps/bridge/CLAUDE_CLI_VERSION` (single line). The file is
+    the canonical pin shared with `bridge.config.baked_cli_version()`.
+    Returns "unknown" when the repo layout doesn't have the pin file
+    (treats as a no-op for tests that don't care)."""
+    here = Path(__file__).resolve()
+    # services/reconciliation.py → orchestrator → src → orchestrator → apps
+    repo_root = here.parents[5]
+    pin = repo_root / "apps" / "bridge" / "CLAUDE_CLI_VERSION"
+    if pin.is_file():
+        return pin.read_text().strip()
+    return "unknown"
+
+
+_CLAUDE_CLI_PIN = _read_cli_pin()
+BRIDGE_SETUP_FINGERPRINT = (
+    f"nvm={_NVM_PIN};pyenv={_PYENV_PIN};rbenv={_RBENV_PIN};claude={_CLAUDE_CLI_PIN}"
+)
+BRIDGE_SETUP_TIMEOUT_S = 600
+
+
+# Slice 7: bridge setup is split into two scripts so the slow
+# manager/CLI installs can run in parallel with `git clone`s.
+#
+#   1. `_BRIDGE_SETUP_PRE` — apt baseline + Adoptium repo + git itself.
+#      Fast (~30s on a fresh sprite, near-zero on subsequent passes).
+#      MUST run before clones because clones need git on PATH; it also
+#      grabs the dpkg lock so any other apt step in the reconciler
+#      sequences after it.
+#   2. `_BRIDGE_SETUP_REST` — runtime managers + system Node + the
+#      pinned `claude` CLI + rustup + the Go install root. None of
+#      these touch dpkg, so this script can run concurrently with
+#      `git clone` of the user's repos. `installing_runtimes` (which
+#      needs nvm/pyenv/rbenv on PATH) waits on this.
+#
+# Both scripts are idempotent at the shell level (`if [ ! -d ... ]` /
+# `command -v ...`) and at the reconciler level (skipped entirely when
+# `Sandbox.bridge_setup_fingerprint` already matches the current pins).
+_BRIDGE_SETUP_PRE = f"""set -euo pipefail
+log() {{ echo "[octo-setup-pre] $*"; }}
+
+log "apt baseline"
+sudo -n apt-get update -y
+sudo -n apt-get install -y --no-install-recommends \\
+    git curl wget ca-certificates gnupg build-essential pkg-config \\
+    libssl-dev libffi-dev zlib1g-dev libbz2-dev libreadline-dev \\
+    libsqlite3-dev liblzma-dev libncurses-dev tk-dev \\
+    libpq-dev libxml2-dev libxslt1-dev libvips-dev libjpeg-dev libpng-dev
+
+log "Adoptium apt repo (Java)"
+if [ ! -f /etc/apt/keyrings/adoptium.gpg ]; then
+    sudo -n install -d -m 0755 /etc/apt/keyrings
+    wget -qO - https://packages.adoptium.net/artifactory/api/gpg/key/public \\
+        | sudo -n gpg --dearmor -o /etc/apt/keyrings/adoptium.gpg
+    DISTRO_CODENAME=$(. /etc/os-release && echo "$VERSION_CODENAME")
+    echo "deb [signed-by=/etc/apt/keyrings/adoptium.gpg] https://packages.adoptium.net/artifactory/deb $DISTRO_CODENAME main" \\
+        | sudo -n tee /etc/apt/sources.list.d/adoptium.list >/dev/null
+    sudo -n apt-get update -y
+fi
+
+log "go install root + version-manager dirs"
+sudo -n install -d -m 0755 {_GO_INSTALL_ROOT}
+sudo -n install -d -m 0755 {_RUSTUP_HOME} {_CARGO_HOME}
+
+log "pre done"
+"""
+
+
+_BRIDGE_SETUP_REST = f"""set -euo pipefail
+log() {{ echo "[octo-setup] $*"; }}
+
+log "nvm @ {_NVM_PIN}"
+if [ ! -d /usr/local/nvm ]; then
+    sudo -n git clone --branch {_NVM_PIN} --depth 1 \\
+        https://github.com/nvm-sh/nvm.git /usr/local/nvm
+fi
+
+log "pyenv @ {_PYENV_PIN}"
+if [ ! -d /usr/local/pyenv ]; then
+    sudo -n git clone --branch {_PYENV_PIN} --depth 1 \\
+        https://github.com/pyenv/pyenv.git /usr/local/pyenv
+fi
+
+log "rbenv @ {_RBENV_PIN}"
+if [ ! -d /usr/local/rbenv ]; then
+    sudo -n git clone --branch {_RBENV_PIN} --depth 1 \\
+        https://github.com/rbenv/rbenv.git /usr/local/rbenv
+    sudo -n git clone --depth 1 \\
+        https://github.com/rbenv/ruby-build.git \\
+        /usr/local/rbenv/plugins/ruby-build
+fi
+
+log "rustup (no toolchain - installing_runtimes installs per-repo versions)"
+if [ ! -x {_CARGO_HOME}/bin/rustup ]; then
+    sudo -n env RUSTUP_HOME={_RUSTUP_HOME} CARGO_HOME={_CARGO_HOME} \\
+        bash -c "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \\
+                | sh -s -- -y --default-toolchain none --no-modify-path"
+    sudo -n chmod -R a+rX {_CARGO_HOME} {_RUSTUP_HOME}
+fi
+
+log "activation script"
+sudo -n tee /etc/profile.d/octo-runtimes.sh >/dev/null <<'PROFILE'
+export NVM_DIR=/usr/local/nvm
+[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+export PYENV_ROOT=/usr/local/pyenv
+export PATH="$PYENV_ROOT/bin:$PATH"
+command -v pyenv >/dev/null 2>&1 && eval "$(pyenv init -)"
+export RBENV_ROOT=/usr/local/rbenv
+export PATH="$RBENV_ROOT/bin:$PATH"
+command -v rbenv >/dev/null 2>&1 && eval "$(rbenv init -)"
+export RUSTUP_HOME=__RUSTUP_HOME__
+export CARGO_HOME=__CARGO_HOME__
+export PATH="$CARGO_HOME/bin:$PATH"
+# Go: highest-installed version is symlinked at __GO_CURRENT__.
+export PATH="__GO_CURRENT__/bin:$PATH"
+PROFILE
+sudo -n sed -i \\
+    -e 's|__RUSTUP_HOME__|{_RUSTUP_HOME}|g' \\
+    -e 's|__CARGO_HOME__|{_CARGO_HOME}|g' \\
+    -e 's|__GO_CURRENT__|/usr/local/go-current|g' \\
+    /etc/profile.d/octo-runtimes.sh
+sudo -n chmod 0755 /etc/profile.d/octo-runtimes.sh
+
+log "system Node (NodeSource 20.x — fallback when no .nvmrc is active)"
+if ! command -v node >/dev/null 2>&1; then
+    curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -n bash -
+    sudo -n apt-get install -y --no-install-recommends nodejs
+fi
+
+log "claude CLI @ {_CLAUDE_CLI_PIN}"
+sudo -n npm install -g @anthropic-ai/claude-code@{_CLAUDE_CLI_PIN}
+
+log "verify"
+bash -lc 'claude --version'
+bash -lc 'nvm --version'
+bash -lc 'pyenv --version'
+bash -lc 'rbenv --version'
+bash -lc 'rustup --version'
+
+log "done"
+"""
+
+
+# Slice 7: per-runtime install commands the `installing_runtimes` phase
+# fires for each `(name, version)` pair. The managers themselves are
+# installed by `installing_bridge` (above). v1 wires only node/python/
+# ruby — go/rust/java are detected by introspection but the toolchains
+# are heterogeneous; the agent can still install ad-hoc during chat.
+#
+# pyenv/rbenv ship Python/Ruby version recipes via their bundled
+# `python-build` / `ruby-build` plugins. Those plugin databases must
+# be current to know about a release — pyenv 2.4.15 (our pin) was
+# tagged before Python 3.13.5 existed, so a naive `pyenv install
+# 3.13.5` fails with `definition not found`. The fallback retries
+# once after `sudo -n git pull` inside the relevant repo (exactly what
+# pyenv prints to stderr on miss). Cheap on a hit, self-heals on a
+# miss without rotating the pin.
+_RUNTIME_INSTALL_CMDS: dict[str, list[str]] = {
+    # `bash -lc` so /etc/profile.d/octo-runtimes.sh is sourced and
+    # `nvm`/`pyenv`/`rbenv`/`rustup` + the go-current symlink are on
+    # PATH.
+    "node": ["bash", "-lc", "nvm install {version}"],
+    "python": [
+        "bash",
+        "-lc",
+        'pyenv install -s {version} || ('
+        "echo 'pyenv install failed — updating pyenv and retrying' "
+        '&& sudo -n git -C "$PYENV_ROOT" pull --ff-only '
+        '&& pyenv install -s {version}'
+        ')',
+    ],
+    "ruby": [
+        "bash",
+        "-lc",
+        'rbenv install -s {version} || ('
+        "echo 'rbenv install failed — updating ruby-build and retrying' "
+        '&& sudo -n git -C "$RBENV_ROOT/plugins/ruby-build" pull --ff-only '
+        '&& rbenv install -s {version}'
+        ')',
+    ],
+    # Java via Adoptium Temurin: introspection emits versions like
+    # `17`, `17.0.13`, or `21.0.1`; we install the matching major
+    # (`temurin-<major>-jdk`). Multiple majors coexist as separate
+    # packages under `/usr/lib/jvm/`; system `java` defaults to the
+    # last installed (or whatever `update-alternatives` selects). The
+    # agent picks the right `JAVA_HOME` per repo from there.
+    "java": [
+        "bash",
+        "-lc",
+        # `{{` / `}}` escape Python's `.format()` so `${MAJOR}` reaches
+        # the shell verbatim. Introspection emits versions like `17`,
+        # `17.0.13`, `21.0.1` — `cut -d. -f1` collapses them all to the
+        # major.
+        'MAJOR=$(echo "{version}" | cut -d. -f1) '
+        "&& sudo -n apt-get install -y --no-install-recommends "
+        '"temurin-${{MAJOR}}-jdk"',
+    ],
+    # Rust via rustup: versions look like `1.83.0` or `stable`.
+    # `rustup toolchain install` is idempotent (already-installed is a
+    # no-op + 0 exit); rustup self-updates so no retry-with-pull dance
+    # is needed.
+    "rust": [
+        "bash",
+        "-lc",
+        "rustup toolchain install {version} --profile minimal --no-self-update",
+    ],
+    # Go: download the prebuilt amd64 tarball from go.dev/dl/, extract
+    # to `/usr/local/go-versions/<version>/`, and re-point
+    # `/usr/local/go-current` at the highest installed version (lex
+    # sort works for `1.X.Y` strings up to two-digit minor/patch).
+    # `command -v go` checks aren't useful — the install root is the
+    # source of truth for "is this version present".
+    "go": [
+        "bash",
+        "-lc",
+        # `{{` / `}}` escape Python's `.format()` so `${V}` etc. reach
+        # the shell verbatim.
+        "set -euo pipefail; "
+        'V="{version}"; '
+        'TARGET="/usr/local/go-versions/${{V}}"; '
+        'if [ ! -x "${{TARGET}}/bin/go" ]; then '
+        "  TMP=$(mktemp -d); "
+        '  curl -fsSL "https://go.dev/dl/go${{V}}.linux-amd64.tar.gz" '
+        '    | tar -xz -C "${{TMP}}"; '
+        '  sudo -n mkdir -p "${{TARGET}}"; '
+        '  sudo -n cp -a "${{TMP}}/go/." "${{TARGET}}/"; '
+        '  rm -rf "${{TMP}}"; '
+        "fi; "
+        "LATEST=$(ls -1 /usr/local/go-versions | sort -V | tail -1); "
+        'sudo -n ln -sfn "/usr/local/go-versions/${{LATEST}}" /usr/local/go-current',
+    ],
+}
+RUNTIME_INSTALL_TIMEOUT_S = 600
+
+
+def _now() -> datetime:
+    return datetime.now(UTC)
 
 
 def _handle_of(sandbox: Sandbox) -> SandboxHandle:
@@ -89,10 +356,23 @@ def _lock_for(sandbox_id: PydanticObjectId) -> asyncio.Lock:
 
 class Reconciler:
     """One per-orchestrator-process. Holds a `SandboxProvider` reference;
-    routes pull this from `app.state.reconciler`."""
+    routes pull this from `app.state.reconciler`.
 
-    def __init__(self, provider: SandboxProvider) -> None:
+    `bridge_config` is optional: when wired (via `app.lifespan`), the
+    reconciler runs the slice-7 `installing_bridge` phase that installs
+    nvm/pyenv/rbenv + the pinned `claude` CLI inside the sprite. Tests
+    that don't care about bridge setup pass `None` and that phase is
+    skipped entirely.
+    """
+
+    def __init__(
+        self,
+        provider: SandboxProvider,
+        *,
+        bridge_config: "BridgeRuntimeConfig | None" = None,
+    ) -> None:
         self._provider = provider
+        self._bridge_config = bridge_config
 
     async def reconcile(self, sandbox_id: PydanticObjectId) -> ReconciliationResult:
         async with _lock_for(sandbox_id):
@@ -173,6 +453,25 @@ class Reconciler:
         # returns one level at a time. The mock returns full_name strings
         # directly for back-compat with our pre-real-fs tests, so we
         # accept either shape.
+        #
+        # **Scope cleanup to tracked owners only.** Slice 6 lets users
+        # create files freely under `/work/...` from the IDE. If we walked
+        # every top-level dir and removed anything that didn't match a
+        # connected `Repo.full_name`, we'd nuke the user's scratch
+        # directories (`/work/notes.md`, `/work/playground/...`). So we
+        # only descend into owner dirs that own at least one tracked repo,
+        # and only remove `owner/repo` paths under those owners. A user
+        # creating `/work/scratch/foo.md` is left alone because `scratch`
+        # is not a tracked owner.
+        #
+        # Tradeoff: if a user disconnects every repo under owner `octocat`,
+        # `/work/octocat/...` will survive on disk because `octocat` is no
+        # longer tracked. We accept that — losing user files is much worse
+        # than leaving stale clones around. Explicit Reset wipes `/work`
+        # entirely and is the right escape hatch.
+        wanted = {r.full_name: r for r in repos}
+        tracked_owners = {full_name.split("/", 1)[0] for full_name in wanted}
+
         on_disk: set[str] = set()
         try:
             top = await self._provider.fs_list(_handle_of(sandbox), WORK_ROOT)
@@ -185,10 +484,17 @@ class Reconciler:
             if entry.kind != "dir":
                 continue
             if "/" in entry.name:
-                # Mock-style: "owner/repo" already.
-                on_disk.add(entry.name)
+                # Mock-style: "owner/repo" already in one entry. Only
+                # accept it if its owner is tracked.
+                owner_part = entry.name.split("/", 1)[0]
+                if owner_part in tracked_owners:
+                    on_disk.add(entry.name)
                 continue
             owner = entry.name
+            if owner not in tracked_owners:
+                # User-created scratch dir — leave it alone, don't even
+                # list its children.
+                continue
             try:
                 sub = await self._provider.fs_list(_handle_of(sandbox), f"{WORK_ROOT}/{owner}")
             except SpritesError:
@@ -196,7 +502,6 @@ class Reconciler:
             for s in sub:
                 if s.kind == "dir":
                     on_disk.add(f"{owner}/{s.name}")
-        wanted = {r.full_name: r for r in repos}
 
         to_clone = [r for full_name, r in wanted.items() if full_name not in on_disk]
         to_remove = sorted(on_disk - set(wanted))
@@ -219,6 +524,18 @@ class Reconciler:
                         }
                     },
                 )
+
+        # 2.0. Bridge prerequisites pre-step (slice 7) — once per
+        # sprite, idempotent via `Sandbox.bridge_setup_fingerprint`.
+        # Pre installs the apt baseline + Adoptium repo so `git` is on
+        # PATH for clones. The slow rest (managers + Node + claude CLI
+        # + rustup + go install root) runs in parallel with clones
+        # below. Skipped when the current pin set already matches.
+        bridge_pre_ok = True
+        if to_clone and self._bridge_config is not None:
+            if sandbox.bridge_setup_fingerprint != BRIDGE_SETUP_FINGERPRINT:
+                await _set_activity(sandbox, "installing_bridge", _CLAUDE_CLI_PIN)
+            bridge_pre_ok = await self._bridge_setup_pre(sandbox)
 
         # 2a. One-time git setup. Writes ~/.gitconfig (identity) and
         # ~/.git-credentials (OAuth token) inside the sandbox so plain
@@ -297,9 +614,20 @@ class Reconciler:
                     error=str(exc),
                 )
 
-        # 3. Clones — serialized. Re-check sandbox status between clones
-        # so a mid-flight pause/destroy stops the loop quickly instead of
-        # plowing through all remaining repos.
+        # 3. Clones run in parallel with bridge_setup_rest. Clones only
+        # need git on PATH (provided by bridge_setup_pre above) and
+        # don't touch /usr/local/* where bridge-rest writes — so the
+        # two are race-free. Clones are still serialized within
+        # themselves (one git clone at a time per sandbox; Sprites
+        # exec sessions don't always like concurrent commands).
+        bridge_rest_task: asyncio.Task[None] | None = None
+        if (
+            bridge_pre_ok
+            and self._bridge_config is not None
+            and sandbox.bridge_setup_fingerprint != BRIDGE_SETUP_FINGERPRINT
+        ):
+            bridge_rest_task = asyncio.create_task(self._bridge_setup_rest(sandbox))
+
         for repo in to_clone:
             await asyncio.sleep(0)  # cooperative cancellation point
             fresh = await Sandbox.get(sandbox_id)
@@ -317,6 +645,55 @@ class Reconciler:
                 mutated = True
             else:
                 result.failed.append((repo.full_name, repo.clone_error or "unknown"))
+
+        if bridge_rest_task is not None:
+            # Wait for bridge_setup_rest before installing_runtimes —
+            # the per-repo nvm/pyenv/rbenv/rustup/go installs need the
+            # managers it sets up. If clones finished first, this is
+            # the part of the wait the user actually feels.
+            await _set_activity(sandbox, "installing_bridge", _CLAUDE_CLI_PIN)
+            await bridge_rest_task
+
+        # 2c. Language-runtime install (slice 7). Deduped union across
+        # repos; each (manager, version) installed once. Best-effort —
+        # failures set `Repo.runtime_install_error` for the affected
+        # repos but never block subsequent passes (a missing runtime
+        # degrades to "agent installs ad-hoc" rather than data loss).
+        # Runs after clones because clones don't depend on it; clones
+        # already happened in parallel with bridge_setup_rest above.
+        runtime_targets = _merge_runtime_targets(repos)
+        if runtime_targets:
+            await _set_activity(
+                sandbox,
+                "installing_runtimes",
+                ", ".join(f"{m} {v}" for m, v in runtime_targets[:3]),
+            )
+            installed, install_errors = await self._install_runtimes(
+                sandbox, runtime_targets
+            )
+            result.runtimes_installed = installed
+            for repo in repos:
+                # Determine each repo's expected runtimes; mark error if
+                # any of them are in `install_errors`. Mutates the
+                # in-memory `Repo` so any later save doesn't wipe the
+                # field; persists right away too so the FE sees it.
+                repo_targets = _runtime_targets_for(repo)
+                missing = [t for t in repo_targets if t in install_errors]
+                if missing:
+                    detail = "; ".join(
+                        f"{m} {v}: {install_errors[(m, v)]}" for m, v in missing
+                    )
+                    repo.runtime_install_error = detail[:500]
+                    # Don't bump `runtimes_installed_at` — the repo isn't
+                    # in a fully-installed state. Leave whatever value
+                    # was there (typically None on first attempt).
+                else:
+                    repo.runtime_install_error = None
+                    # Mark the repo's runtimes as installed at this
+                    # moment. The dashboard banner uses this timestamp
+                    # to switch from "no state" to "Installed".
+                    repo.runtimes_installed_at = _now()
+                await repo.save()
 
         # 4. Removes — serialized.
         for full_name in to_remove:
@@ -371,6 +748,89 @@ class Reconciler:
         )
         return result
 
+    async def _bridge_setup_pre(self, sandbox: Sandbox) -> bool:
+        """Slice 7: fast prereq for `git clone` + the rest of bridge
+        setup. Runs the apt baseline, registers the Adoptium apt key,
+        and creates the rust/go install roots. Returns True if the
+        pre-step finished cleanly (caller then proceeds to clones +
+        bridge-rest in parallel); False on failure (caller skips
+        bridge-rest; clones still attempt — system git may already be
+        present from a prior pass).
+
+        Skipped entirely when `Sandbox.bridge_setup_fingerprint` already
+        matches — both the pre and rest phases are then no-ops.
+        """
+        if sandbox.bridge_setup_fingerprint == BRIDGE_SETUP_FINGERPRINT:
+            return True
+        try:
+            res = await self._provider.exec_oneshot(
+                _handle_of(sandbox),
+                ["bash", "-lc", _BRIDGE_SETUP_PRE],
+                env={"DEBIAN_FRONTEND": "noninteractive"},
+                cwd="/",
+                timeout_s=BRIDGE_SETUP_TIMEOUT_S,
+            )
+        except SpritesError as exc:
+            _logger.warning(
+                "reconcile.bridge_setup_pre_error",
+                sandbox_id=str(sandbox.id),
+                error=str(exc)[:200],
+            )
+            return False
+        if res.exit_code != 0:
+            _logger.warning(
+                "reconcile.bridge_setup_pre_failed",
+                sandbox_id=str(sandbox.id),
+                exit_code=res.exit_code,
+                stderr=res.stderr[-1000:],
+            )
+            return False
+        return True
+
+    async def _bridge_setup_rest(self, sandbox: Sandbox) -> None:
+        """Slice 7: slow part of bridge setup — runtime managers +
+        system Node + pinned `claude` CLI + rustup. Designed to run
+        concurrently with `git clone` of the user's repos (no dpkg
+        lock contention, no shared state with clones). On success,
+        persists `Sandbox.bridge_setup_fingerprint`; on failure leaves
+        it unset so the next reconcile pass retries."""
+        if sandbox.bridge_setup_fingerprint == BRIDGE_SETUP_FINGERPRINT:
+            return
+        try:
+            res = await self._provider.exec_oneshot(
+                _handle_of(sandbox),
+                ["bash", "-lc", _BRIDGE_SETUP_REST],
+                env={"DEBIAN_FRONTEND": "noninteractive"},
+                cwd="/",
+                timeout_s=BRIDGE_SETUP_TIMEOUT_S,
+            )
+        except SpritesError as exc:
+            _logger.warning(
+                "reconcile.bridge_setup_error",
+                sandbox_id=str(sandbox.id),
+                error=str(exc)[:200],
+            )
+            return
+        if res.exit_code != 0:
+            _logger.warning(
+                "reconcile.bridge_setup_failed",
+                sandbox_id=str(sandbox.id),
+                exit_code=res.exit_code,
+                stderr=res.stderr[-1000:],
+                stdout=res.stdout[-500:],
+            )
+            return
+        sandbox.bridge_setup_fingerprint = BRIDGE_SETUP_FINGERPRINT
+        if sandbox.id is not None:
+            await Sandbox.find_one(Sandbox.id == sandbox.id).update(  # pyright: ignore[reportGeneralTypeIssues]
+                {"$set": {"bridge_setup_fingerprint": BRIDGE_SETUP_FINGERPRINT}}
+            )
+        _logger.info(
+            "reconcile.bridge_setup_done",
+            sandbox_id=str(sandbox.id),
+            fingerprint=BRIDGE_SETUP_FINGERPRINT,
+        )
+
     async def _ensure_git_setup(self, sandbox: Sandbox, user: User) -> None:
         """One-time-per-token git setup inside the sandbox.
 
@@ -398,9 +858,14 @@ class Reconciler:
         token = user.github_access_token or ""
         if not token:
             return  # caller already short-circuits clones with no token
-        fp = hashlib.sha256(token.encode()).hexdigest()
+        # Bump this version any time the script body below changes shape so
+        # already-configured sandboxes get rewritten on next reconcile.
+        # v2 added `[safe] directory = *` to fix "dubious ownership" errors
+        # for repos cloned via `sudo -n`.
+        config_version = "v2"
+        fp = hashlib.sha256(f"{config_version}:{token}".encode()).hexdigest()
         if sandbox.git_configured_token_fp == fp:
-            return  # already configured for this exact token
+            return  # already configured for this exact token + version
 
         name = user.github_username or "octo-canvas user"
         email = user.email or f"{user.github_username}@users.noreply.github.com"
@@ -410,6 +875,16 @@ class Reconciler:
         # `GIT_ENV`) tells git to read our config file regardless of $HOME,
         # so clones from any user/HOME find the same credentials.
         cred_line = f"https://x-access-token:{token}@github.com"
+        # Two configs:
+        # - `/etc/octo-canvas/gitconfig` (orchestrator-only via
+        #   `GIT_CONFIG_GLOBAL`): identity + credentials. Only the
+        #   orchestrator's exec_oneshot calls see this — keeps the OAuth
+        #   token off the user's HOME.
+        # - `/etc/gitconfig` (system-level, read by EVERY git invocation
+        #   regardless of HOME or env): `safe.directory=*`. This is what
+        #   the user's interactive terminal AND the slice-8 agent need to
+        #   work on repos cloned by `sudo -n`. Without it, every git
+        #   command fails with "fatal: detected dubious ownership".
         script = (
             "set -eu\n"
             'sudo -n mkdir -p "$(dirname "$GIT_CONFIG")"\n'
@@ -427,6 +902,13 @@ class Reconciler:
             "\tdefaultBranch = main\n"
             "EOF\n"
             'sudo -n chmod 644 "$GIT_CONFIG"\n'
+            # System-wide gitconfig — every shell, every user, every
+            # git tool inside the sandbox sees it.
+            "sudo -n tee /etc/gitconfig > /dev/null <<EOF\n"
+            "[safe]\n"
+            "\tdirectory = *\n"
+            "EOF\n"
+            "sudo -n chmod 644 /etc/gitconfig\n"
         )
         try:
             res = await self._provider.exec_oneshot(
@@ -468,6 +950,60 @@ class Reconciler:
             sandbox_id=str(sandbox.id),
             user=user.github_username,
         )
+
+    async def _install_runtimes(
+        self,
+        sandbox: Sandbox,
+        targets: list[tuple[str, str]],
+    ) -> tuple[list[tuple[str, str]], dict[tuple[str, str], str]]:
+        """Run `nvm install <ver>` / `pyenv install <ver>` / etc. once
+        per target. Returns `(installed, errors)` — `errors` keys are the
+        targets that failed (mapped to a short reason). Slice 7 #3.
+        """
+        installed: list[tuple[str, str]] = []
+        errors: dict[tuple[str, str], str] = {}
+        for manager, version in targets:
+            template = _RUNTIME_INSTALL_CMDS[manager]
+            argv = [part.format(version=version) for part in template]
+            try:
+                res = await self._provider.exec_oneshot(
+                    _handle_of(sandbox),
+                    argv,
+                    env={},
+                    cwd="/",
+                    timeout_s=RUNTIME_INSTALL_TIMEOUT_S,
+                )
+            except SpritesError as exc:
+                errors[(manager, version)] = str(exc)[:200]
+                _logger.warning(
+                    "reconcile.runtime_install_error",
+                    sandbox_id=str(sandbox.id),
+                    manager=manager,
+                    version=version,
+                    error=str(exc)[:200],
+                )
+                continue
+            if res.exit_code == 0:
+                installed.append((manager, version))
+                _logger.info(
+                    "reconcile.runtime_installed",
+                    sandbox_id=str(sandbox.id),
+                    manager=manager,
+                    version=version,
+                )
+            else:
+                errors[(manager, version)] = (
+                    f"exit_code={res.exit_code}: {res.stderr[-200:].strip()}"
+                )
+                _logger.warning(
+                    "reconcile.runtime_install_failed",
+                    sandbox_id=str(sandbox.id),
+                    manager=manager,
+                    version=version,
+                    exit_code=res.exit_code,
+                    stderr=res.stderr[-500:],
+                )
+        return installed, errors
 
     async def _clone_one(self, sandbox: Sandbox, repo: Repo, token: str | None) -> bool:
         if not token:
@@ -576,6 +1112,37 @@ async def _mark_clone_failed(repo: Repo, reason: str) -> None:
         full_name=repo.full_name,
         reason=reason[:300],  # log preview; full reason on the doc
     )
+
+
+def _runtime_targets_for(repo: Repo) -> list[tuple[str, str]]:
+    """Effective runtimes for a repo (overrides win over detected). Each
+    entry is `(manager_key, version_string)`. Drops entries we can't
+    install (no version pinned, or runtime name unsupported by v1)."""
+    runtimes: list[tuple[str, str]] = []
+    intr = repo.introspection_detected
+    ovr = repo.introspection_overrides
+    src = (
+        ovr.runtimes
+        if ovr is not None and ovr.runtimes is not None
+        else (intr.runtimes if intr is not None else [])
+    )
+    for r in src:
+        if r.version is None:
+            continue
+        if r.name not in _RUNTIME_INSTALL_CMDS:
+            continue
+        runtimes.append((r.name, r.version))
+    return runtimes
+
+
+def _merge_runtime_targets(repos: list[Repo]) -> list[tuple[str, str]]:
+    """Deduped union of every alive repo's runtime install targets,
+    sorted for stable ordering across passes."""
+    seen: set[tuple[str, str]] = set()
+    for repo in repos:
+        for target in _runtime_targets_for(repo):
+            seen.add(target)
+    return sorted(seen)
 
 
 def _merge_system_packages(repos: list[Repo]) -> list[str]:

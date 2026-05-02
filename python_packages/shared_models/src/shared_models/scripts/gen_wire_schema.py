@@ -13,8 +13,11 @@ import sys
 from typing import Any
 
 from shared_models.wire_protocol import (
+    FsWatchToWebAdapter,
     OrchestratorToWebAdapter,
+    PtyToWebAdapter,
     WebToOrchestratorAdapter,
+    WebToPtyAdapter,
 )
 
 
@@ -32,8 +35,14 @@ def main() -> int:
     all_defs: dict[str, Any] = {}
     out_to_web = _hoist(OrchestratorToWebAdapter.json_schema(), all_defs)
     web_to_out = _hoist(WebToOrchestratorAdapter.json_schema(), all_defs)
+    fs_watch = _hoist(FsWatchToWebAdapter.json_schema(), all_defs)
+    pty_in = _hoist(WebToPtyAdapter.json_schema(), all_defs)
+    pty_out = _hoist(PtyToWebAdapter.json_schema(), all_defs)
     all_defs["OrchestratorToWeb"] = out_to_web
     all_defs["WebToOrchestrator"] = web_to_out
+    all_defs["FsWatchToWeb"] = fs_watch
+    all_defs["WebToPty"] = pty_in
+    all_defs["PtyToWeb"] = pty_out
 
     blob = json.dumps(
         {

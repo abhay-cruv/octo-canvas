@@ -1,5 +1,6 @@
 import { useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { Link } from '@tanstack/react-router';
 import { sandboxesQueryOptions } from '../lib/queries';
 import {
   destroySandbox,
@@ -22,7 +23,9 @@ const TRANSIENT: ReadonlyArray<SandboxResponse['status']> = [
 // new phases the backend introduces).
 const ACTIVITY_LABELS: Record<string, string> = {
   configuring_git: 'Setting up git…',
+  installing_bridge: 'Setting up sandbox tools…',
   installing_packages: 'Installing system packages…',
+  installing_runtimes: 'Installing language runtimes…',
   cloning: 'Cloning repository…',
   checkpointing: 'Snapshotting clean state…',
   pausing: 'Releasing compute (waiting for idle)…',
@@ -176,12 +179,20 @@ export function SandboxPanel() {
         </div>
       </div>
       <div className="mt-4 flex flex-wrap items-center gap-2">
+        {isAlive ? (
+          <Link
+            to="/sandbox"
+            className="px-4 py-2 rounded-lg bg-black text-white text-sm font-medium hover:bg-gray-800"
+          >
+            Open IDE
+          </Link>
+        ) : null}
         {isAlive && active.status !== 'running' ? (
           <button
             type="button"
             onClick={() => wake.mutate(active.id)}
             disabled={wake.isPending}
-            className="px-4 py-2 rounded-lg bg-black text-white text-sm font-medium hover:bg-gray-800 disabled:opacity-60"
+            className="px-3 py-1.5 rounded-lg bg-white border border-gray-300 text-gray-900 text-sm hover:bg-gray-50 disabled:opacity-60"
           >
             {wake.isPending ? 'Starting…' : 'Start session'}
           </button>

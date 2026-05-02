@@ -1,4 +1,7 @@
-"""SandboxProvider Protocol — slice 4 (provisioning) + slice 5b (clone/exec/fs/checkpoint).
+"""SandboxProvider Protocol.
+
+Slice 4 (provisioning) + slice 5b (clone / exec / fs / checkpoint) +
+slice 6 (FS file-ops + watch).
 
 Designed to be **provider-agnostic** so we can swap Sprites for another
 backend (Modal, E2B, AWS) without touching the orchestrator. The handle
@@ -6,14 +9,14 @@ returned by `create` is opaque — provider-specific identifiers go in
 `payload`, the discriminator in `provider`. Higher-level code never reaches
 into `payload`.
 
-Slice 5b widens with the minimum needed to clone repos, reconcile against
-the sandbox's `/work` listing, and take/restore checkpoints. `fs_read` /
-`fs_write` are still **not** in the surface — those land in slice 8 with
-the file-ops endpoints. Code that needs per-byte FS access in slice 5b
-uses `exec_oneshot` (`cat`, `tee`).
+Slice 5b widened with what's needed to clone repos, reconcile against
+the sandbox's `/work` listing, and take/restore checkpoints. Slice 6
+adds the per-byte FS surface (`fs_read`, `fs_write`, `fs_rename`) and a
+streaming `fs_watch_subscribe` so the orchestrator can fan out file
+edits to web subscribers.
 """
 
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
 from typing import Literal, NewType, Protocol
 
@@ -98,7 +101,13 @@ class SandboxProvider(Protocol):
     async def create(self, *, sandbox_id: str, labels: list[str]) -> SandboxHandle:
         """Provision a new sandbox. `sandbox_id` is the Mongo `Sandbox._id`
         (string). `labels` are arbitrary tags the provider may attach for
-        organization / billing. Returns the opaque handle."""
+        organization / billing. Returns the opaque handle.
+
+        v1 deliberately keeps this signature minimal — Sprites is already a
+        VM, so per-sandbox setup (nvm/pyenv/rbenv, claude CLI, bridge
+        daemon) lives in the orchestrator's reconciler. Per-provision
+        bridge env (`BRIDGE_TOKEN`, etc.) is delivered later via
+        `exec_oneshot` when the bridge daemon is launched."""
         ...
 
     async def status(self, handle: SandboxHandle) -> SandboxState:
@@ -168,3 +177,92 @@ class SandboxProvider(Protocol):
         avoid the full destroy+create round-trip. Returns the post-restore
         state (typically `warm`)."""
         ...
+
+    # ── Slice 6 additions ────────────────────────────────────────────────
+
+    async def fs_read(self, handle: SandboxHandle, path: str) -> bytes:
+        """Read a file from the sandbox filesystem. Returns the raw bytes.
+        Raises `SpritesError(retriable=False)` if the path doesn't exist or
+        is a directory."""
+        ...
+
+    async def fs_write(
+        self,
+        handle: SandboxHandle,
+        path: str,
+        content: bytes,
+        *,
+        mode: int = 0o644,
+        mkdir: bool = True,
+    ) -> int:
+        """Write `content` to `path`, creating parent directories when
+        `mkdir=True`. Returns the number of bytes written. Raises
+        `SpritesError` on provider errors."""
+        ...
+
+    async def fs_rename(self, handle: SandboxHandle, src: str, dst: str) -> None:
+        """Rename or move `src` to `dst`. Both paths are absolute (or
+        resolved relative to the sandbox's `/`)."""
+        ...
+
+    async def pty_dial_info(
+        self,
+        handle: SandboxHandle,
+        *,
+        cwd: str = "/work",
+        cols: int = 80,
+        rows: int = 24,
+        attach_session_id: str | None = None,
+    ) -> "PtyDialInfo":
+        """Tell the orchestrator's PTY broker where to dial. When
+        `attach_session_id` is supplied, the URL points at the Sprites
+        attach endpoint (`/exec/{session_id}`); otherwise it opens a
+        new bash login session.
+
+        The broker pumps bytes both ways across this URL — see
+        `apps/orchestrator/src/orchestrator/ws/pty.py`.
+        """
+        ...
+
+    async def fs_watch_subscribe(
+        self,
+        handle: SandboxHandle,
+        path: str,
+        *,
+        recursive: bool = True,
+    ) -> AsyncIterator["FsEvent"]:
+        """Subscribe to filesystem-change events under `path`. Yields
+        `FsEvent` records until the consumer closes the iterator (which
+        the impl uses as the signal to tear down the underlying watcher).
+
+        Implementations must be async-cancel-safe: cancelling the
+        consuming task cleanly closes the underlying connection.
+        """
+        ...
+        # Required by Protocol — bodies are never executed.
+        if False:
+            yield  # type: ignore[unreachable]
+
+
+@dataclass(frozen=True)
+class PtyDialInfo:
+    """Where the orchestrator's PTY broker should dial to reach this
+    sandbox's exec channel. Returned by `pty_dial_info` so the broker
+    stays provider-agnostic — Sprites, Mock, or any future backend just
+    yields a `wss://` URL plus auth headers."""
+
+    url: str
+    headers: list[tuple[str, str]]
+
+
+@dataclass(frozen=True)
+class FsEvent:
+    """One filesystem-change event from `fs_watch_subscribe`. `path` is the
+    absolute path inside the sandbox; `kind` is the change type. `size` is
+    the post-event size for create/modify on files, `None` otherwise."""
+
+    path: str
+    kind: Literal["create", "modify", "delete", "rename"]
+    is_dir: bool
+    size: int | None
+    timestamp_ms: int

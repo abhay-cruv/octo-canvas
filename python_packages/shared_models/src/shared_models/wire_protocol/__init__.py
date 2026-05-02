@@ -24,6 +24,21 @@ from shared_models.wire_protocol.events import (
     ServerPing,
     StatusChangeEvent,
 )
+from shared_models.wire_protocol.sandbox_channels import (
+    FileEditEvent,
+    FsWatchSubscribed,
+    FsWatchToWeb,
+    FsWatchToWebAdapter,
+    PtyExit,
+    PtySessionInfo,
+    PtyToWeb,
+    PtyToWebAdapter,
+    RequestClosePty,
+    RequestOpenPty,
+    ResizePty,
+    WebToPty,
+    WebToPtyAdapter,
+)
 
 OrchestratorToWebAdapter: TypeAdapter[OrchestratorToWeb] = TypeAdapter(OrchestratorToWeb)
 WebToOrchestratorAdapter: TypeAdapter[WebToOrchestrator] = TypeAdapter(WebToOrchestrator)
@@ -34,13 +49,26 @@ __all__ = [
     "ClientPong",
     "DebugEvent",
     "ErrorEvent",
+    "FileEditEvent",
+    "FsWatchSubscribed",
+    "FsWatchToWeb",
+    "FsWatchToWebAdapter",
     "OrchestratorToWeb",
     "OrchestratorToWebAdapter",
     "Pong",
+    "PtyExit",
+    "PtySessionInfo",
+    "PtyToWeb",
+    "PtyToWebAdapter",
+    "RequestClosePty",
+    "RequestOpenPty",
+    "ResizePty",
     "Resume",
     "SandboxStatusEvent",
     "ServerPing",
     "StatusChangeEvent",
     "WebToOrchestrator",
     "WebToOrchestratorAdapter",
+    "WebToPty",
+    "WebToPtyAdapter",
 ]

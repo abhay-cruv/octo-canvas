@@ -22,19 +22,22 @@ Mongo's `Sandbox` doc is the source of truth and `MockSandboxProvider` is
 *never* used in prod (see `provider_factory.build_sandbox_provider`).
 """
 
+import asyncio
 import copy
 import re
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass, field
 
 from sandbox_provider.interface import (
     CheckpointId,
     ExecResult,
     FsEntry,
+    FsEvent,
     ProviderName,
     ProviderStatus,
+    PtyDialInfo,
     SandboxHandle,
     SandboxState,
     SpritesError,
@@ -52,8 +55,73 @@ class _SpriteRecord:
     # of full_names since slice 5b never reads file bytes.
     cloned_repos: set[str] = field(default_factory=set)
     apt_installed: set[str] = field(default_factory=set)
-    # checkpoint_id -> deep-copied snapshot of (cloned_repos, apt_installed).
-    checkpoints: dict[str, tuple[set[str], set[str]]] = field(default_factory=dict)
+    # Slice 7 — modeled per-(manager,version) language runtime installs.
+    # The mock records what the reconciler asked nvm/pyenv/rbenv to do
+    # so tests can assert without a real shell. Tests can also seed
+    # `runtime_install_failures` with `(manager, version) → exit_code`
+    # to drive the failure path.
+    runtimes_installed: set[tuple[str, str]] = field(default_factory=set)
+    runtime_install_failures: dict[tuple[str, str], int] = field(default_factory=dict)
+    # Slice 6 — modeled per-byte FS: { absolute_path: bytes }. Directories
+    # are implicit (any prefix that has a child). Mode is tracked separately
+    # since most tests don't care, but we keep it for fs_write round-trips.
+    files: dict[str, bytes] = field(default_factory=dict)
+    file_modes: dict[str, int] = field(default_factory=dict)
+    # Slice 6 — canned git outputs per repo path. Tests fill these via
+    # `set_git_status_output` / `set_git_show_output` test hooks. The
+    # mock's `exec_oneshot` recognizes the matching argv shapes and
+    # returns these as stdout.
+    git_status_outputs: dict[str, str] = field(default_factory=dict)
+    git_show_outputs: dict[tuple[str, str], str] = field(default_factory=dict)
+    git_show_missing: set[tuple[str, str]] = field(default_factory=set)
+    # Active fs_watch_subscribe queues. The mock fans events to every
+    # queue whose `path_prefix` covers the event's path. Tests push events
+    # via `_emit_fs_event`.
+    watch_queues: list[tuple[str, bool, asyncio.Queue[FsEvent | None]]] = field(
+        default_factory=list
+    )
+    # checkpoint_id -> deep-copied snapshot of (cloned_repos, apt_installed, files, file_modes).
+    checkpoints: dict[str, tuple[set[str], set[str], dict[str, bytes], dict[str, int]]] = field(
+        default_factory=dict
+    )
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _list_dir(files: dict[str, bytes], path: str) -> list[FsEntry]:
+    """Synthesize an `fs_list` response from the in-memory `files` dict.
+    Anything whose absolute path starts with `path/` becomes either a
+    file entry (if exactly one segment deeper) or a dir entry (if deeper)."""
+    base = path.rstrip("/") + "/"
+    direct_files: dict[str, int] = {}
+    direct_dirs: set[str] = set()
+    for full, content in files.items():
+        if not full.startswith(base):
+            continue
+        rest = full.removeprefix(base)
+        if not rest:
+            continue
+        head, _, tail = rest.partition("/")
+        if tail:
+            direct_dirs.add(head)
+        else:
+            direct_files[head] = len(content)
+    out: list[FsEntry] = [FsEntry(name=name, kind="dir", size=0) for name in sorted(direct_dirs)]
+    out.extend(
+        FsEntry(name=name, kind="file", size=size) for name, size in sorted(direct_files.items())
+    )
+    return out
+
+
+def _path_matches(prefix: str, recursive: bool, path: str) -> bool:
+    if path == prefix:
+        return True
+    if not recursive:
+        # Only direct children fire when recursive=False.
+        return path.startswith(prefix.rstrip("/") + "/") and "/" not in path[len(prefix) + 1 :]
+    return path.startswith(prefix.rstrip("/") + "/")
 
 
 _GIT_CLONE_RE = re.compile(
@@ -66,6 +134,9 @@ class MockSandboxProvider:
 
     def __init__(self) -> None:
         self._sprites: dict[str, _SpriteRecord] = {}
+        # Test override — point this at an in-process fake WS server URL
+        # so the orchestrator's PTY broker has somewhere real to dial.
+        self._pty_url: str | None = None
 
     async def create(self, *, sandbox_id: str, labels: list[str]) -> SandboxHandle:
         _ = labels
@@ -169,6 +240,37 @@ class MockSandboxProvider:
                 full_name = target.removeprefix(prefix).rstrip("/")
                 rec.cloned_repos.discard(full_name)
             return ExecResult(exit_code=0, stdout="", stderr="", duration_s=0.0)
+        # Slice 7: recognise `bash -lc "<manager> install [-s] <version> [|| (...)]"`
+        # so reconciler runtime-install asserts hit a deterministic path.
+        # Recorded by *runtime* name (node/python/ruby) — not manager name —
+        # so tests can assert against the introspection vocabulary.
+        _MANAGER_TO_RUNTIME = {"nvm": "node", "pyenv": "python", "rbenv": "ruby"}
+        if argv[:2] == ["bash", "-lc"] and len(argv) >= 3:
+            tokens = argv[2].split()
+            if len(tokens) >= 3 and tokens[1] == "install":
+                manager = tokens[0]
+                # Real command shape: `<manager> install [-s] <version> [|| (...retry...)]`.
+                # Skip the optional `-s` flag so the mock recognises both
+                # the v1 raw form and the slice-7 retry-with-update form.
+                version_idx = 3 if len(tokens) >= 4 and tokens[2] == "-s" else 2
+                version = tokens[version_idx]
+                runtime = _MANAGER_TO_RUNTIME.get(manager)
+                if runtime is not None:
+                    key = (runtime, version)
+                    if key in rec.runtime_install_failures:
+                        return ExecResult(
+                            exit_code=rec.runtime_install_failures[key],
+                            stdout="",
+                            stderr=f"mock: {manager} install {version} failed",
+                            duration_s=time.monotonic() - start,
+                        )
+                    rec.runtimes_installed.add(key)
+                    return ExecResult(
+                        exit_code=0,
+                        stdout=f"installed {runtime} {version}",
+                        stderr="",
+                        duration_s=time.monotonic() - start,
+                    )
         if argv[:3] == ["apt-get", "install", "-y"]:
             for pkg in argv[3:]:
                 rec.apt_installed.add(pkg)
@@ -178,28 +280,95 @@ class MockSandboxProvider:
                 stderr="",
                 duration_s=0.0,
             )
+        # Strip leading `-c <key=value>` pairs so we can match git argv
+        # shapes regardless of whether the orchestrator passed
+        # `-c safe.directory=*` etc. Then expect the canonical
+        # `git -C <repo> <subcommand> ...` form.
+        i = 1
+        while i < len(argv) - 1 and argv[i] == "-c":
+            i += 2
+        # `git [-c k=v ...] -C <repo_path> status --porcelain=v1 -b -z`
+        if (
+            argv[0] == "git"
+            and i + 2 < len(argv)
+            and argv[i] == "-C"
+            and argv[i + 2] == "status"
+        ):
+            repo = argv[i + 1]
+            stdout = rec.git_status_outputs.get(repo, "")
+            return ExecResult(exit_code=0, stdout=stdout, stderr="", duration_s=0.0)
+        # `git [-c k=v ...] -C <repo_path> show <ref>:<rel>`
+        if (
+            argv[0] == "git"
+            and i + 3 < len(argv)
+            and argv[i] == "-C"
+            and argv[i + 2] == "show"
+        ):
+            repo = argv[i + 1]
+            spec = argv[i + 3]
+            if (repo, spec) in rec.git_show_missing:
+                return ExecResult(
+                    exit_code=128,
+                    stdout="",
+                    stderr=f"fatal: path '{spec}' does not exist",
+                    duration_s=0.0,
+                )
+            content = rec.git_show_outputs.get((repo, spec), "")
+            return ExecResult(exit_code=0, stdout=content, stderr="", duration_s=0.0)
         return ExecResult(exit_code=0, stdout="", stderr="", duration_s=0.0)
 
     async def fs_list(self, handle: SandboxHandle, path: str) -> list[FsEntry]:
         rec = self._require(handle)
-        # Mock only models /work/<full_name> directories; anything else
-        # returns empty. Sufficient for reconciliation's diff path.
-        if path != "/work":
-            return []
-        # Each `<full_name>` becomes one or more entries — owner dir + repo
-        # subdir. We surface just the top-level "owner/repo" form so the
-        # reconciler's diff can match `Repo.full_name` directly.
-        return [
-            FsEntry(name=full_name, kind="dir", size=0) for full_name in sorted(rec.cloned_repos)
-        ]
+        # Slice 5b: top-level /work listing comes from cloned_repos so the
+        # reconciler's diff can match Repo.full_name directly.
+        # Slice 6: any other path looks at the modeled `files` dict so the
+        # IDE file tree has something to render in tests.
+        if path == "/work":
+            entries: list[FsEntry] = [
+                FsEntry(name=full_name, kind="dir", size=0)
+                for full_name in sorted(rec.cloned_repos)
+            ]
+            # Files written directly under /work via fs_write also surface.
+            entries.extend(_list_dir(rec.files, "/work"))
+            # De-dup names (a cloned repo and a manually-written file shouldn't
+            # collide in fixtures, but be defensive).
+            seen: set[str] = set()
+            out: list[FsEntry] = []
+            for entry in entries:
+                if entry.name in seen:
+                    continue
+                seen.add(entry.name)
+                out.append(entry)
+            return out
+        return _list_dir(rec.files, path)
 
     async def fs_delete(self, handle: SandboxHandle, path: str, *, recursive: bool = False) -> None:
-        _ = recursive
         rec = self._require(handle)
         prefix = "/work/"
-        if path.startswith(prefix):
+        # Repo-directory removal under /work — keep the slice 5b behaviour
+        # (drops the entry from cloned_repos) for the reconciler's wipe path.
+        if path.startswith(prefix) and path.count("/") == 3:
             full_name = path.removeprefix(prefix).rstrip("/")
             rec.cloned_repos.discard(full_name)
+        # File-level delete from the modeled FS.
+        if path in rec.files:
+            del rec.files[path]
+            rec.file_modes.pop(path, None)
+            self._emit_fs_event(
+                rec,
+                FsEvent(path=path, kind="delete", is_dir=False, size=None, timestamp_ms=_now_ms()),
+            )
+        elif recursive:
+            # Directory-recursive delete — drop every file beneath `path`.
+            sep_path = path.rstrip("/") + "/"
+            doomed = [p for p in rec.files if p.startswith(sep_path)]
+            for p in doomed:
+                del rec.files[p]
+                rec.file_modes.pop(p, None)
+                self._emit_fs_event(
+                    rec,
+                    FsEvent(path=p, kind="delete", is_dir=False, size=None, timestamp_ms=_now_ms()),
+                )
 
     async def snapshot(self, handle: SandboxHandle, *, comment: str) -> CheckpointId:
         _ = comment
@@ -208,6 +377,8 @@ class MockSandboxProvider:
         rec.checkpoints[ckpt] = (
             copy.deepcopy(rec.cloned_repos),
             copy.deepcopy(rec.apt_installed),
+            copy.deepcopy(rec.files),
+            copy.deepcopy(rec.file_modes),
         )
         return CheckpointId(ckpt)
 
@@ -216,11 +387,106 @@ class MockSandboxProvider:
         snap = rec.checkpoints.get(str(checkpoint_id))
         if snap is None:
             raise SpritesError(f"checkpoint {checkpoint_id!r} not found", retriable=False)
-        cloned, apt = snap
+        cloned, apt, files, modes = snap
         rec.cloned_repos = copy.deepcopy(cloned)
         rec.apt_installed = copy.deepcopy(apt)
+        rec.files = copy.deepcopy(files)
+        rec.file_modes = copy.deepcopy(modes)
         rec.status = "warm"
         return SandboxState(status="warm", public_url=rec.public_url)
+
+    # ── Slice 6 additions ────────────────────────────────────────────────
+
+    async def fs_read(self, handle: SandboxHandle, path: str) -> bytes:
+        rec = self._require(handle)
+        if path not in rec.files:
+            raise SpritesError(f"path {path!r} not found", retriable=False)
+        return rec.files[path]
+
+    async def fs_write(
+        self,
+        handle: SandboxHandle,
+        path: str,
+        content: bytes,
+        *,
+        mode: int = 0o644,
+        mkdir: bool = True,
+    ) -> int:
+        _ = mkdir  # mock has no real directory state — writes always succeed
+        rec = self._require(handle)
+        existed = path in rec.files
+        rec.files[path] = bytes(content)
+        rec.file_modes[path] = mode
+        self._emit_fs_event(
+            rec,
+            FsEvent(
+                path=path,
+                kind="modify" if existed else "create",
+                is_dir=False,
+                size=len(content),
+                timestamp_ms=_now_ms(),
+            ),
+        )
+        return len(content)
+
+    async def fs_rename(self, handle: SandboxHandle, src: str, dst: str) -> None:
+        rec = self._require(handle)
+        if src not in rec.files:
+            raise SpritesError(f"path {src!r} not found", retriable=False)
+        rec.files[dst] = rec.files.pop(src)
+        if src in rec.file_modes:
+            rec.file_modes[dst] = rec.file_modes.pop(src)
+        self._emit_fs_event(
+            rec,
+            FsEvent(
+                path=dst,
+                kind="rename",
+                is_dir=False,
+                size=len(rec.files[dst]),
+                timestamp_ms=_now_ms(),
+            ),
+        )
+
+    async def fs_watch_subscribe(
+        self,
+        handle: SandboxHandle,
+        path: str,
+        *,
+        recursive: bool = True,
+    ) -> AsyncIterator[FsEvent]:
+        rec = self._require(handle)
+        queue: asyncio.Queue[FsEvent | None] = asyncio.Queue()
+        entry = (path.rstrip("/") or "/", recursive, queue)
+        rec.watch_queues.append(entry)
+        try:
+            while True:
+                event = await queue.get()
+                if event is None:
+                    return
+                yield event
+        finally:
+            try:
+                rec.watch_queues.remove(entry)
+            except ValueError:
+                pass
+
+    async def pty_dial_info(
+        self,
+        handle: SandboxHandle,
+        *,
+        cwd: str = "/work",
+        cols: int = 80,
+        rows: int = 24,
+        attach_session_id: str | None = None,
+    ) -> PtyDialInfo:
+        _ = cwd, cols, rows
+        rec = self._require(handle)
+        # Tests override `_pty_url` to point at a local fake echo server
+        # spun up via pytest fixtures. Without an override, return a
+        # placeholder URL the broker will fail to dial — clear signal that
+        # PTY isn't supported on the bare Mock.
+        url = self._pty_url or f"ws://mock-pty-unconfigured/{rec.name}/{attach_session_id or 'new'}"
+        return PtyDialInfo(url=url, headers=[("X-Mock-Sprite", rec.name)])
 
     # ── Test hooks (not part of the Protocol) ────────────────────────────
 
@@ -228,6 +494,64 @@ class MockSandboxProvider:
         """Simulate Sprites' idle-hibernation transition for tests."""
         rec = self._require(handle)
         rec.status = "cold"
+
+    def _emit_fs_event(self, rec: "_SpriteRecord", event: FsEvent) -> None:
+        """Push `event` to every active fs_watch_subscribe consumer whose
+        path covers it. Public test hook: callers may also pass a handle to
+        `emit_fs_event` for fixture-driven event injection."""
+        for prefix, recursive, queue in rec.watch_queues:
+            if not _path_matches(prefix, recursive, event.path):
+                continue
+            queue.put_nowait(event)
+
+    def emit_fs_event(self, handle: SandboxHandle, event: FsEvent) -> None:
+        """Test hook — emit an arbitrary FsEvent into all matching watcher
+        queues for the given sprite. Production code never calls this."""
+        rec = self._require(handle)
+        self._emit_fs_event(rec, event)
+
+    def runtimes_installed(self, handle: SandboxHandle) -> set[tuple[str, str]]:
+        """Test hook — `(manager, version)` pairs the reconciler's
+        `installing_runtimes` phase asked nvm/pyenv/rbenv to install."""
+        return set(self._require(handle).runtimes_installed)
+
+    def fail_runtime_install(
+        self, handle: SandboxHandle, manager: str, version: str, *, exit_code: int = 1
+    ) -> None:
+        """Test hook — make the next `bash -lc '<manager> install <version>'`
+        return a non-zero exit code so failure paths can be exercised."""
+        self._require(handle).runtime_install_failures[(manager, version)] = exit_code
+
+    def close_fs_watch(self, handle: SandboxHandle) -> None:
+        """Test hook — signal every active watch consumer on the sprite to
+        terminate cleanly (yields no more events; the iterator returns)."""
+        rec = self._require(handle)
+        for _prefix, _recursive, queue in list(rec.watch_queues):
+            queue.put_nowait(None)
+
+    def set_git_status_output(self, handle: SandboxHandle, repo_path: str, raw: str) -> None:
+        """Test hook — canned `git status --porcelain=v1 -b -z` stdout
+        returned for `repo_path`. Pass NUL-separated records exactly as
+        git would emit them (the route's parser is what we want to test)."""
+        self._require(handle).git_status_outputs[repo_path] = raw
+
+    def set_git_show_output(
+        self,
+        handle: SandboxHandle,
+        repo_path: str,
+        spec: str,
+        content: str,
+    ) -> None:
+        """Test hook — canned content for `git -C <repo> show <spec>`.
+        `spec` is the `<ref>:<rel_path>` string passed to git show."""
+        self._require(handle).git_show_outputs[(repo_path, spec)] = content
+
+    def mark_git_show_missing(
+        self, handle: SandboxHandle, repo_path: str, spec: str
+    ) -> None:
+        """Test hook — make `git show <spec>` exit non-zero (path not in
+        ref). The route translates this to `exists=False`."""
+        self._require(handle).git_show_missing.add((repo_path, spec))
 
     def _require(self, handle: SandboxHandle) -> _SpriteRecord:
         if handle.provider != "mock":
