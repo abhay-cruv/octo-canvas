@@ -40,6 +40,21 @@ For *what changed structurally*, read [progress.md](progress.md). For *who and w
 
 ## Log
 
+### 2026-05-02 — Claude Opus 4.7 via Claude Code (slice plan reorganized — IDE first, then image, then agent)
+
+- User re-anchored slice 6 scope: it's now the **VS Code-style IDE shell** (file tree + editor + terminal + dummy agent panel), not the agent runtime. Slice plan reorganized 6→11 with new intermediate 8b for User Agent: 6 = IDE shell, 7 = sprite image bake + runtime install + agent_config bootstrap, 8 = chats + bridge + CLI (passthrough), 8b = User Agent, 9 = git ops + PR, 10 = HTTP preview controls, 11 = S3 archive.
+- New [slice6.md](slice/slice6.md) — four collapsible regions, Monaco + xterm.js, sha-If-Match save conflicts, fs/watch live updates, dummy ChatsPanel (toast-only). Provider Protocol widening: `fs_rename` + `fs_watch_subscribe`.
+- New [slice7.md](slice/slice7.md) — sprite image Dockerfile, CI workflow, pinned `claude` CLI + Node + bridge wheel + nvm/pyenv/rbenv, `python_packages/agent_config/` fill-in (`ClaudeCredentials` Protocol + dev-agent prompt + tool allowlist), bridge skeleton that boots and idles cleanly without an orchestrator URL.
+- Renamed old slice6.md → [slice8.md](slice/slice8.md) and reframed: `Task → Chat` rename (chat is user-facing primitive); CLI **stays alive** while web is connected — direct feed via live SDK client, `--resume` is cold-path fallback only after `IDLE_AFTER_DISCONNECT_S = 300` grace post-disconnect; cap raised to `MAX_LIVE_CHATS_PER_SANDBOX = 5`; only chats with no live web subscriber are evictable; **multi-chats per repo via git worktrees** at `/work/<repo>/.octo-worktrees/chat-<slug>/`; PR-open unambiguously a slice 9 milestone.
+- **Plan.md updates**: §18 slice plan rewritten end-to-end; §8 data model collection renames + tags; §10 transport tags updated (slice 8 for bridge work, slice 7 for image/token mint); §10.7 cross-instance routing publishes to `chat:{chat_id}` (renamed from `task:{task_id}`); §13, §14, §15, §16.2 retagged; §17 env vars renamed (`MAX_LIVE_CHATS_PER_SANDBOX`, `IDLE_AFTER_DISCONNECT_S`, added `BRIDGE_IMAGE_TAG`); §19 #30 retagged; §20/§21 updated.
+
+### 2026-05-02 — Claude Opus 4.7 via Claude Code (slice 6 brief + Plan.md agent-runtime pivot)
+
+- Architectural pivot for slice 6: agent runtime is `claude` CLI baked into the sprite image, driven by `claude-agent-sdk`, supervised by a long-lived bridge process at `apps/bridge/` dialing `/ws/bridge/{sandbox_id}`. Subprocess-per-run-via-Sprites-Exec model from earlier drafts is discarded.
+- Authored [docs/slice/slice6.md](slice/slice6.md) end-to-end: Task↔Claude session 1:1, multi-session multiplexing with LRU eviction (cap 3), `ClaudeCredentials` Protocol (v1 = `PlatformApiKeyCredentials` only; OAuth + BYOK reserved), bridge wire schema, ring-buffer replay with `Hello{last_acked_seq}`, cross-instance bridge ownership via Redis, in-process MCP `ask_user_clarification`, sprite image bake (Node + CLI + bridge wheel). PR-open moved to slice 7 (flagged in Risks #1 for explicit user decision).
+- Plan.md updated in lockstep (permitted per [AGENTS.md §3.3](../AGENTS.md), explicit user direction): §4 architecture diagram, §5 agent stack row, §8 widening of User/Task/AgentRun/AgentEvent/Sandbox + seq_counter re-keying, §10.1 (three legs), §10.3 (bridge endpoint row), new §10.4b (bridge wire protocol), §10.6 (heartbeat + replay extended), §10.7 (`bridge_owner:{sandbox_id}` Redis routing), §10.8 (drop "no incoming bridge" non-goal), §14 fully rewritten, §16.2 auth (bridge token + creds), §17 env (`BRIDGE_TOKEN`, `ORCHESTRATOR_WS_URL`, `MAX_LIVE_SESSIONS_PER_SANDBOX`, `SESSION_IDLE_EVICT_S`, `CLAUDE_AUTH_MODE`), §18 slice 6 entry rewritten.
+- Updated [docs/progress.md](progress.md) — slice 6 row + new "Active slice" status + a dated "Recent changes" block summarizing the pivot.
+
 ### 2026-05-02 — Claude Opus 4.7 via Claude Code (slice 5b sign-off)
 
 - Slice 5b signed off. [slice/slice5b.md](slice/slice5b.md) is now frozen. Corrections / followups live in [progress.md](progress.md) under "Slice-5b corrections (post-freeze)" and "Slice-5b open followups".
