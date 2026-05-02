@@ -47,6 +47,8 @@ def _to_response(doc: Sandbox) -> SandboxResponse:
         reset_count=doc.reset_count,
         activity=doc.activity,
         activity_detail=doc.activity_detail,
+        activity_started_at=doc.activity_started_at,
+        last_reconcile_error=doc.last_reconcile_error,
         failure_reason=doc.failure_reason,
         created_at=doc.created_at,
     )

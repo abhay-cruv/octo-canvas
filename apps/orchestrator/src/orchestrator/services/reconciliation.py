@@ -235,9 +235,20 @@ if ! command -v node >/dev/null 2>&1; then
     curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -n bash -
     sudo -n apt-get install -y --no-install-recommends nodejs
 fi
+# NodeSource's `nodejs` deb doesn't bundle `npm` on every Ubuntu
+# release (questing/25.10 ships it as a separate package). Install
+# explicitly when missing — without npm the `claude` CLI install
+# below would fail with `sudo: npm: command not found`.
+if ! command -v npm >/dev/null 2>&1; then
+    sudo -n apt-get install -y --no-install-recommends npm
+fi
 
 log "claude CLI @ {_CLAUDE_CLI_PIN}"
-sudo -n npm install -g @anthropic-ai/claude-code@{_CLAUDE_CLI_PIN}
+# Resolve npm to an absolute path so sudo's secure_path doesn't have
+# to find it (some Ubuntu sudoers configs don't include /usr/bin in
+# secure_path on top of having a stripped PATH).
+NPM_BIN=$(command -v npm)
+sudo -n "$NPM_BIN" install -g @anthropic-ai/claude-code@{_CLAUDE_CLI_PIN}
 
 log "verify"
 bash -lc 'claude --version'
@@ -269,12 +280,20 @@ _RUNTIME_INSTALL_CMDS: dict[str, list[str]] = {
     # `nvm`/`pyenv`/`rbenv`/`rustup` + the go-current symlink are on
     # PATH.
     "node": ["bash", "-lc", "nvm install {version}"],
+    # NB: pyenv/rbenv were `git clone --depth 1 --branch <pin>` so the
+    # working tree sits on a detached HEAD at the tag — `git pull` is a
+    # no-op (no tracking branch). When `installing_runtimes` asks for a
+    # version newer than the pin's catalog, we fetch the latest master
+    # with depth 1 and check out FETCH_HEAD before retrying. This
+    # advances the plugin's recipe database without needing a full
+    # un-shallow clone.
     "python": [
         "bash",
         "-lc",
         'pyenv install -s {version} || ('
         "echo 'pyenv install failed — updating pyenv and retrying' "
-        '&& sudo -n git -C "$PYENV_ROOT" pull --ff-only '
+        '&& sudo -n git -C "$PYENV_ROOT" fetch --depth 1 origin master '
+        '&& sudo -n git -C "$PYENV_ROOT" checkout --quiet FETCH_HEAD '
         '&& pyenv install -s {version}'
         ')',
     ],
@@ -283,7 +302,8 @@ _RUNTIME_INSTALL_CMDS: dict[str, list[str]] = {
         "-lc",
         'rbenv install -s {version} || ('
         "echo 'rbenv install failed — updating ruby-build and retrying' "
-        '&& sudo -n git -C "$RBENV_ROOT/plugins/ruby-build" pull --ff-only '
+        '&& sudo -n git -C "$RBENV_ROOT/plugins/ruby-build" fetch --depth 1 origin master '
+        '&& sudo -n git -C "$RBENV_ROOT/plugins/ruby-build" checkout --quiet FETCH_HEAD '
         '&& rbenv install -s {version}'
         ')',
     ],
@@ -339,7 +359,13 @@ _RUNTIME_INSTALL_CMDS: dict[str, list[str]] = {
         'sudo -n ln -sfn "/usr/local/go-versions/${{LATEST}}" /usr/local/go-current',
     ],
 }
-RUNTIME_INSTALL_TIMEOUT_S = 600
+# Per-runtime install timeout. Most managers (nvm, rustup, java apt,
+# go tarball) finish in <60s — they download prebuilt artifacts.
+# pyenv + rbenv compile from source on slower sprites: cpython 3.13.x
+# can take 10+ minutes on a 1-CPU VM, ruby is similar. 1200s gives
+# enough headroom for the slowest legitimate compile path while still
+# bounding a hung command.
+RUNTIME_INSTALL_TIMEOUT_S = 1200
 
 
 def _now() -> datetime:
@@ -447,6 +473,15 @@ class Reconciler:
             result.skipped = True
             result.skipped_reason = "sandbox_cold"
             return result
+
+        # Slice 7: clear any stale activity from a previous crashed pass.
+        # The end-of-pass `_set_activity(None, None)` doesn't run if the
+        # process died (timeout, OOM, redeploy), leaving the dashboard
+        # showing a 5+ hour-old "installing_runtimes" banner. Reset at
+        # pass start so each phase's first `_set_activity` call writes
+        # a fresh timestamp.
+        if sandbox.activity is not None:
+            await _set_activity(sandbox, None, None)
 
         # Claim any orphan repos owned by this user. Covers users who
         # provisioned before slice 5b shipped (the route's fresh-provision
@@ -604,6 +639,10 @@ class Reconciler:
                         exit_code=upd.exit_code,
                         stderr=upd.stderr[-500:],
                     )
+                    await _set_reconcile_error(
+                        sandbox,
+                        f"apt-get update exit {upd.exit_code}: {upd.stderr.strip()[-200:]}",
+                    )
                 exec_result = await self._provider.exec_oneshot(
                     _handle_of(sandbox),
                     ["sudo", "-n", "apt-get", "install", "-y", *apt_pkgs],
@@ -621,11 +660,18 @@ class Reconciler:
                         stderr=exec_result.stderr[-1000:],
                         stdout=exec_result.stdout[-500:],
                     )
+                    await _set_reconcile_error(
+                        sandbox,
+                        f"apt install exit {exec_result.exit_code}: {exec_result.stderr.strip()[-200:]}",
+                    )
             except SpritesError as exc:
                 _logger.warning(
                     "reconcile.apt_install_error",
                     sandbox_id=str(sandbox_id),
                     error=str(exc),
+                )
+                await _set_reconcile_error(
+                    sandbox, f"apt install: {str(exc)[:200]}"
                 )
 
         # 3. Clones run in parallel with bridge_setup_rest. Clones only
@@ -806,6 +852,9 @@ class Reconciler:
                 sandbox_id=str(sandbox.id),
                 error=str(exc)[:200],
             )
+            await _set_reconcile_error(
+                sandbox, f"bridge setup (pre): {str(exc)[:200]}"
+            )
             return False
         if res.exit_code != 0:
             _logger.warning(
@@ -813,6 +862,10 @@ class Reconciler:
                 sandbox_id=str(sandbox.id),
                 exit_code=res.exit_code,
                 stderr=res.stderr[-1000:],
+            )
+            await _set_reconcile_error(
+                sandbox,
+                f"bridge setup (pre) exit {res.exit_code}: {res.stderr.strip()[-200:]}",
             )
             return False
         return True
@@ -840,6 +893,7 @@ class Reconciler:
                 sandbox_id=str(sandbox.id),
                 error=str(exc)[:200],
             )
+            await _set_reconcile_error(sandbox, f"bridge setup: {str(exc)[:200]}")
             return
         if res.exit_code != 0:
             _logger.warning(
@@ -848,6 +902,10 @@ class Reconciler:
                 exit_code=res.exit_code,
                 stderr=res.stderr[-1000:],
                 stdout=res.stdout[-500:],
+            )
+            await _set_reconcile_error(
+                sandbox,
+                f"bridge setup exit {res.exit_code}: {res.stderr.strip()[-200:]}",
             )
             return
         sandbox.bridge_setup_fingerprint = BRIDGE_SETUP_FINGERPRINT
@@ -992,7 +1050,17 @@ class Reconciler:
         """
         installed: list[tuple[str, str]] = []
         errors: dict[tuple[str, str], str] = {}
-        for manager, version in targets:
+        total = len(targets)
+        for idx, (manager, version) in enumerate(targets, start=1):
+            # Per-runtime activity update so the dashboard banner shows
+            # which one is in flight (cpython compiles for 5-10 min;
+            # without this the user sees "node 24, python 3.13.5" sit
+            # there for the whole window even after Node finished).
+            await _set_activity(
+                sandbox,
+                "installing_runtimes",
+                f"{manager} {version} ({idx}/{total})",
+            )
             template = _RUNTIME_INSTALL_CMDS[manager]
             argv = [part.format(version=version) for part in template]
             try:
@@ -1011,6 +1079,9 @@ class Reconciler:
                     manager=manager,
                     version=version,
                     error=str(exc)[:200],
+                )
+                await _set_reconcile_error(
+                    sandbox, f"{manager} {version}: {str(exc)[:200]}"
                 )
                 continue
             if res.exit_code == 0:
@@ -1032,6 +1103,10 @@ class Reconciler:
                     version=version,
                     exit_code=res.exit_code,
                     stderr=res.stderr[-500:],
+                )
+                await _set_reconcile_error(
+                    sandbox,
+                    f"{manager} {version} exit {res.exit_code}: {res.stderr.strip()[-200:]}",
                 )
         return installed, errors
 
@@ -1102,24 +1177,75 @@ async def _set_activity(sandbox: Sandbox, activity: str | None, detail: str | No
     `$set`, NOT `sandbox.save()`. The reconciler may have loaded the
     sandbox doc minutes ago; a full `save()` here would overwrite a
     destroyed/failed/reset status set by a concurrent route handler.
-    `$set` only touches the two activity fields, leaving everything
+    `$set` only touches the activity-related fields, leaving everything
     else intact.
+
+    Slice 7: also stamps `activity_started_at` (UI shows elapsed time)
+    and clears `last_reconcile_error` whenever the activity *name*
+    changes (so the user sees the freshest error per stage rather than
+    a stale one from earlier in the pass).
 
     Best-effort — a failed update is logged but doesn't abort
     reconciliation."""
     if sandbox.id is None:
         return
+    # Refresh elapsed-time on EITHER a name change (installing_packages
+    # → installing_runtimes) OR a detail change within the same name
+    # (`node 24 (1/2)` → `python 3.13.5 (2/2)`). Without the detail
+    # check the timer would show "time since the FIRST runtime" while
+    # later runtimes ran. Clear `last_reconcile_error` only on a name
+    # change so the user sees the latest error per stage, not per
+    # detail-tick.
+    name_changed = sandbox.activity != activity
+    detail_changed = sandbox.activity_detail != detail
     sandbox.activity = activity  # keep in-memory copy in sync
     sandbox.activity_detail = detail
+    update: dict[str, object] = {"activity": activity, "activity_detail": detail}
+    if name_changed or detail_changed:
+        # Stamp start time on transition into a phase OR a sub-step;
+        # clear when activity goes None (end of pass).
+        new_started_at: datetime | None = _now_utc() if activity is not None else None
+        sandbox.activity_started_at = new_started_at
+        update["activity_started_at"] = new_started_at
+    if name_changed:
+        # Phase change → drop any stale error so the banner reflects
+        # the current stage. The stage's own failure path will set
+        # `last_reconcile_error` again if it trips.
+        sandbox.last_reconcile_error = None
+        update["last_reconcile_error"] = None
     try:
         await Sandbox.find_one(Sandbox.id == sandbox.id).update(  # pyright: ignore[reportGeneralTypeIssues]
-            {"$set": {"activity": activity, "activity_detail": detail}}
+            {"$set": update}
         )
     except Exception as exc:
         _logger.warning(
             "reconcile.set_activity_failed",
             sandbox_id=str(sandbox.id),
             activity=activity,
+            error=str(exc),
+        )
+
+
+def _now_utc() -> datetime:
+    return datetime.now(UTC)
+
+
+async def _set_reconcile_error(sandbox: Sandbox, error: str | None) -> None:
+    """Persist `Sandbox.last_reconcile_error` atomically. Same `$set`
+    discipline as `_set_activity` so we don't clobber concurrent route
+    writes. Best-effort."""
+    if sandbox.id is None:
+        return
+    truncated = error[:300] if error else None
+    sandbox.last_reconcile_error = truncated
+    try:
+        await Sandbox.find_one(Sandbox.id == sandbox.id).update(  # pyright: ignore[reportGeneralTypeIssues]
+            {"$set": {"last_reconcile_error": truncated}}
+        )
+    except Exception as exc:
+        _logger.warning(
+            "reconcile.set_error_failed",
+            sandbox_id=str(sandbox.id),
             error=str(exc),
         )
 

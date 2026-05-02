@@ -25,25 +25,29 @@ const PANEL_KEY = 'octo.dashboardPanelOpen';
 function DashboardPage() {
   const { data: me } = useQuery(meQueryOptions);
   const sandboxes = useQuery(sandboxesQueryOptions);
-  const hasLiveSandbox =
-    Array.isArray(sandboxes.data) &&
-    sandboxes.data.some((s) => s.status !== 'destroyed');
+  const liveSandboxes = Array.isArray(sandboxes.data)
+    ? sandboxes.data.filter((s) => s.status !== 'destroyed')
+    : [];
+  const hasLiveSandbox = liveSandboxes.length > 0;
+  // The reconciler sets `Sandbox.activity` while any phase is in
+  // flight (`installing_bridge` / `installing_packages` /
+  // `installing_runtimes` / `cloning` / `checkpointing` / etc.) and
+  // clears it back to null at the end of the pass. Use that as the
+  // canonical "reconcile is doing something" signal — clone_status
+  // flipping to `ready` only covers the clone phase; later phases
+  // (especially `installing_runtimes`, ~5 min for pyenv compiles)
+  // would otherwise leave the dashboard frozen until manual refresh.
+  const reconcileInFlight = liveSandboxes.some((s) => s.activity != null);
   const connected = useQuery({
     ...connectedReposQueryOptions,
-    // Poll while any repo is mid-clone — the reconciler flips
-    // clone_status from pending → cloning → ready/failed in the
-    // background, and without a refetch the card never updates. Stops
-    // polling once everything settles to ready/failed AND when there's
-    // no live sandbox at all (a destroyed/missing sandbox can't make
-    // pending → ready transitions, so polling would never terminate).
     refetchInterval: (query) => {
       if (!hasLiveSandbox) return false;
       const data = query.state.data;
       if (!data || !Array.isArray(data)) return false;
-      const inFlight = data.some(
+      const cloneInFlight = data.some(
         (r) => r.clone_status === 'pending' || r.clone_status === 'cloning',
       );
-      return inFlight ? 2000 : false;
+      return cloneInFlight || reconcileInFlight ? 2000 : false;
     },
   });
   const navigate = useNavigate();
@@ -864,11 +868,17 @@ function Pill({
 }
 
 function CloneStatusLabel({ status }: { status: string }) {
+  // `pending` is the default state for a connected-but-not-yet-cloned
+  // repo — also the state every repo lands in right after a sandbox
+  // Reset (since `/work` is wiped). Saying "sandbox not yet provisioned"
+  // here was misleading post-Reset; the sandbox IS provisioned, the
+  // clone just hasn't finished yet. The reconciler picks pending repos
+  // up on its next pass.
   const label =
     status === 'pending'
-      ? 'pending — sandbox not yet provisioned'
+      ? 'queued to clone'
       : status === 'cloning'
-        ? 'cloning'
+        ? 'cloning…'
         : status === 'ready'
           ? 'ready'
           : status === 'failed'

@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Link } from '@tanstack/react-router';
 import { sandboxesQueryOptions } from '../lib/queries';
@@ -134,7 +134,7 @@ export function SandboxPanel() {
       />
       <div className="text-sm text-gray-600 space-y-1">
         {active.activity ? (
-          <div className="text-xs px-2 py-1 rounded-md bg-amber-50 border border-amber-200 text-amber-900 inline-flex items-center gap-1.5">
+          <div className="text-xs px-2 py-1 rounded-md bg-amber-50 border border-amber-200 text-amber-900 inline-flex items-center gap-1.5 flex-wrap">
             <span className="inline-block w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse" />
             <span className="font-medium">
               {ACTIVITY_LABELS[active.activity] ?? active.activity}
@@ -142,6 +142,17 @@ export function SandboxPanel() {
             {active.activity_detail ? (
               <span className="font-mono">— {active.activity_detail}</span>
             ) : null}
+            {active.activity_started_at ? (
+              <ElapsedSince since={active.activity_started_at} />
+            ) : null}
+          </div>
+        ) : null}
+        {active.last_reconcile_error ? (
+          <div className="text-xs px-2 py-1 rounded-md bg-red-50 border border-red-200 text-red-900">
+            <span className="font-medium">Last setup error:</span>{' '}
+            <span className="font-mono break-all">
+              {active.last_reconcile_error}
+            </span>
           </div>
         ) : null}
         <div>{labels.subtitle}</div>
@@ -299,6 +310,27 @@ function pickActive(
     if (s.status !== 'destroyed') return s;
   }
   return null;
+}
+
+function ElapsedSince({ since }: { since: string }) {
+  // Re-renders every second so the user can tell "slow legitimate
+  // compile" (timer keeps ticking) from "actually stuck" (timer rolls
+  // past the timeout). The parent already polls Sandbox state every
+  // 2s when activity != null, so the `since` prop refreshes whenever
+  // the reconciler transitions to a new phase — this just smooths
+  // the display between polls.
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const handle = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(handle);
+  }, []);
+  const startedMs = Date.parse(since);
+  if (Number.isNaN(startedMs)) return null;
+  const elapsed = Math.max(0, Math.floor((now - startedMs) / 1000));
+  const m = Math.floor(elapsed / 60);
+  const s = elapsed % 60;
+  const label = m > 0 ? `${m}m ${s}s` : `${s}s`;
+  return <span className="text-amber-700/70">· {label}</span>;
 }
 
 function Card({ children }: { children: React.ReactNode }) {

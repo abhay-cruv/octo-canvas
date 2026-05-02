@@ -40,5 +40,11 @@ class SandboxResponse(BaseModel):
     # "checkpointing", "pausing". `None` when idle.
     activity: str | None = None
     activity_detail: str | None = None
+    # Slice 7: when the current activity started (for elapsed-time UI).
+    activity_started_at: datetime | None = None
+    # Slice 7: short stderr-tail of the most recent reconciler failure
+    # (sanitized). Lets the dashboard show "Last setup error: …" so a
+    # transient install hiccup isn't invisible to the user.
+    last_reconcile_error: str | None = None
     failure_reason: str | None
     created_at: datetime

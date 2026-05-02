@@ -54,6 +54,17 @@ class Sandbox(Document):
     # the activity banner together so the user sees what's in flight.
     activity: str | None = None
     activity_detail: str | None = None
+    # Slice 7: timestamp the current `activity` was set. UI uses this to
+    # show "elapsed 4m 12s" alongside the activity banner so the user
+    # can tell "slow legitimate compile" from "actually stuck". Cleared
+    # whenever activity transitions to None.
+    activity_started_at: datetime | None = None
+    # Slice 7: short stderr-tail of the most recent reconciler failure.
+    # Set at every `reconcile.*_failed` / `*_error` point (apt failure,
+    # bridge_setup, runtime install, clone). Cleared when activity
+    # transitions to a NEW phase (so the user sees the freshest error,
+    # not yesterday's). Sanitized — never includes tokens.
+    last_reconcile_error: str | None = None
     # Slice 7: bridge wiring. The orchestrator mints a per-sandbox token
     # at bridge-launch time (`secrets.token_urlsafe(32)`), pipes the
     # plaintext into the bridge's env as `BRIDGE_TOKEN` via

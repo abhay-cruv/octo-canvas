@@ -158,11 +158,15 @@ function Empty({ children }: { children: React.ReactNode }) {
 }
 
 function CloneStatusLabel({ status }: { status: string }) {
+  // `pending` is the default state for a connected-but-not-yet-cloned
+  // repo — also the state every repo lands in right after a sandbox
+  // Reset (since `/work` is wiped). Saying "sandbox not yet provisioned"
+  // here was misleading post-Reset.
   const label =
     status === 'pending'
-      ? 'pending — sandbox not yet provisioned'
+      ? 'queued to clone'
       : status === 'cloning'
-        ? 'cloning'
+        ? 'cloning…'
         : status === 'ready'
           ? 'ready'
           : status === 'failed'
