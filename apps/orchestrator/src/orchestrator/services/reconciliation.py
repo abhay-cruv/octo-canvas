@@ -143,15 +143,29 @@ sudo -n apt-get install -y --no-install-recommends \\
     libpq-dev libxml2-dev libxslt1-dev libvips-dev libjpeg-dev libpng-dev
 
 log "Adoptium apt repo (Java)"
+# Adoptium only ships LTS Ubuntu pockets (focal/jammy/noble). Sprites
+# may run on a non-LTS image (questing/oracular/plucky/...) — registering
+# an unsupported codename breaks every subsequent `apt-get update` with
+# "does not have a Release file". Map non-LTS to the most recent LTS
+# (Adoptium debs are codename-tolerant; the same .deb installs fine on a
+# newer Ubuntu). The script reconciles the source list every run rather
+# than only-on-first-run so an existing broken file from a prior version
+# of this script gets healed without manual cleanup.
+RAW_CODENAME=$(. /etc/os-release && echo "$VERSION_CODENAME")
+case "$RAW_CODENAME" in
+    focal|jammy|noble) ADOPTIUM_CODENAME="$RAW_CODENAME" ;;
+    *) ADOPTIUM_CODENAME=noble ;;
+esac
+ADOPTIUM_LINE="deb [signed-by=/etc/apt/keyrings/adoptium.gpg] https://packages.adoptium.net/artifactory/deb $ADOPTIUM_CODENAME main"
+sudo -n install -d -m 0755 /etc/apt/keyrings
 if [ ! -f /etc/apt/keyrings/adoptium.gpg ]; then
-    sudo -n install -d -m 0755 /etc/apt/keyrings
     wget -qO - https://packages.adoptium.net/artifactory/api/gpg/key/public \\
         | sudo -n gpg --dearmor -o /etc/apt/keyrings/adoptium.gpg
-    DISTRO_CODENAME=$(. /etc/os-release && echo "$VERSION_CODENAME")
-    echo "deb [signed-by=/etc/apt/keyrings/adoptium.gpg] https://packages.adoptium.net/artifactory/deb $DISTRO_CODENAME main" \\
-        | sudo -n tee /etc/apt/sources.list.d/adoptium.list >/dev/null
-    sudo -n apt-get update -y
 fi
+# Always rewrite the source list (cheap; heals stale codenames from
+# earlier broken runs).
+echo "$ADOPTIUM_LINE" | sudo -n tee /etc/apt/sources.list.d/adoptium.list >/dev/null
+sudo -n apt-get update -y
 
 log "go install root + version-manager dirs"
 sudo -n install -d -m 0755 {_GO_INSTALL_ROOT}
@@ -662,7 +676,23 @@ class Reconciler:
         # Runs after clones because clones don't depend on it; clones
         # already happened in parallel with bridge_setup_rest above.
         runtime_targets = _merge_runtime_targets(repos)
-        if runtime_targets:
+        # Skip `installing_runtimes` entirely when bridge setup hasn't
+        # finished — nvm/pyenv/rbenv/rustup aren't on PATH yet, so every
+        # `nvm install <ver>` would exit 127 (command not found) and
+        # plaster `Repo.runtime_install_error` with noise. The next
+        # reconcile pass after bridge setup succeeds will re-run runtime
+        # install cleanly.
+        bridge_setup_done = (
+            sandbox.bridge_setup_fingerprint == BRIDGE_SETUP_FINGERPRINT
+        )
+        if runtime_targets and not bridge_setup_done:
+            _logger.info(
+                "reconcile.skip_runtime_install",
+                sandbox_id=str(sandbox_id),
+                reason="bridge_setup_not_done",
+                targets=runtime_targets,
+            )
+        if runtime_targets and bridge_setup_done:
             await _set_activity(
                 sandbox,
                 "installing_runtimes",

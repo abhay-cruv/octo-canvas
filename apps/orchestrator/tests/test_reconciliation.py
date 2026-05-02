@@ -317,6 +317,11 @@ async def test_reconcile_installs_runtimes_dedup_across_repos(
             private=False,
             introspection_detected=_intro_with_runtimes(rts),
         ).create()
+    # Pre-seed bridge setup as done — `installing_runtimes` is gated on
+    # this so the reconciler doesn't try `nvm install` before nvm itself
+    # is on PATH.
+    sandbox.bridge_setup_fingerprint = BRIDGE_SETUP_FINGERPRINT
+    await sandbox.save()
 
     reconciler = Reconciler(provider)
     result = await reconciler.reconcile(sandbox.id)
@@ -356,6 +361,9 @@ async def test_reconcile_runtime_install_failure_recorded_per_repo(
 
     h = SandboxHandle(provider="mock", payload={"name": f"octo-sbx-{sandbox.id}"})
     provider.fail_runtime_install(h, "node", "0.0.0-bogus", exit_code=1)
+    # Pre-seed bridge setup as done so the runtime-install gate opens.
+    sandbox.bridge_setup_fingerprint = BRIDGE_SETUP_FINGERPRINT
+    await sandbox.save()
 
     reconciler = Reconciler(provider)
     result = await reconciler.reconcile(sandbox.id)
