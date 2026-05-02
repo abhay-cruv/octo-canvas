@@ -52,10 +52,22 @@ from sandbox_provider.interface import (
 _logger = structlog.get_logger("sandbox_provider.sprites")
 
 # Sprites' status enum maps 1:1 onto our ProviderStatus.
+# Map every Sprites lifecycle string we know about — keys lowercased
+# at lookup time. Anything an idle/paused/stopped sprite reports
+# resolves to `cold`; transient warming/starting strings resolve to
+# `warm`. Unknown strings fall through to the warning path below.
 _STATUS_MAP: dict[str, ProviderStatus] = {
     "cold": "cold",
+    "stopped": "cold",
+    "idle": "cold",
+    "paused": "cold",
+    "hibernated": "cold",
     "warm": "warm",
+    "starting": "warm",
+    "warming": "warm",
+    "ready": "warm",
     "running": "running",
+    "active": "running",
 }
 
 
@@ -514,13 +526,21 @@ def _to_text(buf: object) -> str:
 
 
 def _to_state(sprite: Sprite) -> SandboxState:
-    raw = sprite.status or "cold"
+    raw = (sprite.status or "cold").lower()
     mapped = _STATUS_MAP.get(raw)
     if mapped is None:
-        # Sprites might add intermediate states (e.g. 'starting'). Map to
-        # 'warm' as a safe approximation.
-        _logger.warning("sprites.unknown_status", status=raw, name=sprite.name)
-        mapped = "warm"
+        # Sprites might add a state we haven't taught the map. Default
+        # to `cold` (safer than `warm` — the previous default kept
+        # actually-cold sprites stuck reading as warm in the dashboard
+        # whenever Sprites rebranded a status string). Log the raw
+        # value loudly so we can extend the map.
+        _logger.warning(
+            "sprites.unknown_status",
+            status=sprite.status,
+            name=sprite.name,
+            mapped_to="cold",
+        )
+        mapped = "cold"
     return SandboxState(status=mapped, public_url=sprite.url)
 
 
