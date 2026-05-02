@@ -300,12 +300,15 @@ _RUNTIME_INSTALL_CMDS: dict[str, list[str]] = {
         # `/.sprite/bin/python3`). `pyenv global` writes
         # `$PYENV_ROOT/version`; PYENV_ROOT is root-owned post-bridge-
         # setup, so we sudo-write the file directly.
-        '(pyenv install -s {version} || ('
+        # bash's `||` and `&&` are equal-precedence + left-associative,
+        # so this chains correctly without grouping: the tee + rehash
+        # only run when EITHER the first install OR the retry succeeds.
+        'pyenv install -s {version} || ('
         "echo 'pyenv install failed — updating pyenv and retrying' "
         '&& sudo -n git -C "$PYENV_ROOT" fetch --depth 1 origin master '
         '&& sudo -n git -C "$PYENV_ROOT" checkout --quiet FETCH_HEAD '
         '&& pyenv install -s {version}'
-        ')) '
+        ') '
         '&& sudo -n tee "$PYENV_ROOT/version" >/dev/null <<<"{version}" '
         '&& pyenv rehash',
     ],
@@ -314,12 +317,12 @@ _RUNTIME_INSTALL_CMDS: dict[str, list[str]] = {
         "-lc",
         # Same `pyenv global` rationale — set this as rbenv's default
         # so `ruby` resolves outside of an `.ruby-version` repo.
-        '(rbenv install -s {version} || ('
+        'rbenv install -s {version} || ('
         "echo 'rbenv install failed — updating ruby-build and retrying' "
         '&& sudo -n git -C "$RBENV_ROOT/plugins/ruby-build" fetch --depth 1 origin master '
         '&& sudo -n git -C "$RBENV_ROOT/plugins/ruby-build" checkout --quiet FETCH_HEAD '
         '&& rbenv install -s {version}'
-        ')) '
+        ') '
         '&& sudo -n tee "$RBENV_ROOT/version" >/dev/null <<<"{version}" '
         '&& rbenv rehash',
     ],

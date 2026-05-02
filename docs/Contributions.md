@@ -40,6 +40,24 @@ For *what changed structurally*, read [progress.md](progress.md). For *who and w
 
 ## Log
 
+### 2026-05-02 — Claude Opus 4.7 (1M) via Claude Code (slice 7 — sign-off)
+
+User signed off on slice 7. [slice7.md](slice/slice7.md) frozen with a header note pointing future corrections to progress.md. Status flipped to ✅ shipped on the slice table; full implementation summary + post-freeze followups added to [progress.md](progress.md) under "Slice-7 implementation summary" / "Slice-7 followups (post-freeze)".
+
+What's in vs. punted:
+
+- ✅ Reconciler-driven bridge setup (apt baseline + Adoptium + nvm/pyenv/rbenv + Node + npm + pinned claude CLI + rustup + go install root). Idempotent at fingerprint level + shell level; pre/rest split parallelizes with clones.
+- ✅ All six standard runtimes (`node`/`python`/`ruby`/`java`/`go`/`rust`) installed by `installing_runtimes` with shim-resolves-cleanly post-install (`nvm alias default` / pyenv & rbenv global writes).
+- ✅ Self-healing on stale-catalog: `pyenv install` falls back to `git fetch + checkout FETCH_HEAD` when a requested version postdates the pinned plugin's recipes.
+- ✅ Anthropic API key never enters the sprite (pydantic `SecretStr` on the orchestrator side, `BridgeRuntimeConfig._anthropic_api_key` masked-`__repr__`, `env_for(...)` emits sandbox-scoped Bearer-mode synthetic only).
+- ✅ Dashboard observability: per-detail elapsed timer, `last_reconcile_error` red row, "Agent setup" banner per repo, sandbox-aware polling that stops after destroy, "queued to clone" copy.
+- ✅ Defensive cleanup at three levels (per-pass start, per-detail tick, lifespan boot sweep) so a crashed reconcile can't poison the UI banner forever.
+- ⏭ Anthropic reverse-proxy implementation → slice 8. Full contract pinned in [slice7.md §6b](slice/slice7.md) + [slice8.md §3a](slice/slice8.md): async streaming, header swap, no buffering, token validation.
+- ⏭ Bridge auto-cold on FE disconnect → slice 8 (the `IDLE_AFTER_DISCONNECT_S` knob is wired but only fires once the bridge is dialing home).
+- ⏭ Per-stage activity granularity inside `installing_bridge` → optional follow-up.
+
+Test counts at sign-off: orchestrator **175**, bridge **6**, agent_config **12**, sandbox-provider **49**. FE typecheck clean.
+
 ### 2026-05-02 — Claude Opus 4.7 via Claude Code (slice 6 sign-off)
 
 - Slice 6 signed off. [slice/slice6.md](slice/slice6.md) is now frozen — corrections live in [progress.md](progress.md) under "Slice-6 corrections (post-freeze)".
