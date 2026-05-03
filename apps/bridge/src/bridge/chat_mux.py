@@ -33,6 +33,7 @@ from claude_agent_sdk import (
     ClaudeAgentOptions,
     ClaudeSDKClient,
     ResultMessage as SDKResultMessage,
+    StreamEvent as SDKStreamEvent,
     SystemMessage,
     TextBlock,
     ThinkingBlock as SDKThinkingBlock,
@@ -58,11 +59,26 @@ class _LiveChat:
     claude_session_id: str | None = None
     started_emitted: bool = False
     receive_task: asyncio.Task[None] | None = None
+    # Tracks the SDK-level permission mode currently active for this
+    # chat. Spawn locks the value; subsequent UserMessages can request
+    # a different mode via the per-frame `permission_mode` field, in
+    # which case we call `client.set_permission_mode(...)` before the
+    # query. Without this, follow-ups would ignore the user's toggle.
+    sdk_permission_mode: str = "acceptEdits"
     # Latest assistant text accumulator — flushed as `assistant.message`
     # at end-of-turn. SDK's streaming text comes in `AssistantMessage`
     # blocks; we emit deltas in real time AND a final `assistant.message`
     # for the user-agent filter.
     pending_assistant_text: list[str] = field(default_factory=list)
+    # Per-StreamEvent index → in-flight tool_use accumulator. Lets us
+    # emit `tool.started` in real time (between text deltas) instead of
+    # waiting for the final `AssistantMessage` (which lands AFTER the
+    # entire response, making tool calls appear at the bottom of the
+    # bubble out of order with the surrounding text).
+    inflight_tools: dict[int, dict[str, Any]] = field(default_factory=dict)
+    # `tool_use_id`s already emitted via the StreamEvent path so the
+    # AssistantMessage finalizer doesn't double-emit.
+    streamed_tool_use_ids: set[str] = field(default_factory=set)
 
 
 class ChatMux:
@@ -87,19 +103,49 @@ class ChatMux:
         chat_id: str,
         text: str,
         claude_session_id: str | None,
+        permission_mode: str | None = None,
     ) -> None:
         """Entry point for inbound `UserMessage` from the orchestrator.
-        Spawns or reuses a `ClaudeSDKClient`, sends the text."""
+        Spawns or reuses a `ClaudeSDKClient`, sends the text.
+
+        `permission_mode` is honored only on FIRST spawn — once a
+        ClaudeSDKClient is alive the SDK's spawn-time permission_mode
+        is locked. Follow-ups in the same chat keep the original mode.
+        """
         async with self._lock:
             chat = self._chats.get(chat_id)
             if chat is None:
                 if len(self._chats) >= self._max_live:
                     await self._evict_lru_locked()
                 chat = await self._spawn_locked(
-                    chat_id=chat_id, resume=claude_session_id
+                    chat_id=chat_id,
+                    resume=claude_session_id,
+                    permission_mode=permission_mode,
                 )
                 self._chats[chat_id] = chat
             chat.last_active = time.monotonic()
+        # Runtime mode flip: if the user toggled permissions between
+        # turns, push the new mode to the live SDK client BEFORE the
+        # query. Cheap roundtrip via the SDK's control protocol.
+        desired_sdk_mode = _map_permission_mode(permission_mode)
+        if (
+            desired_sdk_mode is not None
+            and desired_sdk_mode != chat.sdk_permission_mode
+        ):
+            try:
+                await chat.client.set_permission_mode(desired_sdk_mode)  # type: ignore[arg-type]
+                chat.sdk_permission_mode = desired_sdk_mode
+                _logger.info(
+                    "bridge.chat_mux.permission_mode_changed",
+                    chat_id=chat_id,
+                    new_mode=desired_sdk_mode,
+                )
+            except Exception as exc:  # noqa: BLE001
+                _logger.warning(
+                    "bridge.chat_mux.permission_mode_change_failed",
+                    chat_id=chat_id,
+                    error=str(exc)[:200],
+                )
         try:
             await chat.client.query(text)
         except Exception as exc:  # noqa: BLE001
@@ -146,17 +192,30 @@ class ChatMux:
     # ── internals ────────────────────────────────────────────────────
 
     async def _spawn_locked(
-        self, *, chat_id: str, resume: str | None
+        self,
+        *,
+        chat_id: str,
+        resume: str | None,
+        permission_mode: str | None = None,
     ) -> _LiveChat:
         """Build options, instantiate a `ClaudeSDKClient`, kick off the
-        receive loop. Caller holds `self._lock`."""
+        receive loop. Caller holds `self._lock`.
+
+        `permission_mode` mapping (per `User.chat_permission_mode`):
+          - "all_granted" → SDK `bypassPermissions` (no prompts; agent
+            runs every tool unattended).
+          - "ask"         → SDK `acceptEdits` (Edits auto-accept; Bash
+            and similar trigger an in-line ask).
+          - None / unknown → bridge default `acceptEdits`.
+        """
+        sdk_mode = _map_permission_mode(permission_mode) or "acceptEdits"
         env = self._credentials.env()
         prompt = _render_root_prompt(work_root=self._cwd)
         options = ClaudeAgentOptions(
             cwd=self._cwd,
             system_prompt=prompt,
             allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
-            permission_mode="acceptEdits",
+            permission_mode=sdk_mode,  # type: ignore[arg-type]
             resume=resume,
             env=env,
             include_partial_messages=True,
@@ -165,7 +224,10 @@ class ChatMux:
         client = ClaudeSDKClient(options=options)
         await client.connect()
         chat = _LiveChat(
-            chat_id=chat_id, client=client, last_active=time.monotonic()
+            chat_id=chat_id,
+            client=client,
+            last_active=time.monotonic(),
+            sdk_permission_mode=sdk_mode,
         )
         chat.receive_task = asyncio.create_task(self._pump_messages(chat))
         return chat
@@ -194,18 +256,95 @@ class ChatMux:
         self, chat: _LiveChat, message: Any
     ) -> None:
         """SDK message → wire frame(s)."""
+        # Live-streaming text deltas. With `include_partial_messages=True`
+        # the SDK emits `StreamEvent`s containing the raw Anthropic API
+        # stream events ahead of the final `AssistantMessage`. We forward
+        # text/thinking deltas as live `assistant.delta` / `thinking`
+        # frames so the FE can render them character-by-character.
+        if isinstance(message, SDKStreamEvent):
+            event = message.event or {}
+            etype = event.get("type")
+            if etype == "content_block_start":
+                idx = event.get("index")
+                cb = event.get("content_block") or {}
+                if isinstance(idx, int) and cb.get("type") == "tool_use":
+                    chat.inflight_tools[idx] = {
+                        "id": cb.get("id") or "",
+                        "name": cb.get("name") or "tool",
+                        "input_json": "",
+                        "input": cb.get("input") if isinstance(cb.get("input"), dict) else {},
+                    }
+            elif etype == "content_block_delta":
+                idx = event.get("index")
+                delta = event.get("delta") or {}
+                dtype = delta.get("type")
+                if dtype == "text_delta":
+                    text = delta.get("text") or ""
+                    if text:
+                        await self._emit(
+                            chat.chat_id, "assistant.delta", {"text": text}
+                        )
+                elif dtype == "input_json_delta" and isinstance(idx, int):
+                    tool = chat.inflight_tools.get(idx)
+                    if tool is not None:
+                        partial = delta.get("partial_json") or ""
+                        tool["input_json"] += partial
+                # `thinking_delta` is intentionally NOT streamed: the
+                # FE renders thinking as a single collapsible block,
+                # not a live-typing element. Emit one consolidated
+                # `thinking` frame from the AssistantMessage path
+                # below instead.
+            elif etype == "content_block_stop":
+                idx = event.get("index")
+                if isinstance(idx, int):
+                    tool = chat.inflight_tools.pop(idx, None)
+                    if tool is not None and tool.get("id"):
+                        # Parse the accumulated input JSON. Fall back to
+                        # whatever `input` came on `content_block_start`
+                        # (SDK pre-populates the dict-shape for some
+                        # tools).
+                        import json as _json
+                        try:
+                            args = (
+                                _json.loads(tool["input_json"])
+                                if tool["input_json"]
+                                else tool.get("input") or {}
+                            )
+                        except _json.JSONDecodeError:
+                            args = tool.get("input") or {}
+                        if not isinstance(args, dict):
+                            args = {"value": args}
+                        chat.streamed_tool_use_ids.add(tool["id"])
+                        await self._emit(
+                            chat.chat_id,
+                            "tool.started",
+                            {
+                                "tool_use_id": tool["id"],
+                                "tool_name": tool["name"],
+                                "args": args,
+                            },
+                        )
+            return
         if isinstance(message, SDKAssistantMessage):
             for block in message.content:
                 if isinstance(block, TextBlock):
+                    # Accumulate for the canonical `assistant.message`
+                    # frame at turn close. We deliberately DON'T emit a
+                    # delta here — the StreamEvent path above already
+                    # streamed the same text incrementally. Emitting
+                    # again would double-render in the FE.
                     chat.pending_assistant_text.append(block.text)
-                    await self._emit(
-                        chat.chat_id, "assistant.delta", {"text": block.text}
-                    )
                 elif isinstance(block, SDKThinkingBlock):
                     await self._emit(
                         chat.chat_id, "thinking", {"text": block.thinking}
                     )
                 elif isinstance(block, ToolUseBlock):
+                    # Skip if already streamed via the StreamEvent path
+                    # (real-time, in-order with surrounding text). Falls
+                    # through only when partial messages weren't enabled
+                    # — defensive backstop.
+                    if block.id in chat.streamed_tool_use_ids:
+                        continue
                     await self._emit(
                         chat.chat_id,
                         "tool.started",
@@ -319,6 +458,20 @@ class ChatMux:
             await chat.client.disconnect()
         except Exception:  # noqa: BLE001
             pass
+
+
+def _map_permission_mode(mode: str | None) -> str | None:
+    """User-facing → SDK PermissionMode mapping.
+    `all_granted` → SDK `bypassPermissions` (no prompts).
+    `ask`         → SDK `acceptEdits` (Edits auto-accept; Bash + similar
+                    risky tools trigger an in-line ask).
+    Any other value (or None) returns None — caller falls back to its
+    spawn-time default."""
+    if mode == "all_granted":
+        return "bypassPermissions"
+    if mode == "ask":
+        return "acceptEdits"
+    return None
 
 
 def _render_root_prompt(*, work_root: str) -> str:

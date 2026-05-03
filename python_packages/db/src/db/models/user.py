@@ -21,6 +21,15 @@ ClaudeAuthMode = Literal["platform_api_key", "user_oauth", "user_api_key"]
 # Gemini land later as additional `LLMProvider` impls.
 UserAgentProvider = Literal["anthropic", "openai", "google"]
 
+# Slice 8: how the dev agent handles tool-use permissions.
+# - `all_granted`  → Claude SDK `bypassPermissions`. The agent runs
+#   tools (Read/Write/Edit/Bash/...) without asking. Recommended for
+#   the chat UX where the user-agent loop already filters questions.
+# - `ask`          → Claude SDK `acceptEdits`. Edits auto-accept, but
+#   risky tools (Bash, etc.) trigger a permission ask that surfaces
+#   as assistant text the user must reply to.
+ChatPermissionMode = Literal["all_granted", "ask"]
+
 
 class User(Document):
     github_user_id: Annotated[int, Indexed(unique=True)]
@@ -41,6 +50,10 @@ class User(Document):
     user_agent_enabled: bool = True
     user_agent_provider: UserAgentProvider = "anthropic"
     user_agent_model: str = "claude-haiku-4-5"
+    # Default to `all_granted` so chats run frictionlessly out of the box.
+    # The user can flip to `ask` from the settings panel for tighter
+    # supervision of tool calls.
+    chat_permission_mode: ChatPermissionMode = "all_granted"
 
     class Settings:
         name = Collections.USERS

@@ -103,7 +103,22 @@ export function useChatStream(chatId: string | undefined): UseChatStreamResult {
           lastSeqRef.current = seqVal;
           setLastSeq(seqVal);
         }
-        setEvents((prev) => [...prev, msg]);
+        // De-dup: events get a stable key based on type + seq +
+        // claude_session_id (the orchestrator allocates seq per
+        // (chat, session) so the same seq can repeat across sessions).
+        // React StrictMode in dev opens two WebSockets which would
+        // otherwise produce two copies of every event.
+        setEvents((prev) => {
+          const sessId =
+            (msg as { claude_session_id?: string | null }).claude_session_id ?? '';
+          const key = `${msg.type}|${seqVal ?? 'nil'}|${sessId}`;
+          for (const e of prev) {
+            const eSess =
+              (e as { claude_session_id?: string | null }).claude_session_id ?? '';
+            if (`${e.type}|${e.seq ?? 'nil'}|${eSess}` === key) return prev;
+          }
+          return [...prev, msg];
+        });
       });
 
       ws.addEventListener('close', () => {

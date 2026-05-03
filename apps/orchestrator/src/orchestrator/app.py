@@ -129,10 +129,23 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
                 return
             user = await _User.get(chat.user_id)
             user_agent_enabled = bool(user and user.user_agent_enabled)
-            claude_session_id = (
-                getattr(frame, "claude_session_id", None)
-                or chat.claude_session_id
-            )
+            frame_session_id = getattr(frame, "claude_session_id", None)
+            claude_session_id = frame_session_id or chat.claude_session_id
+            # Persist the FIRST claude_session_id we see for this chat
+            # so subsequent events (which arrive WITHOUT session_id on
+            # the wire — only `chat.started` / `result` carry one)
+            # land in the same seq space. Without this, every bridge
+            # restart spawned a fresh SDK client → new session_id →
+            # events split across multiple seq spaces → FE replay sees
+            # bunched turn_ends after turn 1 because mongo sorts by
+            # seq and seq=2 has a `result` row from each session.
+            if (
+                frame_session_id
+                and chat.claude_session_id != frame_session_id
+            ):
+                chat.claude_session_id = frame_session_id
+                await chat.save()
+                claude_session_id = frame_session_id
             await append_chat_event(
                 chat_id,
                 frame,  # type: ignore[arg-type]

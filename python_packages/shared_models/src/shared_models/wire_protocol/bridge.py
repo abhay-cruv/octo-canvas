@@ -284,6 +284,14 @@ class UserMessage(_BridgeFrame):
     frame_id: str
     text: str
     claude_session_id: str | None = None
+    # Slice 8: drives the dev agent's tool-permission behavior on the
+    # spawned `ClaudeSDKClient`. Honored only on FIRST UserMessage
+    # of a chat (when the SDK client is freshly spawned); subsequent
+    # follow-ups for a live chat reuse the spawn-time mode.
+    # - "all_granted" → SDK `permission_mode='bypassPermissions'`
+    # - "ask"         → SDK `permission_mode='acceptEdits'`
+    # - None / other  → bridge default ('acceptEdits')
+    permission_mode: Literal["all_granted", "ask"] | None = None
 
 
 class CancelChat(_BridgeFrame):

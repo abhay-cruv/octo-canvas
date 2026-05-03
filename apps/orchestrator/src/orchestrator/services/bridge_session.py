@@ -457,86 +457,49 @@ class BridgeSessionFleet:
 
     async def ensure_started(self, sandbox: Sandbox) -> None:
         """Idempotent: ensure a Sprites Service named `bridge` is
-        declared + running on this sandbox, with a `BridgeSession`
-        dialing in via `/proxy` WSS.
+        declared + running, with a `BridgeSession` dialing in via
+        `/proxy` WSS, AND `Sandbox.bridge_token_hash` matches the
+        token actually in the service env.
 
-        Strategy: try Services API first (clean lifecycle: PUT def +
-        POST start → Sprites supervises). If Services API fails (older
-        sprites where `services manager not started`), fall back to
-        the exec_oneshot nohup launch path.
+        Strategy:
+          1. Read existing service env (single source of truth for the
+             running bridge's BRIDGE_TOKEN). Adopt if present.
+          2. If no service def yet → mint fresh env.
+          3. Persist hash(BRIDGE_TOKEN) to mongo so the Anthropic
+             proxy's bearer validation matches.
+          4. Upsert service def + start (idempotent — Sprites no-ops
+             on already-running). For sprites without Services API,
+             fall back to exec_oneshot nohup launch.
+          5. Re-read service env afterwards and reconcile mongo to it
+             (Sprites' PUT-while-running quirks: env-on-disk may not
+             match env-on-process; we trust whatever ended up running).
+          6. Ensure a `BridgeSession` exists.
+
+        This shape keeps mongo + service env in sync across:
+          - first provision (no service yet → mint, persist, start)
+          - orchestrator reload (cache cold → adopt running env)
+          - reset (service untouched → adopt)
+          - cold pause + resume (service def survives → adopt env from def)
+          - explicit `restart()` (calls into here after stop+drop cache)
         """
         if sandbox.id is None:
             return
         sandbox_id = str(sandbox.id)
-        # Cached env: a previous ensure_started already minted a token,
-        # persisted its hash, and launched. Reuse it — minting a fresh
-        # token on every chat message would invalidate the running
-        # bridge's auth and Claude would 401 in a retry loop.
+
+        # 1+2. Resolve env: cached (warm) → adopted from service def → minted.
         env = self._cached_env.get(sandbox_id)
-        cache_was_cold = env is None
         if env is None:
-            # If a service is already running, ADOPT its existing
-            # BRIDGE_TOKEN — don't mint a fresh one. This keeps the
-            # token stable across orchestrator restarts (uvicorn reload
-            # in dev) so the proxy keeps validating successfully.
-            env = None
-            try:
-                from sandbox_provider import SandboxProvider as _SP  # noqa: F401
-                # Read service definition to get current env.
-                # Sprites GET returns the service def including env.
-                # We don't have a typed accessor; reach through the
-                # provider's underlying client. Best-effort — fall
-                # through to fresh mint on any error.
-                import asyncio as _asyncio
+            adopted = await self._read_service_env(sandbox)
+            env = adopted if adopted is not None else self._bridge_env_for(sandbox)
 
-                # Status query also returns env on Sprites — but our
-                # ServiceStatus type doesn't expose env. Read via raw
-                # call instead.
-                env = await self._read_service_env(sandbox)
-            except Exception as exc:  # noqa: BLE001
-                _logger.info(
-                    "bridge_session_fleet.adopt_failed",
-                    sandbox_id=sandbox_id, error=str(exc)[:200],
-                )
-                env = None
-            if env is None:
-                env = self._bridge_env_for(sandbox)
-            # Persist whichever bridge_token we ended up with so the
-            # proxy's bearer validation works.
-            bridge_token = env.get("BRIDGE_TOKEN") or env.get("ANTHROPIC_AUTH_TOKEN")
-            if bridge_token and sandbox.id is not None:
-                from orchestrator.services.sandbox_manager import _hash_bridge_token
+        # 3. Persist hash so proxy bearer validation works on the next
+        #    Claude API call. Always — cheap mongo write, idempotent.
+        await self._persist_token_hash(sandbox, env)
+        self._cached_env[sandbox_id] = env
 
-                token_hash = _hash_bridge_token(bridge_token)
-                if sandbox.bridge_token_hash != token_hash:
-                    await Sandbox.find_one(Sandbox.id == sandbox.id).update(  # pyright: ignore[reportGeneralTypeIssues]
-                        {"$set": {"bridge_token_hash": token_hash}}
-                    )
-                    sandbox.bridge_token_hash = token_hash
-            self._cached_env[sandbox_id] = env
-        # Try Services API first — clean lifecycle, Sprites supervises.
-        # CRITICAL: don't restart on cache_was_cold (orchestrator
-        # uvicorn reloads happen often during dev; restarting the
-        # bridge every time would kill in-flight chats and force token
-        # rotation needlessly). Trust the running service. If our
-        # BridgeSession can't dial /proxy, we'll surface that error
-        # and the user can hit force-relaunch explicitly.
+        # 4. Bring the service up. Idempotent — start on running is no-op.
+        services_path_failed = False
         try:
-            # Check status first — if already running with our token
-            # hash matching what's in mongo, skip the upsert+start
-            # entirely (true idempotent).
-            try:
-                status = await self._provider.service_status(
-                    _handle_of(sandbox), name=BRIDGE_SERVICE_NAME
-                )
-                if status.status == "running":
-                    _logger.info(
-                        "bridge_session_fleet.service_already_running",
-                        sandbox_id=sandbox_id, pid=status.pid,
-                    )
-                    return
-            except SpritesError:
-                pass  # service not declared yet — fall through to upsert
             await self._provider.upsert_service(
                 _handle_of(sandbox),
                 name=BRIDGE_SERVICE_NAME,
@@ -550,27 +513,39 @@ class BridgeSessionFleet:
                 _handle_of(sandbox), name=BRIDGE_SERVICE_NAME
             )
             _logger.info(
-                "bridge_session_fleet.service_started",
+                "bridge_session_fleet.service_ensured",
                 sandbox_id=sandbox_id,
             )
-            return
         except SpritesError as exc:
             _logger.warning(
                 "bridge_session_fleet.services_api_unavailable",
                 sandbox_id=sandbox_id, error=str(exc)[:200],
                 fallback="exec_launch",
             )
-        # Fallback: exec_oneshot + nohup launch (works on old sprites
-        # whose services manager isn't initialized).
-        try:
-            await self._exec_launch(sandbox, env, force=cache_was_cold)
-        except SpritesError as exc:
-            _logger.warning(
-                "bridge_session_fleet.exec_launch_failed",
-                sandbox_id=sandbox_id,
-                error=str(exc)[:200],
-            )
-            raise
+            services_path_failed = True
+
+        if services_path_failed:
+            # Fallback for sprites with no Services API.
+            try:
+                await self._exec_launch(sandbox, env, force=False)
+            except SpritesError as exc:
+                _logger.warning(
+                    "bridge_session_fleet.exec_launch_failed",
+                    sandbox_id=sandbox_id, error=str(exc)[:200],
+                )
+                raise
+
+        # 5. Reconcile: re-read service env to confirm token hash on
+        #    mongo matches the running service. Catches Sprites
+        #    PUT-while-running quirks where the def env we just sent
+        #    didn't actually replace the running process's env.
+        if not services_path_failed:
+            actual = await self._read_service_env(sandbox)
+            if actual is not None:
+                self._cached_env[sandbox_id] = actual
+                await self._persist_token_hash(sandbox, actual)
+
+        # 6. BridgeSession dials /proxy + sends queued frames.
         async with self._lock:
             session = self._sessions.get(sandbox_id)
             if session is None:
@@ -583,11 +558,41 @@ class BridgeSessionFleet:
                 self._sessions[sandbox_id] = session
                 await session.start()
 
+    async def _persist_token_hash(
+        self, sandbox: Sandbox, env: dict[str, str]
+    ) -> None:
+        """Write `Sandbox.bridge_token_hash = sha256(env BRIDGE_TOKEN)` if
+        it doesn't already match. Idempotent + cheap."""
+        if sandbox.id is None:
+            return
+        bridge_token = env.get("BRIDGE_TOKEN") or env.get("ANTHROPIC_AUTH_TOKEN")
+        if not bridge_token:
+            return
+        from orchestrator.services.sandbox_manager import _hash_bridge_token
+
+        token_hash = _hash_bridge_token(bridge_token)
+        if sandbox.bridge_token_hash == token_hash:
+            return
+        await Sandbox.find_one(Sandbox.id == sandbox.id).update(  # pyright: ignore[reportGeneralTypeIssues]
+            {"$set": {"bridge_token_hash": token_hash}}
+        )
+        sandbox.bridge_token_hash = token_hash
+        _logger.info(
+            "bridge_session_fleet.token_hash_synced",
+            sandbox_id=str(sandbox.id),
+        )
+
     async def _read_service_env(self, sandbox: Sandbox) -> dict[str, str] | None:
-        """Read the running bridge service's env via Sprites' raw HTTP.
-        Returns None if the service isn't declared (or any error). Used
-        to adopt the existing token on orchestrator restart instead of
-        rotating it (which would invalidate the running bridge's auth)."""
+        """Read the bridge service's `env` from Sprites' service def
+        (works regardless of running/stopped — it's a GET on the def).
+        Returns None if the service isn't declared OR the provider isn't
+        Sprites OR any HTTP error.
+
+        Used to adopt the existing token on:
+          - orchestrator restart (preserves token across uvicorn reload)
+          - reset (service def survives /work wipe)
+          - cold pause + resume (service def stays in the def store)
+        """
         from sandbox_provider import SpritesProvider
 
         provider = self._provider
@@ -705,59 +710,42 @@ fi
         )
 
     async def restart(self, sandbox: Sandbox) -> None:
-        """Force-restart the bridge daemon (e.g. after a wheel reinstall).
-        The exec_launch script kills the existing PID and starts a
-        fresh process, so a plain `ensure_started` does the right thing.
-        We also drop the cached `BridgeSession` so the next message
-        rebuilds the proxy connection against the freshly-launched bridge.
+        """Force-restart the bridge daemon (e.g. after a wheel reinstall
+        when we need the new code to actually load). Stops the running
+        service so the next `ensure_started` (called by the chat path)
+        rebuilds it cleanly.
+
+        We deliberately DO NOT mint a fresh token here — `ensure_started`
+        adopts the existing service env when present, so the token
+        survives restarts. Pure rotation paths (security) should call
+        `rotate_token()` explicitly (not yet implemented in v1).
         """
         if sandbox.id is None:
             return
         sandbox_id = str(sandbox.id)
+        # Stop the running service so the next ensure_started's start
+        # call brings it up fresh (picks up new wheel code).
+        try:
+            await self._provider.stop_service(
+                _handle_of(sandbox), name=BRIDGE_SERVICE_NAME
+            )
+        except SpritesError as exc:
+            _logger.info(
+                "bridge_session_fleet.stop_warning",
+                sandbox_id=sandbox_id, error=str(exc)[:200],
+            )
+        # Drop session + cached env so ensure_started re-adopts.
         async with self._lock:
             session = self._sessions.pop(sandbox_id, None)
             self._cached_env.pop(sandbox_id, None)
         if session is not None:
             await session.close()
         try:
-            env = self._bridge_env_for(sandbox)
-            # Mint + persist a fresh token for the relaunched bridge.
-            bridge_token = env.get("BRIDGE_TOKEN") or env.get("ANTHROPIC_AUTH_TOKEN")
-            if bridge_token and sandbox.id is not None:
-                from orchestrator.services.sandbox_manager import _hash_bridge_token
-
-                token_hash = _hash_bridge_token(bridge_token)
-                await Sandbox.find_one(Sandbox.id == sandbox.id).update(  # pyright: ignore[reportGeneralTypeIssues]
-                    {"$set": {"bridge_token_hash": token_hash}}
-                )
-                sandbox.bridge_token_hash = token_hash
-            self._cached_env[sandbox_id] = env
-            # Try Services API (PUT new env + restart). Falls back to
-            # exec_launch on older sprites.
-            try:
-                await self._provider.upsert_service(
-                    _handle_of(sandbox),
-                    name=BRIDGE_SERVICE_NAME,
-                    cmd="/opt/bridge/.venv/bin/python",
-                    args=["-m", "bridge.main"],
-                    env=env,
-                    cwd="/work",
-                    http_port=self._listen_port,
-                )
-                await self._provider.restart_service(
-                    _handle_of(sandbox), name=BRIDGE_SERVICE_NAME
-                )
-            except SpritesError as exc:
-                _logger.warning(
-                    "bridge_session_fleet.restart_via_services_failed",
-                    sandbox_id=sandbox_id, error=str(exc)[:200],
-                )
-                await self._exec_launch(sandbox, env, force=True)
+            await self.ensure_started(sandbox)
         except SpritesError as exc:
             _logger.warning(
                 "bridge_session_fleet.restart_failed",
-                sandbox_id=sandbox_id,
-                error=str(exc)[:200],
+                sandbox_id=sandbox_id, error=str(exc)[:200],
             )
 
     # ── Live log streaming for the debug WS endpoint ─────────────────

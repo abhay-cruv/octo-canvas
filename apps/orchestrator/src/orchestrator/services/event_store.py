@@ -126,17 +126,53 @@ def chat_user_agent_channel_for(chat_id: PydanticObjectId) -> str:
 
 
 def _seq_key(chat_id: PydanticObjectId, claude_session_id: str | None) -> str:
-    """Slice 8: per-(chat, session) seq allocator key. `_global` covers
-    pre-`ChatStarted` events (no session id assigned yet) so they get a
-    distinct seq space from the post-resume session's events."""
-    return f"{chat_id}:{claude_session_id or '_global'}"
+    """Single seq space per chat — claude_session_id is intentionally
+    ignored.
+
+    Earlier we keyed by `(chat, session)` so each resume got its own
+    seq space. That broke the FE: pre-`chat.started` events
+    (assistant.delta / assistant.message — emitted before the SDK
+    surfaces session_id) landed in the `_global` space while
+    `chat.started` / `result` / `token.usage` landed in the session's
+    space. Mongo replay sorts by seq → events from different spaces
+    interleaved at the same seq number → 3 result rows at seq=2 →
+    FE saw 3 turn_ends in a row → all follow-up user messages bunched
+    after the first turn.
+
+    The session_id field on AgentEvent is preserved for diagnostics;
+    only the seq counter is unified."""
+    _ = claude_session_id  # intentionally unused
+    return f"{chat_id}"
 
 
 async def _allocate_chat_seq(
     chat_id: PydanticObjectId, claude_session_id: str | None
 ) -> int:
+    key = _seq_key(chat_id, claude_session_id)
+    # Self-heal: if the per-chat counter doesn't exist yet, seed it
+    # from `max(seq)` across ALL events already persisted for this
+    # chat. Without this, chats that were partially written under
+    # the old per-(chat, session) seq schema get colliding (chat,
+    # session, seq) tuples on the next event → unique-index dup-key
+    # error → events dropped.
+    #
+    # Idempotent — `$setOnInsert` is a no-op if another caller already
+    # seeded. Single mongo round-trip on the hot path (skips the
+    # find/seed lookup once the counter exists).
+    existing = await mongo.seq_counters.find_one({"_id": key})
+    if existing is None:
+        last = await mongo.agent_events.find_one(
+            {"chat_id": chat_id}, sort=[("seq", -1)]
+        )
+        last_seq_raw = last.get("seq") if isinstance(last, dict) else None
+        seed = int(last_seq_raw) if isinstance(last_seq_raw, (int, float, str)) else 0
+        await mongo.seq_counters.update_one(
+            {"_id": key},
+            {"$setOnInsert": {"next": seed}},
+            upsert=True,
+        )
     doc = await mongo.seq_counters.find_one_and_update(
-        {"_id": _seq_key(chat_id, claude_session_id)},
+        {"_id": key},
         {"$inc": {"next": 1}},
         upsert=True,
         return_document=ReturnDocument.AFTER,

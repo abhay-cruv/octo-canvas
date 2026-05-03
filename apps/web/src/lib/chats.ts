@@ -101,6 +101,12 @@ export async function getChat(chatId: string): Promise<ChatResponse> {
   return fetchJson<ChatResponse>(`/api/chats/${encodeURIComponent(chatId)}`);
 }
 
+export async function listChatTurns(chatId: string): Promise<ChatTurnResponse[]> {
+  return fetchJson<ChatTurnResponse[]>(
+    `/api/chats/${encodeURIComponent(chatId)}/turns`,
+  );
+}
+
 export async function sendMessage(
   chatId: string,
   prompt: string,

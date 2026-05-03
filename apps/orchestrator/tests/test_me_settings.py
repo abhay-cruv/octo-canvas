@@ -42,6 +42,7 @@ async def test_get_settings_returns_defaults(client: httpx.AsyncClient) -> None:
         "user_agent_enabled": True,
         "user_agent_provider": "anthropic",
         "user_agent_model": "claude-haiku-4-5",
+        "chat_permission_mode": "all_granted",
     }
 
 

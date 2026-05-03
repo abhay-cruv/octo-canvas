@@ -106,6 +106,7 @@ async def _run_dialer(settings: BridgeSettings) -> None:
                 chat_id=frame.chat_id,
                 text=frame.text,
                 claude_session_id=frame.claude_session_id,
+                permission_mode=getattr(frame, "permission_mode", None),
             )
         elif isinstance(frame, CancelChat):
             await mux.cancel(frame.chat_id)

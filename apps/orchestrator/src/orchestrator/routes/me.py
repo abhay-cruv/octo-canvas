@@ -32,12 +32,14 @@ class UserSettingsResponse(BaseModel):
     user_agent_enabled: bool
     user_agent_provider: Literal["anthropic", "openai", "google"]
     user_agent_model: str
+    chat_permission_mode: Literal["all_granted", "ask"]
 
 
 class UpdateUserSettingsBody(BaseModel):
     user_agent_enabled: bool | None = None
     user_agent_provider: Literal["anthropic", "openai", "google"] | None = None
     user_agent_model: str | None = None
+    chat_permission_mode: Literal["all_granted", "ask"] | None = None
 
 
 @router.get("/me/settings", response_model=UserSettingsResponse)
@@ -46,6 +48,7 @@ async def get_settings(user: User = Depends(require_user)) -> UserSettingsRespon
         user_agent_enabled=user.user_agent_enabled,
         user_agent_provider=user.user_agent_provider,
         user_agent_model=user.user_agent_model,
+        chat_permission_mode=user.chat_permission_mode,
     )
 
 
@@ -56,7 +59,11 @@ async def patch_settings(
     """Partial update — only fields the body sets are touched. The
     user agent's provider Protocol means flipping `user_agent_provider`
     swaps to a different `LLMProvider` impl on the next chat without
-    a schema migration (slice 8 §calls #3)."""
+    a schema migration (slice 8 §calls #3).
+
+    `chat_permission_mode` flips take effect on the NEXT chat the user
+    creates (the SDK's permission_mode is locked at spawn time). Live
+    chats keep the mode they were created with."""
     if body.user_agent_enabled is not None:
         user.user_agent_enabled = body.user_agent_enabled
     if body.user_agent_provider is not None:
@@ -66,9 +73,12 @@ async def patch_settings(
         model = body.user_agent_model.strip()
         if model:
             user.user_agent_model = model[:200]
+    if body.chat_permission_mode is not None:
+        user.chat_permission_mode = body.chat_permission_mode
     await user.save()
     return UserSettingsResponse(
         user_agent_enabled=user.user_agent_enabled,
         user_agent_provider=user.user_agent_provider,
         user_agent_model=user.user_agent_model,
+        chat_permission_mode=user.chat_permission_mode,
     )

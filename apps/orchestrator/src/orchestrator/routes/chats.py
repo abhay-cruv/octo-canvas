@@ -229,6 +229,28 @@ async def get_chat(chat_id: str, user: User = Depends(require_user)) -> ChatResp
     return _chat_to_response(chat)
 
 
+@router.get("/{chat_id}/turns", response_model=list[ChatTurnResponse])
+async def list_chat_turns(
+    chat_id: str, user: User = Depends(require_user)
+) -> list[ChatTurnResponse]:
+    """All ChatTurn rows for the chat, sorted oldest-first.
+
+    Slice 8 Phase 8b: the bridge doesn't echo user input back, so the
+    FE chat panel needs an authoritative source for "what messages did
+    the user send" across page reloads. Local optimistic state covers
+    the in-flight session; this endpoint covers refresh.
+    """
+    chat = await _load_chat_for_user(chat_id, user)
+    if chat.id is None:
+        return []
+    rows = (
+        await ChatTurn.find(ChatTurn.chat_id == chat.id)
+        .sort(+ChatTurn.started_at)  # type: ignore[arg-type]
+        .to_list()
+    )
+    return [_turn_to_response(t) for t in rows]
+
+
 class FollowUpResponse(BaseModel):
     turn: ChatTurnResponse
     enhanced: bool

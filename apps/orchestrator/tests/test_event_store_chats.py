@@ -25,10 +25,13 @@ from shared_models.wire_protocol import (
 pytestmark = pytest.mark.asyncio
 
 
-def test_seq_key_uses_global_when_no_session() -> None:
+def test_seq_key_is_chat_scoped() -> None:
+    """Single seq space per chat — claude_session_id is intentionally
+    ignored. Earlier we keyed by `(chat, session)` which split early-
+    turn events (pre-`chat.started`, session=None) and post-session
+    events into separate seq spaces, breaking FE replay ordering."""
     chat_id = PydanticObjectId()
-    assert _seq_key(chat_id, None).endswith(":_global")
-    assert _seq_key(chat_id, "session-abc").endswith(":session-abc")
+    assert _seq_key(chat_id, None) == _seq_key(chat_id, "session-abc")
 
 
 def test_channel_helpers() -> None:
@@ -49,7 +52,14 @@ async def test_append_assigns_monotonic_seq_per_chat(client: Any) -> None:
     assert e3.seq == 3
 
 
-async def test_append_uses_separate_seq_space_per_session(client: Any) -> None:
+async def test_append_uses_unified_seq_space_across_sessions(client: Any) -> None:
+    """Single seq counter per chat regardless of claude_session_id.
+    Old test asserted (chat, session) namespaces — but mongo's
+    `chat_session_seq_unique_partial` index would still collide on
+    duplicate `(chat, session, seq)` combos when the global counter
+    re-allocates a low seq for a session that already has one. Single
+    space per chat avoids the whole class of problems and gives the
+    FE a strictly-monotonic stream per chat."""
     _ = client
     chat_id = PydanticObjectId()
     no_session = ThinkingBlock(chat_id=str(chat_id), seq=0, text="a")
@@ -61,10 +71,9 @@ async def test_append_uses_separate_seq_space_per_session(client: Any) -> None:
     e3 = await append_chat_event(
         chat_id, in_session, claude_session_id="sess-1", redis=None
     )
-    # `_global` and `sess-1` namespaces both start at 1.
     assert e1.seq == 1
-    assert e2.seq == 1
-    assert e3.seq == 2
+    assert e2.seq == 2
+    assert e3.seq == 3
 
 
 async def test_append_persists_to_agent_events_collection(client: Any) -> None:

@@ -1,14 +1,15 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useChatStream } from '../../hooks/useChatStream';
 import {
   cancelChat,
   createChat,
   getChat,
   listChats,
+  listChatTurns,
   sendMessage,
   type ChatResponse,
 } from '../../lib/chats';
-import { ChatTranscript } from './ChatTranscript';
+import { ChatTranscript, type UserMessageEntry } from './ChatTranscript';
 
 // List-view refresh cadence. The chat *view* uses the WS stream and
 // doesn't poll at all; this only affects the sidebar's list of chats.
@@ -99,16 +100,111 @@ function Header({
           </div>
         )}
       </div>
-      {mode === 'list' && (
-        <button
-          type="button"
-          onClick={onNew}
-          className="px-2.5 py-1 bg-ide-accent text-ide-textBright rounded text-xs font-medium hover:bg-ide-accentHover transition-colors"
-        >
-          + New chat
-        </button>
-      )}
+      <div className="flex items-center gap-2">
+        <PermissionModeToggle />
+        {mode === 'list' && (
+          <button
+            type="button"
+            onClick={onNew}
+            className="px-2.5 py-1 bg-ide-accent text-ide-textBright rounded text-xs font-medium hover:bg-ide-accentHover transition-colors"
+          >
+            + New chat
+          </button>
+        )}
+      </div>
     </div>
+  );
+}
+
+interface UserSettings {
+  user_agent_enabled: boolean;
+  user_agent_provider: 'anthropic' | 'openai' | 'google';
+  user_agent_model: string;
+  chat_permission_mode: 'all_granted' | 'ask';
+}
+
+function settingsUrl(): string {
+  const base = import.meta.env.VITE_ORCHESTRATOR_BASE_URL as string | undefined;
+  if (!base) throw new Error('VITE_ORCHESTRATOR_BASE_URL is not set');
+  return `${base.replace(/\/$/, '')}/api/me/settings`;
+}
+
+function PermissionModeToggle(): JSX.Element {
+  // Optimistic default: most users want auto. We still fetch the
+  // canonical state on mount; if it differs we update. Either way the
+  // toggle is clickable from the first render.
+  const [mode, setMode] = useState<'all_granted' | 'ask'>('all_granted');
+  const [busy, setBusy] = useState(false);
+  const [tooltip, setTooltip] = useState<string>('loading settings…');
+
+  // Refetch on click if a previous load failed — gives a path to recover.
+  const refresh = async () => {
+    try {
+      const r = await fetch(settingsUrl(), { credentials: 'include' });
+      if (!r.ok) {
+        setTooltip(`load failed: HTTP ${r.status}`);
+        return;
+      }
+      const j = (await r.json()) as UserSettings;
+      setMode(j.chat_permission_mode);
+      setTooltip('');
+    } catch (exc) {
+      setTooltip(`load failed: ${String(exc).slice(0, 80)}`);
+    }
+  };
+
+  useEffect(() => {
+    void refresh();
+    // Refresh once on mount only; flip() handles subsequent state.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const flip = async () => {
+    if (busy) return;
+    const next = mode === 'all_granted' ? 'ask' : 'all_granted';
+    setBusy(true);
+    setMode(next); // optimistic
+    try {
+      const r = await fetch(settingsUrl(), {
+        method: 'PATCH',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_permission_mode: next }),
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const j = (await r.json()) as UserSettings;
+      setMode(j.chat_permission_mode);
+      setTooltip('');
+    } catch (exc) {
+      // Rollback on failure
+      setMode((prev) => (prev === next ? (next === 'ask' ? 'all_granted' : 'ask') : prev));
+      setTooltip(`save failed: ${String(exc).slice(0, 80)}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const label = mode === 'all_granted' ? 'auto' : 'ask';
+  const baseTitle =
+    mode === 'all_granted'
+      ? 'All tools auto-allowed. Click to switch to ASK mode.'
+      : 'Agent asks before risky tools. Click to switch to AUTO mode.';
+  const dotColor = mode === 'all_granted' ? 'bg-ide-ok' : 'bg-ide-warn';
+  return (
+    <button
+      type="button"
+      onClick={() => void flip()}
+      disabled={busy}
+      title={tooltip ? `${baseTitle} (${tooltip})` : baseTitle}
+      className={`flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-ide-deep border text-[10.5px] uppercase tracking-wider transition-colors disabled:opacity-50 ${
+        tooltip
+          ? 'border-ide-danger/60 text-ide-danger hover:border-ide-danger'
+          : 'border-ide-borderSoft text-ide-textMuted hover:text-ide-textBright hover:border-ide-border'
+      }`}
+    >
+      <span className={`w-1.5 h-1.5 rounded-full ${dotColor}`} />
+      <span>perm: {label}</span>
+    </button>
   );
 }
 
@@ -261,18 +357,37 @@ function ChatView({ chatId }: { chatId: string }): JSX.Element {
   const [dismissedSuggestions, setDismissedSuggestions] = useState<Set<string>>(
     () => new Set(),
   );
+  // Locally-tracked follow-up user messages. Bridge events don't
+  // echo user input, so we record each successful `sendMessage` and
+  // pass the list to the transcript for inline rendering.
+  const [followUps, setFollowUps] = useState<UserMessageEntry[]>([]);
+  const replyRef = useRef<HTMLTextAreaElement | null>(null);
 
   // One-time fetch for static chat metadata (title, initial_prompt,
-  // created_at). Live state — status flips, token usage, transcript —
-  // arrives over the WS stream via `useChatStream`. No polling: we
-  // were spamming `GET /api/chats/{id}` every 2s × StrictMode
-  // double-mount. The stream is the source of truth now.
+  // created_at) + persisted ChatTurn rows. Live state — status flips,
+  // token usage, transcript — arrives over the WS stream via
+  // `useChatStream`. The turns fetch covers page-refresh / chat-reopen:
+  // optimistic followUps state is wiped on remount, so we seed from
+  // the authoritative server list (skipping the initial-prompt turn,
+  // which already renders via `chat.initial_prompt`).
   useEffect(() => {
     let cancelled = false;
     void (async () => {
       try {
-        const c = await getChat(chatId);
-        if (!cancelled) setChat(c);
+        const [c, turns] = await Promise.all([
+          getChat(chatId),
+          listChatTurns(chatId),
+        ]);
+        if (cancelled) return;
+        setChat(c);
+        const followUpEntries: UserMessageEntry[] = turns
+          .filter((t) => t.is_follow_up)
+          .map((t) => ({
+            id: t.id,
+            text: t.prompt,
+            sentAt: Date.parse(t.started_at),
+          }));
+        setFollowUps(followUpEntries);
       } catch (exc) {
         if (!cancelled) setError(String(exc));
       }
@@ -317,11 +432,25 @@ function ChatView({ chatId }: { chatId: string }): JSX.Element {
     if (!value || busy) return;
     setBusy(true);
     setError(null);
+    // Optimistically render the user's message immediately so they
+    // see what they sent without waiting for the bridge round-trip.
+    const entry: UserMessageEntry = {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      text: value,
+      sentAt: Date.now(),
+    };
+    setFollowUps((prev) => [...prev, entry]);
+    if (text === undefined) {
+      setReply('');
+      // Reset textarea height after clearing.
+      if (replyRef.current) replyRef.current.style.height = 'auto';
+    }
     try {
       await sendMessage(chatId, value);
-      if (text === undefined) setReply('');
     } catch (exc) {
       setError(String(exc));
+      // Roll back the optimistic entry on failure.
+      setFollowUps((prev) => prev.filter((e) => e.id !== entry.id));
     } finally {
       setBusy(false);
     }
@@ -362,6 +491,8 @@ function ChatView({ chatId }: { chatId: string }): JSX.Element {
         <ChatTranscript
           initialPrompt={chat.initial_prompt}
           events={visibleEvents}
+          followUpUserMessages={followUps}
+          status={chat.status}
           onAcceptSuggestion={(sid, text) => {
             setDismissedSuggestions((s) => {
               const next = new Set(s);
@@ -380,30 +511,54 @@ function ChatView({ chatId }: { chatId: string }): JSX.Element {
         />
       )}
       {error && (
-        <div className="px-3 pb-2 text-xs text-ide-danger">{error}</div>
+        <div className="mx-3 my-2 px-3 py-2 rounded-lg bg-ide-danger/5 border border-ide-danger/40 text-xs text-ide-danger">
+          {error}
+        </div>
       )}
-      <div className="border-t border-ide-borderSoft p-2 flex gap-2">
-        <input
-          type="text"
-          value={reply}
-          onChange={(e) => setReply(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter' && !e.shiftKey) {
-              e.preventDefault();
-              void send();
-            }
-          }}
-          placeholder="Reply…"
-          className="flex-1 bg-ide-deep border border-ide-border rounded px-2 py-1 text-sm text-ide-textBright focus:outline-none focus:border-ide-accent"
-        />
-        <button
-          type="button"
-          disabled={!reply.trim() || busy}
-          onClick={() => void send()}
-          className="px-3 py-1 bg-ide-accent text-ide-textBright rounded text-xs font-medium disabled:opacity-50 hover:bg-ide-accentHover transition-colors"
-        >
-          {busy ? 'Sending…' : 'Send'}
-        </button>
+      <div className="border-t border-ide-borderSoft/60 bg-ide-panel/95 backdrop-blur-sm px-3 py-3">
+        <div className="flex items-end gap-2 bg-ide-deep border border-ide-border rounded-2xl pl-3 pr-2 py-1.5 focus-within:border-ide-accent transition-colors">
+          <textarea
+            ref={replyRef}
+            value={reply}
+            rows={1}
+            onChange={(e) => {
+              setReply(e.target.value);
+              // Auto-grow the textarea up to ~6 lines.
+              const el = e.target;
+              el.style.height = 'auto';
+              el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
+            }}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && !e.shiftKey && !e.metaKey && !e.ctrlKey) {
+                e.preventDefault();
+                void send();
+              }
+            }}
+            placeholder="Send a message…   (Enter to send, Shift+Enter for newline)"
+            className="flex-1 min-w-0 bg-transparent border-0 resize-none py-1.5 text-sm text-ide-textBright placeholder:text-ide-textDim focus:outline-none leading-relaxed"
+          />
+          <button
+            type="button"
+            disabled={!reply.trim() || busy}
+            onClick={() => void send()}
+            className="flex-shrink-0 mb-0.5 w-8 h-8 rounded-full bg-gradient-to-br from-ide-accent to-ide-accentHover text-white flex items-center justify-center disabled:opacity-40 disabled:cursor-not-allowed enabled:hover:scale-105 transition-all shadow-sm"
+            aria-label="Send"
+          >
+            {busy ? (
+              <span className="block w-3 h-3 border-2 border-white/40 border-t-white rounded-full animate-spin" />
+            ) : (
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="none">
+                <path
+                  d="M2 8L14 2L8 14L7 9L2 8Z"
+                  stroke="currentColor"
+                  strokeWidth="1.5"
+                  strokeLinejoin="round"
+                  strokeLinecap="round"
+                />
+              </svg>
+            )}
+          </button>
+        </div>
       </div>
     </div>
   );

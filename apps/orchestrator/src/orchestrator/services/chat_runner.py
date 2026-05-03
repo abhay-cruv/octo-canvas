@@ -103,17 +103,22 @@ async def _send_user_message_to_bridge(
     chat: Chat,
     text: str,
     ensure_bridge_running: EnsureBridgeRunning | None,
+    permission_mode: "str | None" = None,
 ) -> None:
     """Serialize + send a `UserMessage`. Best effort — never raises
     `bridge_unavailable`; the bridge's Hello-replay path picks up
     queued turns when it (re)dials."""
     if sandbox.id is None or chat.id is None:
         raise ChatRunnerError("invalid_state", "missing sandbox or chat id")
+    # Pydantic Literal type narrows; Mongo / route layer pass the
+    # validated value through.
+    pm: Any = permission_mode if permission_mode in ("all_granted", "ask") else None
     msg = UserMessage(
         chat_id=str(chat.id),
         frame_id="",  # populated by BridgeOwner.send
         text=text,
         claude_session_id=chat.claude_session_id,
+        permission_mode=pm,
     )
     raw = OrchestratorToBridgeAdapter.dump_python(msg, mode="json")
     if not isinstance(raw, dict):
@@ -192,6 +197,7 @@ async def create_chat(
         chat=chat,
         text=text_to_send,
         ensure_bridge_running=ensure_bridge_running,
+        permission_mode=getattr(user, "chat_permission_mode", None),
     )
 
     return chat, turn, enhanced
@@ -262,6 +268,7 @@ async def add_follow_up(
         chat=chat,
         text=text_to_send,
         ensure_bridge_running=ensure_bridge_running,
+        permission_mode=getattr(user, "chat_permission_mode", None),
     )
     return turn, enhanced
 
