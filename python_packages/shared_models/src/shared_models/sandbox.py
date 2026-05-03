@@ -46,5 +46,13 @@ class SandboxResponse(BaseModel):
     # (sanitized). Lets the dashboard show "Last setup error: …" so a
     # transient install hiccup isn't invisible to the user.
     last_reconcile_error: str | None = None
+    # Slice 8: bridge readiness signals. The dashboard uses these to
+    # render a green "Agent ready" pill once the bridge is up and
+    # connected. `bridge_ready=True` means: wheel installed, token
+    # minted, daemon connected within the last heartbeat window.
+    bridge_wheel_installed: bool = False
+    bridge_connected_at: datetime | None = None
+    bridge_version: str | None = None
+    bridge_ready: bool = False
     failure_reason: str | None
     created_at: datetime

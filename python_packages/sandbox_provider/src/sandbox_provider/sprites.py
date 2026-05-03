@@ -49,9 +49,12 @@ from sandbox_provider.interface import (
     FsEvent,
     ProviderName,
     ProviderStatus,
+    ProxyDialInfo,
     PtyDialInfo,
     SandboxHandle,
     SandboxState,
+    ServiceLogLine,
+    ServiceStatus,
     SpritesError,
 )
 
@@ -630,6 +633,214 @@ class SpritesProvider:
                 await ws.close()
             except Exception:
                 pass
+
+    # ── Slice 8 service_proxy: managed services + TCP proxy ──────────────
+
+    async def upsert_service(
+        self,
+        handle: SandboxHandle,
+        *,
+        name: str,
+        cmd: str,
+        args: list[str],
+        env: dict[str, str],
+        cwd: str = "/",
+        http_port: int | None = None,
+    ) -> None:
+        sprite_name = _require_name(handle)
+        body: dict[str, Any] = {
+            "cmd": cmd,
+            "args": list(args),
+            "env": dict(env),
+            "dir": cwd,
+            # `needs` is required by Sprites schema even when empty —
+            # absence yields 400. Empty list = no service deps.
+            "needs": [],
+        }
+        if http_port is not None:
+            body["http_port"] = http_port
+
+        def _do() -> None:
+            resp = self._client._client.put(  # type: ignore[reportPrivateUsage]
+                f"{self._client.base_url}/v1/sprites/{sprite_name}/services/{name}",
+                headers=self._client._headers(),  # type: ignore[reportPrivateUsage]
+                json=body,
+                timeout=httpx.Timeout(connect=5.0, read=15.0, write=15.0, pool=5.0),
+            )
+            if resp.status_code >= 400:
+                raise SpritesError(
+                    f"upsert_service {name!r} HTTP {resp.status_code}: {resp.text[-200:]}",
+                    retriable=resp.status_code >= 500,
+                )
+
+        try:
+            await asyncio.to_thread(_do)
+        except httpx.RequestError as exc:
+            raise SpritesError(f"upsert_service request failed: {exc}", retriable=True) from exc
+
+    async def start_service(self, handle: SandboxHandle, *, name: str) -> None:
+        await self._post_service(handle, name=name, action="start")
+
+    async def restart_service(self, handle: SandboxHandle, *, name: str) -> None:
+        # Some Sprites versions ship `start` / `stop` but not `restart`
+        # (404). Implement restart as stop+start so it works on both.
+        try:
+            await self._post_service(handle, name=name, action="stop")
+        except SpritesError as exc:
+            # Already-stopped is fine — Sprites may surface as 4xx.
+            _logger.info(
+                "sprites.restart_via_stop_warn",
+                name=name, error=str(exc)[:200],
+            )
+        await self._post_service(handle, name=name, action="start")
+
+    async def stop_service(self, handle: SandboxHandle, *, name: str) -> None:
+        await self._post_service(handle, name=name, action="stop")
+
+    async def _post_service(
+        self, handle: SandboxHandle, *, name: str, action: str
+    ) -> None:
+        sprite_name = _require_name(handle)
+
+        def _do() -> None:
+            # Sprites streams NDJSON for start/stop/restart. We don't need
+            # the events back — just wait for the response to close.
+            with self._client._client.stream(  # type: ignore[reportPrivateUsage]
+                "POST",
+                f"{self._client.base_url}/v1/sprites/{sprite_name}/services/{name}/{action}",
+                headers=self._client._headers(),  # type: ignore[reportPrivateUsage]
+                timeout=httpx.Timeout(connect=5.0, read=120.0, write=15.0, pool=5.0),
+            ) as resp:
+                if resp.status_code >= 400:
+                    raw = resp.read().decode("utf-8", errors="replace")
+                    raise SpritesError(
+                        f"{action}_service {name!r} HTTP {resp.status_code}: {raw[-200:]}",
+                        retriable=resp.status_code >= 500,
+                    )
+                # Drain so the connection releases; ignore individual
+                # event payloads (caller can use service_logs() for that).
+                for _line in resp.iter_lines():
+                    pass
+
+        try:
+            await asyncio.to_thread(_do)
+        except httpx.RequestError as exc:
+            raise SpritesError(
+                f"{action}_service request failed: {exc}", retriable=True
+            ) from exc
+
+    async def service_status(
+        self, handle: SandboxHandle, *, name: str
+    ) -> ServiceStatus:
+        sprite_name = _require_name(handle)
+
+        def _do() -> dict[str, Any]:
+            resp = self._client._client.get(  # type: ignore[reportPrivateUsage]
+                f"{self._client.base_url}/v1/sprites/{sprite_name}/services/{name}",
+                headers=self._client._headers(),  # type: ignore[reportPrivateUsage]
+                timeout=httpx.Timeout(connect=5.0, read=10.0, write=5.0, pool=5.0),
+            )
+            if resp.status_code == 404:
+                raise SpritesError(
+                    f"service {name!r} not declared on {sprite_name!r}", retriable=False
+                )
+            if resp.status_code >= 400:
+                raise SpritesError(
+                    f"service_status HTTP {resp.status_code}: {resp.text[-200:]}",
+                    retriable=resp.status_code >= 500,
+                )
+            return resp.json()  # type: ignore[no-any-return]
+
+        try:
+            payload = await asyncio.to_thread(_do)
+        except httpx.RequestError as exc:
+            raise SpritesError(f"service_status request failed: {exc}", retriable=True) from exc
+
+        # Sprites' GET response shape per docs: top-level service def +
+        # nested `state: {status, pid, started_at, error}`.
+        state = payload.get("state") or {}
+        raw_status = str(state.get("status") or "stopped").lower()
+        narrowed: Any = (
+            raw_status if raw_status in ("stopped", "starting", "running", "stopping", "failed") else "stopped"
+        )
+        return ServiceStatus(
+            name=name,
+            status=narrowed,
+            pid=int(state["pid"]) if isinstance(state.get("pid"), int) else None,
+            started_at=state.get("started_at"),
+            error=state.get("error"),
+        )
+
+    async def service_logs(
+        self, handle: SandboxHandle, *, name: str
+    ) -> AsyncIterator[ServiceLogLine]:
+        sprite_name = _require_name(handle)
+        token = _client_token(self._client)
+        base = self._client.base_url.rstrip("/")
+        url = f"{base}/v1/sprites/{sprite_name}/services/{name}/logs"
+        # Use a separate client so the SDK's shared client isn't held
+        # for the lifetime of the log tail.
+        client = httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=5.0, read=None, write=15.0, pool=5.0),
+        )
+        try:
+            async with client.stream(
+                "GET",
+                url,
+                headers={"Authorization": f"Bearer {token}"},
+            ) as resp:
+                if resp.status_code >= 400:
+                    raw = (await resp.aread()).decode("utf-8", errors="replace")
+                    raise SpritesError(
+                        f"service_logs HTTP {resp.status_code}: {raw[-200:]}",
+                        retriable=resp.status_code >= 500,
+                    )
+                async for line in resp.aiter_lines():
+                    if not line:
+                        continue
+                    try:
+                        evt = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    kind = str(evt.get("type") or "")
+                    if kind not in (
+                        "stdout", "stderr", "exit", "error",
+                        "started", "stopping", "stopped", "complete",
+                    ):
+                        continue
+                    yield ServiceLogLine(
+                        kind=kind,  # type: ignore[arg-type]
+                        data=str(evt.get("data") or ""),
+                        timestamp_ms=int(evt.get("timestamp") or 0),
+                        exit_code=(
+                            int(evt["exit_code"])
+                            if isinstance(evt.get("exit_code"), int)
+                            else None
+                        ),
+                    )
+        finally:
+            await client.aclose()
+
+    async def proxy_dial_info(
+        self,
+        handle: SandboxHandle,
+        *,
+        host: str = "localhost",
+        port: int,
+    ) -> ProxyDialInfo:
+        sprite_name = _require_name(handle)
+        token = _client_token(self._client)
+        parts = urlsplit(self._client.base_url)
+        scheme = "wss" if parts.scheme == "https" else "ws"
+        url = urlunsplit(
+            (scheme, parts.netloc, f"/v1/sprites/{sprite_name}/proxy", "", "")
+        )
+        return ProxyDialInfo(
+            url=url,
+            headers=[("Authorization", f"Bearer {token}")],
+            init_host=host,
+            init_port=port,
+        )
 
     async def restore(self, handle: SandboxHandle, checkpoint_id: CheckpointId) -> SandboxState:
         sprite_name = _require_name(handle)

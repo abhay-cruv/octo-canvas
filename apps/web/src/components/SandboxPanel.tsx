@@ -23,13 +23,44 @@ const TRANSIENT: ReadonlyArray<SandboxResponse['status']> = [
 // new phases the backend introduces).
 const ACTIVITY_LABELS: Record<string, string> = {
   configuring_git: 'Setting up git…',
-  installing_bridge: 'Setting up sandbox tools…',
+  installing_bridge: 'Installing agent toolchain…',
   installing_packages: 'Installing system packages…',
   installing_runtimes: 'Installing language runtimes…',
+  installing_bridge_wheel: 'Installing agent runtime…',
+  launching_bridge: 'Starting agent…',
   cloning: 'Cloning repository…',
   checkpointing: 'Snapshotting clean state…',
   pausing: 'Releasing compute (waiting for idle)…',
 };
+
+// Pretty-print any unknown activity slug ("foo_bar" → "Foo bar…") so a
+// new backend phase reads naturally on the dashboard before someone
+// adds it to the explicit map above.
+function prettyActivity(activity: string): string {
+  const explicit = ACTIVITY_LABELS[activity];
+  if (explicit) return explicit;
+  const spaced = activity.replace(/_/g, ' ').trim();
+  if (!spaced) return activity;
+  const first = spaced.charAt(0).toUpperCase();
+  return `${first}${spaced.slice(1)}…`;
+}
+
+// Slice 8: green glowing "Agent ready" pill — shown when the bridge
+// daemon is up, connected, and no setup activity is in flight.
+function BridgeReadyPill({ version }: { version: string | null }): JSX.Element {
+  return (
+    <div className="text-xs px-2 py-1 rounded-md bg-green-50 border border-green-200 text-green-900 inline-flex items-center gap-1.5">
+      <span className="relative inline-flex w-2 h-2">
+        <span className="absolute inline-flex w-full h-full rounded-full bg-green-400 opacity-60 animate-ping" />
+        <span className="relative inline-flex w-2 h-2 rounded-full bg-green-500 shadow-[0_0_6px_rgba(34,197,94,0.7)]" />
+      </span>
+      <span className="font-medium">Agent ready</span>
+      {version ? (
+        <span className="font-mono text-green-800/70">— bridge {version}</span>
+      ) : null}
+    </div>
+  );
+}
 
 type DialogKind = 'reset' | 'destroy' | null;
 
@@ -137,7 +168,7 @@ export function SandboxPanel() {
           <div className="text-xs px-2 py-1 rounded-md bg-amber-50 border border-amber-200 text-amber-900 inline-flex items-center gap-1.5 flex-wrap">
             <span className="inline-block w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse" />
             <span className="font-medium">
-              {ACTIVITY_LABELS[active.activity] ?? active.activity}
+              {prettyActivity(active.activity)}
             </span>
             {active.activity_detail ? (
               <span className="font-mono">— {active.activity_detail}</span>
@@ -146,6 +177,8 @@ export function SandboxPanel() {
               <ElapsedSince since={active.activity_started_at} />
             ) : null}
           </div>
+        ) : active.bridge_ready ? (
+          <BridgeReadyPill version={active.bridge_version ?? null} />
         ) : null}
         {active.last_reconcile_error ? (
           <div className="text-xs px-2 py-1 rounded-md bg-red-50 border border-red-200 text-red-900">

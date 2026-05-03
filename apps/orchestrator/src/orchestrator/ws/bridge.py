@@ -223,8 +223,15 @@ async def _read_inbound(session: BridgeSession) -> None:
         if isinstance(frame, Hello):
             if session.sandbox.id is not None:
                 await Sandbox.find_one(Sandbox.id == session.sandbox.id).update(  # pyright: ignore[reportGeneralTypeIssues]
-                    {"$set": {"bridge_version": frame.bridge_version}}
+                    {
+                        "$set": {
+                            "bridge_version": frame.bridge_version,
+                            "bridge_connected_at": _now(),
+                        }
+                    }
                 )
+                session.sandbox.bridge_connected_at = _now()
+                session.sandbox.bridge_version = frame.bridge_version
             # ChatState replay convergence: for every chat in the
             # bridge's `last_acked_seq_per_chat`, tell the bridge our
             # current high-water mark. Bridge resends anything beyond.
@@ -247,6 +254,15 @@ async def _read_inbound(session: BridgeSession) -> None:
                 # Send via the same outbound queue so it serializes
                 # cleanly behind any pending commands.
                 await session.deliver(str(session.sandbox.id), state_msg)
+            # Phase 8d: replay queued ChatTurns for this sandbox. The
+            # bridge may have idle-exited (or the sprite hibernated)
+            # between when chat_runner created the turn and now —
+            # `chat_runner` always persists `ChatTurn(status="queued")`
+            # so we can recover by re-sending the UserMessage. Bridge's
+            # frame_id dedup catches accidental double-delivery if the
+            # turn was actually delivered the first time.
+            if session.sandbox.id is not None:
+                await _replay_queued_turns(session)
             continue
         if isinstance(frame, Goodbye):
             session.stopped = True
@@ -284,11 +300,94 @@ async def _read_inbound(session: BridgeSession) -> None:
             user_agent_enabled=user_agent_enabled,
         )
 
+        # Phase 8d: any event for a chat means the bridge accepted the
+        # most recent UserMessage — flip the latest queued turn to
+        # `running`. Idempotent: if there's no queued turn it's a
+        # no-op. This keeps the Hello-replay scan accurate (only
+        # genuinely-undelivered turns get re-sent on the next connect).
+        await _mark_latest_turn_running(chat_id)
+
         # Track for batched ack.
         if event.seq is not None:
             prev = session.pending_acks.get(chat_id_str, 0)
             if event.seq > prev:
                 session.pending_acks[chat_id_str] = event.seq
+
+
+async def _mark_latest_turn_running(chat_id: PydanticObjectId) -> None:
+    from db.models import ChatTurn
+
+    latest = (
+        await ChatTurn.find(ChatTurn.chat_id == chat_id)
+        .sort(-ChatTurn.started_at)  # type: ignore[arg-type]
+        .limit(1)
+        .to_list()
+    )
+    if not latest:
+        return
+    turn = latest[0]
+    if turn.status == "queued":
+        turn.status = "running"
+        await turn.save()
+
+
+async def _replay_queued_turns(session: BridgeSession) -> None:
+    """Phase 8d: on bridge `Hello`, find chats for this sandbox whose
+    most recent turn is still `status="queued"` and re-send the
+    `UserMessage`. Bridge's `frame_id` LRU drops accidental dupes."""
+    from db.models import ChatTurn
+
+    sandbox_id = session.sandbox.id
+    if sandbox_id is None:
+        return
+    # Chats bound to this sandbox that aren't terminal.
+    chats = await Chat.find(
+        Chat.sandbox_id == sandbox_id,
+        {"status": {"$in": ["pending", "running", "awaiting_input"]}},
+    ).to_list()
+    if not chats:
+        return
+    replayed = 0
+    for chat in chats:
+        if chat.id is None:
+            continue
+        latest = (
+            await ChatTurn.find(ChatTurn.chat_id == chat.id)
+            .sort(-ChatTurn.started_at)  # type: ignore[arg-type]
+            .limit(1)
+            .to_list()
+        )
+        if not latest:
+            continue
+        turn = latest[0]
+        if turn.status != "queued":
+            continue
+        # Build a fresh UserMessage; BridgeOwner.send injects a new
+        # `frame_id` (the bridge's dedup is per-process, so a new id
+        # is correct — if this is the FIRST delivery we don't want
+        # the bridge to think it's a duplicate).
+        text = turn.enhanced_prompt or turn.prompt
+        from shared_models.wire_protocol import (
+            OrchestratorToBridgeAdapter as _Adapter,
+        )
+        from shared_models.wire_protocol import UserMessage as _UserMessage
+
+        msg = _UserMessage(
+            chat_id=str(chat.id),
+            frame_id="",
+            text=text,
+            claude_session_id=chat.claude_session_id,
+        )
+        raw = _Adapter.dump_python(msg, mode="json")
+        if isinstance(raw, dict):
+            await session.deliver(str(sandbox_id), raw)
+            replayed += 1
+    if replayed:
+        _logger.info(
+            "ws_bridge.queued_turns_replayed",
+            sandbox_id=str(sandbox_id),
+            count=replayed,
+        )
 
 
 async def _last_seq_for_chat(chat_id: PydanticObjectId) -> int:

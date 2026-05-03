@@ -13,11 +13,12 @@ mutable directly via tests).
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from datetime import datetime
 from typing import Annotated, Any
 
 from beanie import PydanticObjectId
-from db.models import Chat, ChatTurn, User
+from db.models import Chat, ChatTurn, Sandbox, User
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
 
@@ -109,6 +110,23 @@ def _bridge_owner(request: Request) -> BridgeOwner:
     return owner
 
 
+def _ensure_bridge_running(
+    request: Request,
+) -> "Callable[[Sandbox], Awaitable[None]] | None":
+    """Resolve the reconciler's bridge-launch hook so chat_runner can
+    kick a relaunch when the daemon's idle-exited (Phase 8d). Returns
+    None when the reconciler isn't wired (tests / pre-bridge dev) —
+    callers gracefully degrade to "best-effort send + replay-on-Hello"."""
+    reconciler = getattr(request.app.state, "reconciler", None)
+    if reconciler is None:
+        return None
+    fn = getattr(reconciler, "_ensure_bridge_running", None)
+    if not callable(fn):
+        return None
+    # Cast through the typing layer — we trust the reconciler's signature.
+    return fn  # type: ignore[no-any-return]
+
+
 def _user_agent_provider(request: Request, user: User) -> AnthropicProvider | None:
     """Build (or return cached) user-agent LLMProvider for the user.
     v1 only supports `anthropic`; other providers raise. When the
@@ -159,6 +177,7 @@ async def post_chat(
 ) -> CreateChatResponse:
     owner = _bridge_owner(request)
     provider = _user_agent_provider(request, user)
+    ensure_running = _ensure_bridge_running(request)
     try:
         chat, turn, enhanced = await create_chat(
             user,
@@ -166,6 +185,7 @@ async def post_chat(
             title=body.title,
             bridge_owner=owner,
             user_agent_provider=provider,
+            ensure_bridge_running=ensure_running,
         )
     except ChatRunnerError as exc:
         _raise_chat_error(exc)
@@ -225,6 +245,7 @@ async def post_message(
     chat = await _load_chat_for_user(chat_id, user)
     owner = _bridge_owner(request)
     provider = _user_agent_provider(request, user)
+    ensure_running = _ensure_bridge_running(request)
     user_agent_loop = getattr(request.app.state, "user_agent_loop", None)
     try:
         turn, enhanced = await add_follow_up(
@@ -234,6 +255,7 @@ async def post_message(
             bridge_owner=owner,
             user_agent_provider=provider,
             user_agent_loop=user_agent_loop,
+            ensure_bridge_running=ensure_running,
         )
     except ChatRunnerError as exc:
         _raise_chat_error(exc)

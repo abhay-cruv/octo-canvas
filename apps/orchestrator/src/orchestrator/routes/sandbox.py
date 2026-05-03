@@ -12,12 +12,19 @@ affordance; Refresh resyncs live status from the provider.
 """
 
 import asyncio
+from datetime import UTC, datetime, timedelta
 
 from beanie import PydanticObjectId
 from db import mongo
 from db.models import Repo, Sandbox, User
 from fastapi import APIRouter, Depends, HTTPException, status
 from shared_models.sandbox import SandboxResponse
+
+# Slice 8: the bridge sends a WS Ping every 30s; if `bridge_connected_at`
+# is fresher than this window, we consider the daemon "live." Tolerates
+# one missed heartbeat (90s rx-deadline matches the WS handler's ping
+# rules in `ws/bridge.py`).
+_BRIDGE_LIVE_WINDOW_S = 90
 
 from ..lib.logger import logger
 from ..middleware.auth import require_user
@@ -34,6 +41,21 @@ router = APIRouter()
 def _to_response(doc: Sandbox) -> SandboxResponse:
     if doc.id is None:
         raise RuntimeError("sandbox doc has no id")
+    bridge_wheel_installed = doc.bridge_wheel_sha is not None
+    bridge_ready = False
+    if (
+        bridge_wheel_installed
+        and doc.bridge_connected_at is not None
+        and doc.activity is None
+    ):
+        # WSS ping is 30s; tolerate one miss (90s window).
+        connected_at = doc.bridge_connected_at
+        if connected_at.tzinfo is None:
+            connected_at = connected_at.replace(tzinfo=UTC)
+        if datetime.now(UTC) - connected_at < timedelta(
+            seconds=_BRIDGE_LIVE_WINDOW_S
+        ):
+            bridge_ready = True
     return SandboxResponse(
         id=str(doc.id),
         user_id=str(doc.user_id),
@@ -49,6 +71,10 @@ def _to_response(doc: Sandbox) -> SandboxResponse:
         activity_detail=doc.activity_detail,
         activity_started_at=doc.activity_started_at,
         last_reconcile_error=doc.last_reconcile_error,
+        bridge_wheel_installed=bridge_wheel_installed,
+        bridge_connected_at=doc.bridge_connected_at,
+        bridge_version=doc.bridge_version,
+        bridge_ready=bridge_ready,
         failure_reason=doc.failure_reason,
         created_at=doc.created_at,
     )

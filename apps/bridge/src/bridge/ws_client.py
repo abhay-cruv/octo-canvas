@@ -89,6 +89,11 @@ class WsClient:
         self._ringbufs: dict[str, ChatRingBuffer] = {}
         self._last_acked: dict[str, int] = {}
         self._outbound: asyncio.Queue[bytes] = asyncio.Queue(maxsize=1024)
+        # Phase 8d: bounded LRU of seen `frame_id`s for orchestrator-
+        # replayed-UserMessage idempotency. Set + ordered list keeps
+        # both O(1) membership and bounded memory.
+        self._seen_frame_ids: set[str] = set()
+        self._frame_id_order: list[str] = []
         self._stop = asyncio.Event()
 
     async def emit(
@@ -204,6 +209,29 @@ class WsClient:
             pong = BridgePong()
             await ws.send(BridgeToOrchestratorAdapter.dump_json(pong).decode())
             return
+        # Phase 8d: orchestrator replays queued UserMessages on bridge
+        # `Hello`. Without dedup, a turn that was actually delivered
+        # before the bridge cycled would re-execute. `frame_id` is
+        # uuid4 from the orchestrator (slice 8 §10) so a small bounded
+        # set is enough — first-time-wins semantics. Connection-class
+        # frames don't carry frame_id; only commands do.
+        frame_id = getattr(frame, "frame_id", None)
+        if isinstance(frame_id, str) and frame_id:
+            if frame_id in self._seen_frame_ids:
+                _logger.info(
+                    "bridge.ws_client.duplicate_frame_dropped",
+                    frame_id=frame_id,
+                    frame_type=getattr(frame, "type", None),
+                )
+                return
+            self._seen_frame_ids.add(frame_id)
+            self._frame_id_order.append(frame_id)
+            # Bounded LRU — drop the oldest when over the cap. The
+            # cap is generous because frame_ids are uuid4 strings
+            # (~36 bytes each); 4096 entries ≈ 150 KB.
+            while len(self._frame_id_order) > 4096:
+                old = self._frame_id_order.pop(0)
+                self._seen_frame_ids.discard(old)
         if isinstance(frame, BridgeAck) or isinstance(frame, Ack):
             chat_id = frame.chat_id
             ack_seq = frame.ack_seq

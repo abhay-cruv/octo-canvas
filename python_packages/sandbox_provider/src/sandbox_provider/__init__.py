@@ -23,10 +23,13 @@ from sandbox_provider.interface import (
     FsEvent,
     ProviderName,
     ProviderStatus,
+    ProxyDialInfo,
     PtyDialInfo,
     SandboxHandle,
     SandboxProvider,
     SandboxState,
+    ServiceLogLine,
+    ServiceStatus,
     SpritesError,
 )
 from sandbox_provider.mock import MockSandboxProvider
@@ -40,10 +43,13 @@ __all__ = [
     "MockSandboxProvider",
     "ProviderName",
     "ProviderStatus",
+    "ProxyDialInfo",
     "PtyDialInfo",
     "SandboxHandle",
     "SandboxProvider",
     "SandboxState",
+    "ServiceLogLine",
+    "ServiceStatus",
     "SpritesError",
     "SpritesProvider",
 ]

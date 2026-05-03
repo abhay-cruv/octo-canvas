@@ -44,6 +44,7 @@ from shared_models.wire_protocol import (
 )
 
 from orchestrator.services.bridge_owner import BridgeOwner
+from orchestrator.services.bridge_session import BridgeSessionFleet
 from orchestrator.services.event_store import (
     append_chat_event,
     chat_user_agent_channel_for,
@@ -75,7 +76,7 @@ class UserAgentLoop:
         self,
         *,
         redis: "Redis | None",
-        bridge_owner: BridgeOwner,
+        bridge_owner: BridgeOwner | BridgeSessionFleet,
         anthropic_api_key: str,
     ) -> None:
         self._redis = redis

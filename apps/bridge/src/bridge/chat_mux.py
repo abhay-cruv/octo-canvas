@@ -135,6 +135,14 @@ class ChatMux:
         for chat in chats:
             await self._close_chat(chat)
 
+    def has_live_chats(self) -> bool:
+        """Phase 8d idle gate: True iff at least one chat has a live
+        `ClaudeSDKClient` open. The bridge's main loop polls this; when
+        it stays False for 15 min, the bridge exits cleanly so Sprites
+        can hibernate the sandbox. Lock-free read — single-element
+        atomic on CPython."""
+        return len(self._chats) > 0
+
     # ── internals ────────────────────────────────────────────────────
 
     async def _spawn_locked(

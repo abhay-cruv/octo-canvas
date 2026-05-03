@@ -57,6 +57,23 @@ class Settings(BaseSettings):
     bridge_idle_after_disconnect_s: int = Field(
         default=300, alias="IDLE_AFTER_DISCONNECT_S"
     )
+    # Slice 8 (post-pivot): how the orchestrator talks to the bridge.
+    # - `dial_back` (legacy): bridge dials the orchestrator's WSS using
+    #   `ORCHESTRATOR_WS_URL`. Requires a public orchestrator URL
+    #   (ngrok in dev). Code under apps/bridge/src/bridge/ws_client.py
+    #   + orchestrator/ws/bridge.py + BridgeOwner.
+    # - `service_proxy` (new): bridge runs as a Sprites Service listening
+    #   on a TCP port; orchestrator dials `WSS /v1/sprites/{id}/proxy`
+    #   into it. No ngrok needed, Sprites manages the daemon.
+    # Default stays `dial_back` until service_proxy is proven.
+    bridge_transport: Literal["dial_back", "service_proxy"] = Field(
+        default="dial_back", alias="BRIDGE_TRANSPORT"
+    )
+    # Port the bridge service listens on inside the sprite when
+    # `bridge_transport=service_proxy`. The orchestrator dials this via
+    # the Sprites proxy WSS. Picked above the user app range (1024-8999)
+    # to avoid collision with anything the user might run.
+    bridge_listen_port: int = Field(default=9300, alias="BRIDGE_LISTEN_PORT")
 
     @property
     def is_production(self) -> bool:

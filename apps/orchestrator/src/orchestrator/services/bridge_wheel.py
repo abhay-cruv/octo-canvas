@@ -133,7 +133,7 @@ def _build_uncached(root: Path) -> BridgeWheelBundle:
     with tempfile.TemporaryDirectory(prefix="octo-bridge-build-") as td:
         out = Path(td) / "dist"
         subprocess.run(
-            [uv, "build", "--all-packages", "--wheel", "--out-dir", str(out)],
+            [uv, "build", "--all-packages", "--wheel", "--no-cache", "--out-dir", str(out)],
             cwd=str(root),
             check=True,
             capture_output=True,

@@ -29,6 +29,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass, field
+from typing import Literal
 
 from sandbox_provider.interface import (
     CheckpointId,
@@ -37,9 +38,12 @@ from sandbox_provider.interface import (
     FsEvent,
     ProviderName,
     ProviderStatus,
+    ProxyDialInfo,
     PtyDialInfo,
     SandboxHandle,
     SandboxState,
+    ServiceLogLine,
+    ServiceStatus,
     SpritesError,
 )
 
@@ -82,6 +86,27 @@ class _SpriteRecord:
     )
     # checkpoint_id -> deep-copied snapshot of (cloned_repos, apt_installed, files, file_modes).
     checkpoints: dict[str, tuple[set[str], set[str], dict[str, bytes], dict[str, int]]] = field(
+        default_factory=dict
+    )
+    # Slice 8 service_proxy: declared services keyed by name.
+    # Value tuple: (cmd, args, env, cwd, http_port, status, pid, started_at, error).
+    services: dict[
+        str,
+        tuple[
+            str,
+            list[str],
+            dict[str, str],
+            str,
+            int | None,
+            str,
+            int | None,
+            str | None,
+            str | None,
+        ],
+    ] = field(default_factory=dict)
+    # Pending log lines per service. Tests can push lines with
+    # `push_service_log` to drive the live-log streaming code path.
+    service_log_queues: dict[str, list[asyncio.Queue[ServiceLogLine | None]]] = field(
         default_factory=dict
     )
 
@@ -268,6 +293,33 @@ class MockSandboxProvider:
                     return ExecResult(
                         exit_code=0,
                         stdout=f"installed {runtime} {version}",
+                        stderr="",
+                        duration_s=time.monotonic() - start,
+                    )
+            # Slice 8: python runtime now uses `uv python install` instead
+            # of pyenv. Extract the version from the leading `V="..."`
+            # assignment so the (runtime, version) key still matches what
+            # the reconciler asked for.
+            script = argv[2]
+            if "uv python install" in script:
+                version: str | None = None
+                for tok in tokens:
+                    if tok.startswith('V="') and tok.endswith('";'):
+                        version = tok[3:-2]
+                        break
+                if version is not None:
+                    key = ("python", version)
+                    if key in rec.runtime_install_failures:
+                        return ExecResult(
+                            exit_code=rec.runtime_install_failures[key],
+                            stdout="",
+                            stderr=f"mock: uv python install {version} failed",
+                            duration_s=time.monotonic() - start,
+                        )
+                    rec.runtimes_installed.add(key)
+                    return ExecResult(
+                        exit_code=0,
+                        stdout=f"installed python {version} via uv",
                         stderr="",
                         duration_s=time.monotonic() - start,
                     )
@@ -470,6 +522,103 @@ class MockSandboxProvider:
             except ValueError:
                 pass
 
+    # ── Slice 8 service_proxy stubs ──────────────────────────────────────
+
+    async def upsert_service(
+        self,
+        handle: SandboxHandle,
+        *,
+        name: str,
+        cmd: str,
+        args: list[str],
+        env: dict[str, str],
+        cwd: str = "/",
+        http_port: int | None = None,
+    ) -> None:
+        rec = self._require(handle)
+        prev = rec.services.get(name)
+        prev_status = prev[5] if prev is not None else "stopped"
+        prev_pid = prev[6] if prev is not None else None
+        prev_started = prev[7] if prev is not None else None
+        rec.services[name] = (
+            cmd, list(args), dict(env), cwd, http_port, prev_status, prev_pid, prev_started, None,
+        )
+
+    async def start_service(self, handle: SandboxHandle, *, name: str) -> None:
+        rec = self._require(handle)
+        if name not in rec.services:
+            raise SpritesError(f"service {name!r} not declared", retriable=False)
+        cmd, args, env, cwd, http_port, status, pid, started_at, _err = rec.services[name]
+        if status == "running":
+            return
+        rec.services[name] = (
+            cmd, args, env, cwd, http_port, "running", 4242, "1970-01-01T00:00:00Z", None,
+        )
+
+    async def restart_service(self, handle: SandboxHandle, *, name: str) -> None:
+        await self.stop_service(handle, name=name)
+        await self.start_service(handle, name=name)
+
+    async def stop_service(self, handle: SandboxHandle, *, name: str) -> None:
+        rec = self._require(handle)
+        if name not in rec.services:
+            return
+        cmd, args, env, cwd, http_port, _status, _pid, _started, _err = rec.services[name]
+        rec.services[name] = (cmd, args, env, cwd, http_port, "stopped", None, None, None)
+
+    async def service_status(
+        self, handle: SandboxHandle, *, name: str
+    ) -> ServiceStatus:
+        rec = self._require(handle)
+        entry = rec.services.get(name)
+        if entry is None:
+            raise SpritesError(f"service {name!r} not found", retriable=False)
+        _cmd, _args, _env, _cwd, _port, status, pid, started_at, error = entry
+        # mypy/pyright: narrow the runtime str to the Literal.
+        narrowed: Literal["stopped", "starting", "running", "stopping", "failed"] = (
+            status  # type: ignore[assignment]
+            if status in ("stopped", "starting", "running", "stopping", "failed")
+            else "stopped"
+        )
+        return ServiceStatus(
+            name=name, status=narrowed, pid=pid, started_at=started_at, error=error
+        )
+
+    async def service_logs(
+        self, handle: SandboxHandle, *, name: str
+    ) -> AsyncIterator[ServiceLogLine]:
+        rec = self._require(handle)
+        if name not in rec.services:
+            raise SpritesError(f"service {name!r} not found", retriable=False)
+        queue: asyncio.Queue[ServiceLogLine | None] = asyncio.Queue()
+        rec.service_log_queues.setdefault(name, []).append(queue)
+        try:
+            while True:
+                line = await queue.get()
+                if line is None:
+                    return
+                yield line
+        finally:
+            try:
+                rec.service_log_queues[name].remove(queue)
+            except (KeyError, ValueError):
+                pass
+
+    async def proxy_dial_info(
+        self,
+        handle: SandboxHandle,
+        *,
+        host: str = "localhost",
+        port: int,
+    ) -> ProxyDialInfo:
+        rec = self._require(handle)
+        return ProxyDialInfo(
+            url=f"ws://mock-proxy-unconfigured/{rec.name}/proxy",
+            headers=[("X-Mock-Sprite", rec.name)],
+            init_host=host,
+            init_port=port,
+        )
+
     async def pty_dial_info(
         self,
         handle: SandboxHandle,
@@ -509,6 +658,26 @@ class MockSandboxProvider:
         queues for the given sprite. Production code never calls this."""
         rec = self._require(handle)
         self._emit_fs_event(rec, event)
+
+    def push_service_log(
+        self, handle: SandboxHandle, name: str, line: ServiceLogLine
+    ) -> None:
+        """Test hook — push a `ServiceLogLine` to every active log
+        consumer of `name`. Production code never calls this."""
+        rec = self._require(handle)
+        for queue in rec.service_log_queues.get(name, []):
+            queue.put_nowait(line)
+
+    def close_service_logs(self, handle: SandboxHandle, name: str) -> None:
+        """Test hook — terminate every active log stream for `name`."""
+        rec = self._require(handle)
+        for queue in list(rec.service_log_queues.get(name, [])):
+            queue.put_nowait(None)
+
+    def services_declared(self, handle: SandboxHandle) -> dict[str, str]:
+        """Test hook — `{service_name: status}` for every declared service."""
+        rec = self._require(handle)
+        return {name: entry[5] for name, entry in rec.services.items()}
 
     def runtimes_installed(self, handle: SandboxHandle) -> set[tuple[str, str]]:
         """Test hook — `(manager, version)` pairs the reconciler's

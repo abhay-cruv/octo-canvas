@@ -107,7 +107,7 @@ async def _validate_bearer(sandbox_id: str, token: str | None) -> bool:
 
 @router.api_route(
     "/anthropic-proxy/{sandbox_id}/{path:path}",
-    methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+    methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"],
     include_in_schema=False,
 )
 async def anthropic_proxy(
@@ -168,6 +168,14 @@ async def anthropic_proxy(
         return Response(status_code=502)
 
     out_headers = _filter_outbound(upstream.headers)
+    # Drop transport-encoding-related headers because we're going to
+    # restream as decompressed bytes. httpx's `aiter_bytes()` already
+    # decompresses the upstream body — keeping a stale `Content-Encoding`
+    # header (or `Content-Length` for the compressed size) makes the
+    # client try to gunzip plaintext → "Decompression error: ZlibError"
+    # in claude-agent-sdk.
+    for h in ("content-encoding", "content-length"):
+        out_headers.pop(h, None)
     # Anti-buffering for SSE: any nginx in front of us must NOT buffer
     # message-stream chunks (would defeat the streaming UX).
     out_headers["cache-control"] = "no-cache"
@@ -175,7 +183,10 @@ async def anthropic_proxy(
 
     async def relay() -> AsyncIterator[bytes]:
         try:
-            async for chunk in upstream.aiter_raw():
+            # `aiter_bytes()` auto-decompresses gzip/deflate/brotli per the
+            # upstream's `Content-Encoding`. Combined with stripping that
+            # header above, the client sees plaintext SSE chunks.
+            async for chunk in upstream.aiter_bytes():
                 yield chunk
         finally:
             # Idempotent — also called in the BackgroundTask below for

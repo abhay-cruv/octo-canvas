@@ -106,6 +106,13 @@ class BridgeRuntimeConfig:
     claude_auth_mode: str = "platform_api_key"
     max_live_chats_per_sandbox: int = 5
     idle_after_disconnect_s: int = 300
+    # `dial_back` (legacy WSS-out from sprite) or `service_proxy`
+    # (Sprites Service + proxy WSS in). Affects which env vars we
+    # emit and which reconciler launch path runs.
+    transport: str = "dial_back"
+    # TCP port the bridge listens on inside the sprite when
+    # `transport == "service_proxy"`. Ignored in dial_back mode.
+    listen_port: int = 9300
 
     def env_for(self, *, sandbox_id: str, bridge_token: str) -> dict[str, str]:
         """Build the env-var overlay applied at bridge-launch time.
@@ -147,9 +154,11 @@ class BridgeRuntimeConfig:
             ws_url = base.replace("https://", "wss://", 1).replace("http://", "ws://", 1)
             ws_url = f"{ws_url}/ws/bridge/{sandbox_id}"
             proxy_base = f"{base}/api/_internal/anthropic-proxy/{sandbox_id}"
-        return {
+        env: dict[str, str] = {
             "BRIDGE_TOKEN": bridge_token,
-            "ORCHESTRATOR_WS_URL": ws_url,
+            # Always present — even in service_proxy mode the bridge
+            # surfaces its own sandbox id in logs / errors.
+            "SANDBOX_ID": sandbox_id,
             "CLAUDE_AUTH_MODE": self.claude_auth_mode,
             "MAX_LIVE_CHATS_PER_SANDBOX": str(self.max_live_chats_per_sandbox),
             "IDLE_AFTER_DISCONNECT_S": str(self.idle_after_disconnect_s),
@@ -163,7 +172,17 @@ class BridgeRuntimeConfig:
             # validates this header (NOT `x-api-key`) and swaps in
             # the real key as `x-api-key` for the upstream call.
             "ANTHROPIC_AUTH_TOKEN": bridge_token,
+            "BRIDGE_TRANSPORT": self.transport,
         }
+        if self.transport == "dial_back":
+            # Legacy: bridge dials orchestrator WSS. Needs the public
+            # URL so it knows where to call home.
+            env["ORCHESTRATOR_WS_URL"] = ws_url
+        else:
+            # service_proxy: bridge listens on TCP, orchestrator dials
+            # in via Sprites' /proxy WSS. No outbound URL required.
+            env["BRIDGE_LISTEN_PORT"] = str(self.listen_port)
+        return env
 
     def __repr__(self) -> str:
         # Default dataclass repr would print the secret. Mask it.

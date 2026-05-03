@@ -113,16 +113,21 @@ async def test_create_chat_unready_sandbox_raises_409(client: Any) -> None:
     assert exc.value.code == "sandbox_not_ready"
 
 
-async def test_create_chat_bridge_unavailable_raises(client: Any) -> None:
+async def test_create_chat_bridge_unavailable_does_not_raise(client: Any) -> None:
+    """Phase 8d: chat creation NEVER fails on bridge being unavailable.
+    The ChatTurn is persisted as `queued` and the Hello-replay path
+    delivers it when the bridge (re)connects. The send is best-effort."""
     _ = client
     user = await _seed_user()
     await _seed_sandbox(user)
     owner = _FakeOwner(fail=True)
-    with pytest.raises(ChatRunnerError) as exc:
-        await create_chat(
-            user, prompt="x", bridge_owner=owner, user_agent_provider=None  # type: ignore[arg-type]
-        )
-    assert exc.value.code == "bridge_unavailable"
+    chat, turn, _enhanced = await create_chat(
+        user, prompt="x", bridge_owner=owner, user_agent_provider=None  # type: ignore[arg-type]
+    )
+    # Chat + turn persisted, ready for Hello-replay.
+    assert chat.id is not None
+    assert turn.status == "queued"
+    assert chat.sandbox_id is not None  # bound for the replay scan
 
 
 async def test_follow_up_uses_existing_session_id(client: Any) -> None:

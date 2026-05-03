@@ -10,7 +10,9 @@ import {
 } from '../../lib/chats';
 import { ChatTranscript } from './ChatTranscript';
 
-const POLL_MS = 2_000;
+// List-view refresh cadence. The chat *view* uses the WS stream and
+// doesn't poll at all; this only affects the sidebar's list of chats.
+const POLL_MS = 5_000;
 
 type Mode = 'list' | 'new' | { kind: 'view'; chatId: string };
 
@@ -260,23 +262,23 @@ function ChatView({ chatId }: { chatId: string }): JSX.Element {
     () => new Set(),
   );
 
-  // Poll for chat-level metadata (title, status, cumulative tokens).
-  // The transcript itself comes from `useChatStream`.
+  // One-time fetch for static chat metadata (title, initial_prompt,
+  // created_at). Live state — status flips, token usage, transcript —
+  // arrives over the WS stream via `useChatStream`. No polling: we
+  // were spamming `GET /api/chats/{id}` every 2s × StrictMode
+  // double-mount. The stream is the source of truth now.
   useEffect(() => {
     let cancelled = false;
-    const tick = async () => {
+    void (async () => {
       try {
         const c = await getChat(chatId);
         if (!cancelled) setChat(c);
       } catch (exc) {
         if (!cancelled) setError(String(exc));
       }
-    };
-    void tick();
-    const t = window.setInterval(tick, POLL_MS);
+    })();
     return () => {
       cancelled = true;
-      window.clearInterval(t);
     };
   }, [chatId]);
 
@@ -289,6 +291,26 @@ function ChatView({ chatId }: { chatId: string }): JSX.Element {
       }),
     [events, dismissedSuggestions],
   );
+
+  // Derive live status from the event stream. `result` ends a turn;
+  // `error` flips to failed. (`chat.started` keeps "running".) This
+  // replaces the previous 2s GET poll.
+  useEffect(() => {
+    if (!chat) return;
+    const last = events[events.length - 1];
+    if (!last) return;
+    if (last.type === 'result') {
+      const isError = Boolean((last as { is_error?: boolean }).is_error);
+      const next = isError ? 'failed' : 'completed';
+      if (chat.status !== next) setChat({ ...chat, status: next });
+    } else if (last.type === 'error') {
+      if (chat.status !== 'failed') setChat({ ...chat, status: 'failed' });
+    } else if (chat.status === 'completed' || chat.status === 'failed') {
+      // A new event arrived after a previous turn closed — a follow-up
+      // is in flight. Flip back to running.
+      setChat({ ...chat, status: 'running' });
+    }
+  }, [chat, events]);
 
   const send = async (text?: string) => {
     const value = (text ?? reply).trim();

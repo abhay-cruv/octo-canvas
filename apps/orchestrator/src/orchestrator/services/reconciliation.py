@@ -87,6 +87,12 @@ class ReconciliationResult:
 _NVM_PIN = "v0.40.3"
 _PYENV_PIN = "v2.5.5"
 _RBENV_PIN = "v1.3.2"
+# Slice 8: system Node 20 LTS via official nodejs.org tarball — bypasses
+# NodeSource's apt repo because Sprites occasionally runs on non-LTS
+# Ubuntu codenames (questing/oracular/plucky) that NodeSource doesn't
+# publish packages for. Tarball is codename-agnostic, lands node + npm
+# + npx into /usr/local/{bin,lib,include,share} (on sudo's secure_path).
+_NODE_PIN = "v24.15.0"
 # rustup-init is one curl call; no version pin (rustup self-updates).
 # `RUSTUP_HOME` / `CARGO_HOME` go to /usr/local so installs survive
 # `rm -rf /work` (Reset).
@@ -126,7 +132,8 @@ def _read_cli_pin() -> str:
 _CLAUDE_CLI_PIN = _read_cli_pin()
 BRIDGE_SETUP_FINGERPRINT = (
     f"nvm={_NVM_PIN};pyenv={_PYENV_PIN};rbenv={_RBENV_PIN};"
-    f"claude={_CLAUDE_CLI_PIN};venv-py={_BRIDGE_VENV_PYTHON}"
+    f"claude={_CLAUDE_CLI_PIN};venv-py={_BRIDGE_VENV_PYTHON};"
+    f"node={_NODE_PIN}"
 )
 BRIDGE_SETUP_TIMEOUT_S = 600
 
@@ -247,25 +254,39 @@ sudo -n sed -i \\
     /etc/profile.d/octo-runtimes.sh
 sudo -n chmod 0755 /etc/profile.d/octo-runtimes.sh
 
-log "system Node (NodeSource 20.x — fallback when no .nvmrc is active)"
-if ! command -v node >/dev/null 2>&1; then
-    curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -n bash -
-    sudo -n apt-get install -y --no-install-recommends nodejs
-fi
-# NodeSource's `nodejs` deb doesn't bundle `npm` on every Ubuntu
-# release (questing/25.10 ships it as a separate package). Install
-# explicitly when missing — without npm the `claude` CLI install
-# below would fail with `sudo: npm: command not found`.
-if ! command -v npm >/dev/null 2>&1; then
-    sudo -n apt-get install -y --no-install-recommends npm
+log "system Node {_NODE_PIN} via official tarball (codename-agnostic)"
+# Bypass NodeSource's apt repo because it doesn't publish for every
+# Ubuntu codename Sprites ships (questing/oracular/plucky). The
+# nodejs.org tarball drops node+npm+npx into /usr/local/bin etc.
+# which is on sudo's secure_path. Idempotent: skip when the pinned
+# version is already at /usr/local/bin/node.
+if [ ! -x /usr/local/bin/node ] || \\
+   [ "$(/usr/local/bin/node --version 2>/dev/null)" != "{_NODE_PIN}" ]; then
+    ARCH=$(uname -m)
+    case "$ARCH" in
+        x86_64) NODE_ARCH=x64 ;;
+        aarch64|arm64) NODE_ARCH=arm64 ;;
+        *) echo "unsupported arch: $ARCH" >&2; exit 1 ;;
+    esac
+    NODE_TARBALL="node-{_NODE_PIN}-linux-${{NODE_ARCH}}.tar.xz"
+    NODE_URL="https://nodejs.org/dist/{_NODE_PIN}/${{NODE_TARBALL}}"
+    TMP=$(mktemp -d)
+    curl -fsSL "$NODE_URL" -o "$TMP/node.tar.xz"
+    sudo -n tar -xJ -C /usr/local --strip-components=1 -f "$TMP/node.tar.xz"
+    rm -rf "$TMP"
 fi
 
+log "verify node + npm"
+/usr/local/bin/node --version
+/usr/local/bin/npm --version
+
 log "claude CLI @ {_CLAUDE_CLI_PIN}"
-# Resolve npm to an absolute path so sudo's secure_path doesn't have
-# to find it (some Ubuntu sudoers configs don't include /usr/bin in
-# secure_path on top of having a stripped PATH).
-NPM_BIN=$(command -v npm)
-sudo -n "$NPM_BIN" install -g @anthropic-ai/claude-code@{_CLAUDE_CLI_PIN}
+# Use absolute paths so sudo's secure_path lookup never matters.
+# `npm` is `#!/usr/bin/env node` — passing PATH=/usr/local/bin to sudo
+# guarantees `env node` resolves correctly even on stripped sudoers
+# configs.
+sudo -n env "PATH=/usr/local/bin:/usr/bin:/bin" \\
+    /usr/local/bin/npm install -g @anthropic-ai/claude-code@{_CLAUDE_CLI_PIN}
 
 log "uv (system-wide install for bridge venv)"
 # uv at /usr/local/bin/uv — on every shell's PATH, no profile.d edit
@@ -340,24 +361,27 @@ _RUNTIME_INSTALL_CMDS: dict[str, list[str]] = {
     "python": [
         "bash",
         "-lc",
-        # On success: set this version as the pyenv global so the
-        # `python3` shim resolves to it for any interactive shell that
-        # doesn't have a `.python-version` (otherwise the shim hangs
-        # trying to forward to "system" through Sprites' injected
-        # `/.sprite/bin/python3`). `pyenv global` writes
-        # `$PYENV_ROOT/version`; PYENV_ROOT is root-owned post-bridge-
-        # setup, so we sudo-write the file directly.
-        # bash's `||` and `&&` are equal-precedence + left-associative,
-        # so this chains correctly without grouping: the tee + rehash
-        # only run when EITHER the first install OR the retry succeeds.
-        'pyenv install -s {version} || ('
-        "echo 'pyenv install failed — updating pyenv and retrying' "
-        '&& sudo -n git -C "$PYENV_ROOT" fetch --depth 1 origin master '
-        '&& sudo -n git -C "$PYENV_ROOT" checkout --quiet FETCH_HEAD '
-        '&& pyenv install -s {version}'
-        ') '
-        '&& sudo -n tee "$PYENV_ROOT/version" >/dev/null <<<"{version}" '
-        '&& pyenv rehash',
+        # Use uv-managed prebuilt cpython (python-build-standalone)
+        # instead of pyenv's compile-from-source. ~30s download vs.
+        # 10+ min `gcc` on a 1-vCPU sprite. Same install-dir as the
+        # bridge's own python (created in _BRIDGE_SETUP_REST and owned
+        # by the sprite user, so no sudo for the install itself).
+        # Symlinks into /usr/local/bin make the version reachable as
+        # `python3` and `python<MAJ.MIN>` for any interactive shell —
+        # /usr/local/bin sits ahead of pyenv shims on PATH so the
+        # global default lands here. Repos with a `.python-version`
+        # file still hit pyenv's shim if they activate pyenv first,
+        # but the default-resolution case no longer compiles cpython.
+        'set -euo pipefail; '
+        'V="{version}"; '
+        'UV_PYTHON_INSTALL_DIR=/usr/local/uv-python '
+        'uv python install "$V"; '
+        'PYBIN=$(UV_PYTHON_INSTALL_DIR=/usr/local/uv-python '
+        'uv python find "$V" --python-preference only-managed); '
+        'sudo -n ln -sfn "$PYBIN" /usr/local/bin/python3; '
+        'sudo -n ln -sfn "$PYBIN" /usr/local/bin/python; '
+        'MM=$(echo "$V" | cut -d. -f1,2); '
+        'sudo -n ln -sfn "$PYBIN" "/usr/local/bin/python${{MM}}"',
     ],
     "ruby": [
         "bash",
@@ -476,9 +500,16 @@ class Reconciler:
         provider: SandboxProvider,
         *,
         bridge_config: "BridgeRuntimeConfig | None" = None,
+        bridge_session_fleet: "object | None" = None,
     ) -> None:
         self._provider = provider
         self._bridge_config = bridge_config
+        # When BRIDGE_TRANSPORT=service_proxy, `bridge_session_fleet` is
+        # a `BridgeSessionFleet` whose `ensure_started(sandbox)` PUT-s
+        # + starts the Sprites Service for this sandbox's bridge daemon.
+        # In dial_back mode it stays `None` and the legacy
+        # `_ensure_bridge_running` (PID-file + nohup) runs instead.
+        self._bridge_session_fleet = bridge_session_fleet
 
     async def reconcile(self, sandbox_id: PydanticObjectId) -> ReconciliationResult:
         async with _lock_for(sandbox_id):
@@ -791,6 +822,33 @@ class Reconciler:
         ):
             await self._install_bridge_wheel(sandbox)
 
+        # 2bb. Launch (or relaunch) the bridge daemon (slice 8 phase 8c).
+        # Mints a fresh BRIDGE_TOKEN, persists its hash, kills any
+        # existing bridge.main, starts a new one via nohup. Token
+        # rotation on every relaunch — the bridge dials home with the
+        # new token and the WSS handler validates against the freshly
+        # persisted hash.
+        if (
+            self._bridge_config is not None
+            and sandbox.bridge_setup_fingerprint == BRIDGE_SETUP_FINGERPRINT
+            and sandbox.bridge_wheel_sha is not None
+        ):
+            if self._bridge_session_fleet is not None:
+                # service_proxy: PUT the bridge service def + POST start.
+                # Idempotent — already-running services just refresh env.
+                # The legacy `_ensure_bridge_running` is left intact for
+                # dial_back mode but never reached here.
+                try:
+                    await self._bridge_session_fleet.ensure_started(sandbox)  # type: ignore[attr-defined]
+                except Exception as exc:  # noqa: BLE001
+                    _logger.warning(
+                        "reconcile.bridge_service_start_failed",
+                        sandbox_id=str(sandbox_id),
+                        error=str(exc)[:200],
+                    )
+            else:
+                await self._ensure_bridge_running(sandbox)
+
         # 2c. Language-runtime install (slice 7). Deduped union across
         # repos; each (manager, version) installed once. Best-effort —
         # failures set `Repo.runtime_install_error` for the affected
@@ -901,6 +959,34 @@ class Reconciler:
         )
         return result
 
+    async def _verify_toolchain_present(self, sandbox: Sandbox) -> bool:
+        """Quick filesystem check that everything `_BRIDGE_SETUP_REST`
+        installs is still on disk. Reset preserves `/usr/local/*` and
+        `/opt/bridge` by design, but a half-installed previous pass or
+        manual cleanup can leave the fingerprint pointing at state that
+        doesn't exist. Returns True when every probe passes.
+        """
+        probe = (
+            "command -v uv >/dev/null "
+            "&& [ -x /usr/local/bin/node ] "
+            "&& [ -d /usr/local/nvm ] "
+            "&& [ -d /usr/local/pyenv ] "
+            "&& [ -d /usr/local/rbenv ] "
+            f"&& [ -x {_CARGO_HOME}/bin/rustup ] "
+            f"&& [ -x {_BRIDGE_VENV_DIR}/bin/python ]"
+        )
+        try:
+            res = await self._provider.exec_oneshot(
+                _handle_of(sandbox),
+                ["bash", "-lc", probe],
+                env={},
+                cwd="/",
+                timeout_s=15,
+            )
+        except Exception:  # noqa: BLE001 — probe is best-effort
+            return False
+        return res.exit_code == 0
+
     async def _bridge_setup_pre(self, sandbox: Sandbox) -> bool:
         """Slice 7: fast prereq for `git clone` + the rest of bridge
         setup. Runs the apt baseline, registers the Adoptium apt key,
@@ -911,10 +997,22 @@ class Reconciler:
         present from a prior pass).
 
         Skipped entirely when `Sandbox.bridge_setup_fingerprint` already
-        matches — both the pre and rest phases are then no-ops.
+        matches AND the on-disk toolchain still exists — when the probe
+        fails (e.g. half-installed previous pass) the fingerprint is
+        cleared and full setup re-runs.
         """
         if sandbox.bridge_setup_fingerprint == BRIDGE_SETUP_FINGERPRINT:
-            return True
+            if await self._verify_toolchain_present(sandbox):
+                return True
+            _logger.info(
+                "reconcile.toolchain_missing_reinstalling",
+                sandbox_id=str(sandbox.id),
+            )
+            sandbox.bridge_setup_fingerprint = None
+            if sandbox.id is not None:
+                await Sandbox.find_one(Sandbox.id == sandbox.id).update(  # pyright: ignore[reportGeneralTypeIssues]
+                    {"$set": {"bridge_setup_fingerprint": None}}
+                )
         try:
             res = await self._provider.exec_oneshot(
                 _handle_of(sandbox),
@@ -996,6 +1094,163 @@ class Reconciler:
             fingerprint=BRIDGE_SETUP_FINGERPRINT,
         )
 
+    async def _ensure_bridge_running(self, sandbox: Sandbox) -> None:
+        """Slice 8 Phase 8c: launch (or relaunch) the bridge daemon
+        inside the sprite. Idempotent: kills any existing
+        `bridge.main` process, mints a fresh `BRIDGE_TOKEN`, persists
+        its sha256 on `Sandbox.bridge_token_hash`, and starts a new
+        `python -m bridge.main` via `nohup`. Token rotation on every
+        relaunch keeps the auth surface tight without needing to
+        recover the plaintext (we only ever stored the hash).
+
+        Skipped when:
+          - `bridge_config` isn't wired (tests / dev pre-bridge)
+          - the wheel hasn't been installed yet (nothing to launch)
+          - `ORCHESTRATOR_WS_URL` is empty (single-laptop dev — no
+            orchestrator to dial)
+
+        Service-proxy mode short-circuit: when a `bridge_session_fleet`
+        is wired, delegate to its `ensure_started`. The legacy nohup
+        path below stays intact for dial_back mode.
+        """
+        if self._bridge_session_fleet is not None:
+            # service_proxy: PUT + start the Sprites Service.
+            try:
+                await self._bridge_session_fleet.ensure_started(sandbox)  # type: ignore[attr-defined]
+            except Exception as exc:  # noqa: BLE001
+                _logger.warning(
+                    "reconcile.bridge_service_ensure_failed",
+                    sandbox_id=str(sandbox.id),
+                    error=str(exc)[:200],
+                )
+            return
+
+        if self._bridge_config is None:
+            return
+        if sandbox.bridge_wheel_sha is None:
+            return
+        env_template = self._bridge_config.env_for(
+            sandbox_id=str(sandbox.id) if sandbox.id is not None else "",
+            bridge_token="dummy",  # used only to detect "no orch" via ws_url
+        )
+        if not env_template.get("ORCHESTRATOR_WS_URL"):
+            # Dev path — nothing to dial.
+            return
+
+        from orchestrator.services.sandbox_manager import (
+            _hash_bridge_token,
+            mint_bridge_token,
+        )
+
+        bridge_token = mint_bridge_token()
+        token_hash = _hash_bridge_token(bridge_token)
+        env = self._bridge_config.env_for(
+            sandbox_id=str(sandbox.id) if sandbox.id is not None else "",
+            bridge_token=bridge_token,
+        )
+        # Persist the hash BEFORE launching: the bridge will dial home
+        # immediately and the WSS handshake validates against this hash.
+        # If the persist fails we don't want a bridge alive with a token
+        # the orchestrator can't validate.
+        if sandbox.id is not None:
+            await Sandbox.find_one(Sandbox.id == sandbox.id).update(  # pyright: ignore[reportGeneralTypeIssues]
+                {"$set": {"bridge_token_hash": token_hash}}
+            )
+            sandbox.bridge_token_hash = token_hash
+
+        await _set_activity(sandbox, "launching_bridge", None)
+        # Two non-obvious gotchas this script handles:
+        #
+        # 1. Sprites kills the exec session's pgroup on `exec_oneshot`
+        #    return — `nohup` alone isn't enough. `setsid` puts the
+        #    bridge in its OWN session/pgroup; `< /dev/null` cuts
+        #    stdin so SIGHUP can't propagate that way.
+        #
+        # 2. We CANNOT use `pkill -f 'python -m bridge.main'` to find
+        #    the previous bridge — that pattern also matches the bash
+        #    process running this script (the script body contains
+        #    that string literal as `argv[2]`), so pkill SIGTERMs
+        #    itself and the script exits 143. PID-file path is the
+        #    correct primitive: write `$BRIDGE_PID` after launch,
+        #    read + kill it on next launch.
+        #
+        # 3. 0.5s liveness sanity check — if the bridge crashed at
+        #    startup (bad env, missing module), surface its log here
+        #    instead of letting `bridge_status` report
+        #    `is_running=false` later with no diagnostics.
+        launch_script = """set -euo pipefail
+SPRITE_USER=$(id -un)
+sudo -n install -d -m 0755 -o "$SPRITE_USER" -g "$SPRITE_USER" /var/log/octo
+PIDFILE=/opt/bridge/bridge.pid
+if [ -f "$PIDFILE" ]; then
+    OLD=$(cat "$PIDFILE" 2>/dev/null || true)
+    if [ -n "${OLD:-}" ] && kill -0 "$OLD" 2>/dev/null; then
+        kill "$OLD" 2>/dev/null || true
+        for _ in 1 2 3 4 5; do
+            kill -0 "$OLD" 2>/dev/null || break
+            sleep 0.2
+        done
+        kill -9 "$OLD" 2>/dev/null || true
+    fi
+    rm -f "$PIDFILE"
+fi
+setsid nohup /opt/bridge/.venv/bin/python -m bridge.main \\
+    > /var/log/octo/bridge.log 2>&1 < /dev/null &
+BRIDGE_PID=$!
+disown
+echo "$BRIDGE_PID" > "$PIDFILE"
+sleep 0.5
+if kill -0 "$BRIDGE_PID" 2>/dev/null; then
+    echo "bridge launched: pid=$BRIDGE_PID"
+else
+    echo "bridge exited within 0.5s — log follows:" >&2
+    tail -n 80 /var/log/octo/bridge.log >&2 || true
+    exit 1
+fi
+"""
+        try:
+            res = await self._provider.exec_oneshot(
+                _handle_of(sandbox),
+                ["bash", "-lc", launch_script],
+                env=env,
+                cwd="/",
+                timeout_s=30,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # Sprites SDK rc37 has a `TimeoutError(**kwargs)` bug that
+            # raises TypeError on timeout (slice-7 followup; same
+            # workaround as sandbox_git.py). Catch broadly so the
+            # error doesn't escape into the route handler — the
+            # routes layer assumes this returns cleanly on failure.
+            _logger.warning(
+                "reconcile.bridge_launch_error",
+                sandbox_id=str(sandbox.id),
+                error=f"{type(exc).__name__}: {str(exc)[:200]}",
+            )
+            await _set_reconcile_error(
+                sandbox,
+                f"bridge launch ({type(exc).__name__}): {str(exc)[:200]}",
+            )
+            return
+        if res.exit_code != 0:
+            _logger.warning(
+                "reconcile.bridge_launch_failed",
+                sandbox_id=str(sandbox.id),
+                exit_code=res.exit_code,
+                stderr=res.stderr[-500:],
+            )
+            await _set_reconcile_error(
+                sandbox,
+                f"bridge launch exit {res.exit_code}: "
+                f"{res.stderr.strip()[-200:]}",
+            )
+            return
+        _logger.info(
+            "reconcile.bridge_launched",
+            sandbox_id=str(sandbox.id),
+            stdout=res.stdout.strip(),
+        )
+
     async def _install_bridge_wheel(self, sandbox: Sandbox) -> None:
         """Slice 8 Phase 0b: build the bridge wheel bundle locally,
         upload it to `/opt/bridge/wheels/`, and `uv pip install` it
@@ -1008,7 +1263,14 @@ class Reconciler:
         process itself isn't launched here — that's a later phase.
         """
         try:
-            bundle = await asyncio.to_thread(build_bridge_wheel_bundle)
+            # `force=True` skips the in-memory bundle cache. The
+            # orchestrator may not have reloaded uvicorn after a bridge-
+            # source edit (uvicorn watches `apps/orchestrator/`, not
+            # `apps/bridge/`), so a cached bundle could be stale even
+            # though `fs_write` + `uv pip install --reinstall-package`
+            # would otherwise propagate the new code. Forcing here
+            # guarantees the latest source on every install attempt.
+            bundle = await asyncio.to_thread(build_bridge_wheel_bundle, force=True)
         except Exception as exc:  # noqa: BLE001 — surface any build error
             _logger.warning(
                 "reconcile.bridge_wheel_build_failed",
@@ -1076,14 +1338,19 @@ class Reconciler:
                 cwd="/",
                 timeout_s=BRIDGE_SETUP_TIMEOUT_S,
             )
-        except SpritesError as exc:
+        except Exception as exc:  # noqa: BLE001
+            # Sprites SDK rc37 `TimeoutError(**kwargs)` bug — see
+            # `_ensure_bridge_running`'s broad-catch comment for
+            # context. Catch broadly so the route handler sees a
+            # clean failure return instead of a 500.
             _logger.warning(
                 "reconcile.bridge_wheel_install_error",
                 sandbox_id=str(sandbox.id),
-                error=str(exc)[:200],
+                error=f"{type(exc).__name__}: {str(exc)[:200]}",
             )
             await _set_reconcile_error(
-                sandbox, f"bridge wheel install: {str(exc)[:200]}"
+                sandbox,
+                f"bridge wheel install ({type(exc).__name__}): {str(exc)[:200]}",
             )
             return
         if res.exit_code != 0:
@@ -1110,6 +1377,25 @@ class Reconciler:
             combined_sha=bundle.combined_sha[:12],
             wheel_count=len(bundle.wheels),
         )
+        # Service-proxy: Sprites supervises the bridge daemon, so a new
+        # wheel doesn't reach the running process until we restart the
+        # service. Without this, the bridge keeps running stale code
+        # even after we successfully reinstall the wheel. The fleet
+        # tears down its cached BridgeSession + restart the service —
+        # next `ensure_started` rebuilds the connection.
+        if self._bridge_session_fleet is not None:
+            try:
+                await self._bridge_session_fleet.restart(sandbox)  # type: ignore[attr-defined]
+                _logger.info(
+                    "reconcile.bridge_service_restarted_after_wheel",
+                    sandbox_id=str(sandbox.id),
+                )
+            except Exception as exc:  # noqa: BLE001
+                _logger.warning(
+                    "reconcile.bridge_service_restart_failed",
+                    sandbox_id=str(sandbox.id),
+                    error=str(exc)[:200],
+                )
 
     async def _ensure_git_setup(self, sandbox: Sandbox, user: User) -> None:
         """One-time-per-token git setup inside the sandbox.

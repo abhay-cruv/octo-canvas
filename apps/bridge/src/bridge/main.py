@@ -120,10 +120,11 @@ async def _run_dialer(settings: BridgeSettings) -> None:
     )
     mux_holder["mux"] = mux
 
-    ws_url = (
-        settings.orchestrator_ws_url.rstrip("/")
-        + f"/ws/bridge/{settings.sandbox_id}"
-    )
+    # `BridgeRuntimeConfig.env_for(...)` already builds the full
+    # `wss://<orch>/ws/bridge/<sandbox_id>` URL — use as-is. (Earlier
+    # versions of this file appended the path again, producing
+    # `/ws/bridge/<id>/ws/bridge/<id>` and a 403 from the orchestrator.)
+    ws_url = settings.orchestrator_ws_url
     ws = WsClient(
         url=ws_url,
         bridge_token=settings.bridge_token,
@@ -137,11 +138,67 @@ async def _run_dialer(settings: BridgeSettings) -> None:
         url=ws_url,
         sandbox_id=settings.sandbox_id,
         max_live_chats=settings.max_live_chats_per_sandbox,
+        idle_exit_s=settings.idle_after_disconnect_s,
+    )
+    # Phase 8d: bridge runs only while there's chat work. After
+    # `IDLE_AFTER_DISCONNECT_S` seconds with `mux.has_live_chats() ==
+    # False`, exit cleanly so Sprites can hibernate the sandbox. The
+    # orchestrator's `_ensure_bridge_running` (or `BridgeOwner.kick_idle_bridge`
+    # falling through) relaunches us when the next user message arrives.
+    ws_task = asyncio.create_task(ws.run(), name="ws-client")
+    idle_task = asyncio.create_task(
+        _wait_for_idle(mux, settings.idle_after_disconnect_s),
+        name="idle-watch",
     )
     try:
-        await ws.run()
+        done, _pending = await asyncio.wait(
+            {ws_task, idle_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+        if idle_task in done and not ws_task.done():
+            logger.info(
+                "bridge.dialer.idle_exit",
+                idle_after_s=settings.idle_after_disconnect_s,
+            )
+            await ws.stop()
+            ws_task.cancel()
+        else:
+            idle_task.cancel()
+        for t in (ws_task, idle_task):
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
     finally:
         await mux.shutdown()
+
+
+async def _wait_for_idle(
+    mux: "object",  # ChatMux — typed loose to avoid circular import
+    idle_after_s: int,
+    *,
+    poll_s: float = 5.0,
+) -> None:
+    """Returns when `mux.has_live_chats()` has been False continuously
+    for `idle_after_s` seconds. Default poll cadence is 5s — we'd
+    rather err a few seconds late than burn cpu. Tests pass a smaller
+    `poll_s` to keep the suite fast.
+
+    Any new chat resets the counter, so a chat that fires + finishes
+    + is replaced inside the window keeps the bridge alive without
+    flapping."""
+    quiet_since: float | None = None
+    while True:
+        await asyncio.sleep(poll_s)
+        has_live = bool(getattr(mux, "has_live_chats", lambda: True)())
+        now = asyncio.get_event_loop().time()
+        if has_live:
+            quiet_since = None
+            continue
+        if quiet_since is None:
+            quiet_since = now
+            continue
+        if now - quiet_since >= idle_after_s:
+            return
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -202,16 +259,40 @@ def main(argv: list[str] | None = None) -> int:
         bridge_version=BRIDGE_VERSION,
         cli_version=baked_cli_version(),
         claude_auth_mode=settings.claude_auth_mode,
-        orchestrator_ws_url=settings.orchestrator_ws_url or "(unset — idling)",
+        bridge_transport=settings.bridge_transport,
+        orchestrator_ws_url=settings.orchestrator_ws_url or "(unset)",
+        listen_port=settings.bridge_listen_port,
     )
     try:
-        if settings.orchestrator_ws_url:
+        if settings.bridge_transport == "service_proxy":
+            asyncio.run(_run_listener(settings))
+        elif settings.orchestrator_ws_url:
             asyncio.run(_run_dialer(settings))
         else:
             asyncio.run(_idle_loop(settings))
     except KeyboardInterrupt:
         return 0
     return 0
+
+
+async def _run_listener(settings: BridgeSettings) -> None:
+    """Slice 8 service_proxy: bind a TCP server on `BRIDGE_LISTEN_PORT`
+    and let the orchestrator dial in via Sprites' `WSS .../proxy`. No
+    outbound connection from the bridge — the orchestrator owns the
+    connection lifecycle."""
+    from bridge.tcp_server import run_tcp_server
+
+    credentials = _build_credentials(settings.claude_auth_mode)
+    # Sprites' /proxy WSS resolves `localhost` to the sandbox's
+    # internal interface (10.0.0.1, not 127.0.0.1). Bind to 0.0.0.0
+    # so both loopback (local exec) and proxy traffic reach us.
+    await run_tcp_server(
+        host="0.0.0.0",  # noqa: S104 — sandbox is single-tenant; orchestrator owns access
+        port=settings.bridge_listen_port,
+        work_root=settings.work_root,
+        credentials=credentials,
+        max_live_chats=settings.max_live_chats_per_sandbox,
+    )
 
 
 if __name__ == "__main__":

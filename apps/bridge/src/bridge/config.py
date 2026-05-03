@@ -55,6 +55,14 @@ class BridgeSettings(BaseSettings):
     # Slice 8: where chats run. Always `/work/` in v1 (no per-chat
     # worktrees) — overridable for tests. Branching defers to slice 9.
     work_root: str = Field(default="/work", alias="WORK_ROOT")
+    # Slice 8 (post-pivot): how the bridge talks to the orchestrator.
+    # `dial_back` runs the legacy WSS-out dialer (`ORCHESTRATOR_WS_URL`).
+    # `service_proxy` runs a TCP listener on `BRIDGE_LISTEN_PORT`; the
+    # orchestrator dials in via Sprites' `WSS .../proxy` endpoint.
+    bridge_transport: Literal["dial_back", "service_proxy"] = Field(
+        default="dial_back", alias="BRIDGE_TRANSPORT"
+    )
+    bridge_listen_port: int = Field(default=9300, alias="BRIDGE_LISTEN_PORT")
 
 
 def load_settings() -> BridgeSettings:

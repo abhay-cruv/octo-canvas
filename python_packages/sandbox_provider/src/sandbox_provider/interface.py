@@ -224,6 +224,101 @@ class SandboxProvider(Protocol):
         """
         ...
 
+    # ── Slice 8 service_proxy: managed services + TCP proxy ──────────────
+    #
+    # These three methods are only used when the orchestrator's
+    # BRIDGE_TRANSPORT=service_proxy. The mock provides minimal in-memory
+    # stand-ins so reconciler tests can exercise the new branch without
+    # talking to Sprites.
+    async def upsert_service(
+        self,
+        handle: SandboxHandle,
+        *,
+        name: str,
+        cmd: str,
+        args: list[str],
+        env: dict[str, str],
+        cwd: str = "/",
+        http_port: int | None = None,
+    ) -> None:
+        """Idempotent PUT against Sprites' Services API
+        (`PUT /v1/sprites/{name}/services/{service_name}`). Defines a
+        long-running background process with cmd/args/env. Subsequent
+        calls update the definition in place.
+
+        Raises `SpritesError` on provider errors.
+        """
+        ...
+
+    async def start_service(
+        self,
+        handle: SandboxHandle,
+        *,
+        name: str,
+    ) -> None:
+        """Idempotent: start the named service if not already running.
+        Maps to `POST /v1/sprites/{name}/services/{service_name}/start`.
+        """
+        ...
+
+    async def restart_service(
+        self,
+        handle: SandboxHandle,
+        *,
+        name: str,
+    ) -> None:
+        """`POST /v1/sprites/{name}/services/{service_name}/restart`.
+        Used when the service env (e.g. rotated bridge token) has changed."""
+        ...
+
+    async def stop_service(
+        self,
+        handle: SandboxHandle,
+        *,
+        name: str,
+    ) -> None:
+        """`POST /v1/sprites/{name}/services/{service_name}/stop`.
+        Idempotent — already-stopped is treated as success."""
+        ...
+
+    async def service_status(
+        self,
+        handle: SandboxHandle,
+        *,
+        name: str,
+    ) -> "ServiceStatus":
+        """`GET /v1/sprites/{name}/services/{service_name}`. Returns
+        the current state. Used by the orchestrator's BridgeSession to
+        decide whether to start before dialing the proxy WS."""
+        ...
+
+    async def service_logs(
+        self,
+        handle: SandboxHandle,
+        *,
+        name: str,
+    ) -> AsyncIterator["ServiceLogLine"]:
+        """`GET /v1/sprites/{name}/services/{service_name}/logs`.
+        Streams stdout/stderr lines (NDJSON). Cancelling the consumer
+        closes the underlying stream."""
+        ...
+        if False:
+            yield  # type: ignore[unreachable]
+
+    async def proxy_dial_info(
+        self,
+        handle: SandboxHandle,
+        *,
+        host: str = "localhost",
+        port: int,
+    ) -> "ProxyDialInfo":
+        """Tell the orchestrator's BridgeSession where to dial for the
+        Sprites TCP-proxy WSS (`WSS /v1/sprites/{name}/proxy`). The
+        BridgeSession opens that WS, sends the JSON init frame
+        (`{"host", "port"}`), then talks raw bytes to the bridge service
+        listening on the given TCP port inside the sprite."""
+        ...
+
     async def fs_watch_subscribe(
         self,
         handle: SandboxHandle,
@@ -253,6 +348,43 @@ class PtyDialInfo:
 
     url: str
     headers: list[tuple[str, str]]
+
+
+@dataclass(frozen=True)
+class ServiceStatus:
+    """Snapshot of a Sprites Service's runtime state. Returned by
+    `service_status`. Mirrors the response shape of `GET /services/{name}`."""
+
+    name: str
+    # `stopped` | `starting` | `running` | `stopping` | `failed`
+    status: Literal["stopped", "starting", "running", "stopping", "failed"]
+    pid: int | None
+    started_at: str | None  # ISO-8601 from Sprites
+    error: str | None       # Error message when status == "failed"
+
+
+@dataclass(frozen=True)
+class ServiceLogLine:
+    """One line from `service_logs`. `kind` distinguishes the source
+    stream; `data` is the raw text Sprites emitted (already decoded)."""
+
+    kind: Literal["stdout", "stderr", "exit", "error", "started", "stopping", "stopped", "complete"]
+    data: str
+    timestamp_ms: int
+    exit_code: int | None = None
+
+
+@dataclass(frozen=True)
+class ProxyDialInfo:
+    """Where the orchestrator should dial for the Sprites TCP-proxy WSS
+    (`WSS /v1/sprites/{name}/proxy`). Headers carry the bearer token;
+    the JSON init frame `{"host", "port"}` is sent by the BridgeSession
+    after the WS handshake."""
+
+    url: str
+    headers: list[tuple[str, str]]
+    init_host: str
+    init_port: int
 
 
 @dataclass(frozen=True)

@@ -38,6 +38,12 @@ ChatStatus = Literal[
 
 class Chat(Document):
     user_id: PydanticObjectId
+    # Slice 8 Phase 8d: denormalized sandbox binding so the orchestrator
+    # can scan "queued turns for this sandbox" cheaply on bridge Hello
+    # without joining Chat → User → Sandbox. v1's "one sandbox per
+    # user" invariant means this is just `user.sandbox_id` at chat
+    # creation time; multi-sandbox future will set it explicitly.
+    sandbox_id: PydanticObjectId | None = None
     title: str
     status: ChatStatus = "pending"
     initial_prompt: str
@@ -69,5 +75,11 @@ class Chat(Document):
                     ("status", ASCENDING),
                     ("created_at", DESCENDING),
                 ]
+            ),
+            # Phase 8d: bridge Hello replay scans
+            # `(sandbox_id, status)` to find chats with queued turns.
+            IndexModel(
+                [("sandbox_id", ASCENDING), ("status", ASCENDING)],
+                sparse=True,
             ),
         ]

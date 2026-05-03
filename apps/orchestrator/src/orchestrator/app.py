@@ -20,15 +20,22 @@ from .routes import (
     me,
     repos,
     sandbox,
+    sandbox_bridge,
     sandbox_fs,
     sandbox_git,
 )
+from beanie import PydanticObjectId
+from db.models import Sandbox
+
 from .services.bridge_owner import BridgeOwner
+from .services.bridge_session import BridgeSessionFleet
+from .services.event_store import append_chat_event
 from .services.fs_watcher import FsWatcher
 from .services.reconciliation import Reconciler
 from .services.sandbox_manager import BridgeRuntimeConfig, SandboxManager
 from .services.user_agent.loop import UserAgentLoop
 from .ws import bridge as ws_bridge
+from .ws import bridge_debug as ws_bridge_debug
 from .ws import chats as ws_chats
 from .ws import fs_watch as ws_fs_watch
 from .ws import pty as ws_pty
@@ -59,12 +66,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         claude_auth_mode=settings.claude_auth_mode,
         max_live_chats_per_sandbox=settings.bridge_max_live_chats_per_sandbox,
         idle_after_disconnect_s=settings.bridge_idle_after_disconnect_s,
+        transport=settings.bridge_transport,
+        listen_port=settings.bridge_listen_port,
     )
     manager = SandboxManager(provider=provider, redis=redis_handle)
     app.state.sandbox_manager = manager
     app.state.sandbox_provider = provider
     app.state.bridge_config = bridge_config
-    app.state.reconciler = Reconciler(provider, bridge_config=bridge_config)
+    # `reconciler` is constructed below once we know whether the
+    # service_proxy fleet exists — it gets injected so the bridge-launch
+    # branch in `_run` calls the right path.
     app.state.redis_handle = redis_handle
 
     # Slice 8 §4: shared httpx.AsyncClient for the Anthropic reverse
@@ -96,10 +107,78 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         await chat_fanout.start()
     app.state.chat_fanout = chat_fanout
 
-    # Slice 8: cross-instance bridge ownership singleton. Tolerates a
-    # missing Redis (single-instance dev path).
-    bridge_owner = BridgeOwner(redis=redis_handle)
-    await bridge_owner.start()
+    # Slice 8: bridge transport. Two interchangeable implementations
+    # behind the same `.send(sandbox_id, frame)` shape:
+    #   - dial_back (legacy): bridge dials orchestrator WSS; routed via
+    #     Redis pub/sub by `BridgeOwner`.
+    #   - service_proxy (new): bridge runs as a Sprites Service; the
+    #     orchestrator dials in via Sprites' /proxy WSS via
+    #     `BridgeSessionFleet`.
+    bridge_owner: BridgeOwner | BridgeSessionFleet
+    if settings.bridge_transport == "service_proxy":
+        async def _bridge_event(
+            chat_id: PydanticObjectId,
+            data: dict[str, object],
+            frame: object,
+        ) -> None:
+            from db.models import Chat as _Chat
+            from db.models import User as _User
+
+            chat = await _Chat.get(chat_id)
+            if chat is None:
+                return
+            user = await _User.get(chat.user_id)
+            user_agent_enabled = bool(user and user.user_agent_enabled)
+            claude_session_id = (
+                getattr(frame, "claude_session_id", None)
+                or chat.claude_session_id
+            )
+            await append_chat_event(
+                chat_id,
+                frame,  # type: ignore[arg-type]
+                claude_session_id=claude_session_id,
+                redis=redis_handle,
+                user_agent_enabled=user_agent_enabled,
+            )
+            # Mirror dial-back behavior: any event flips the latest
+            # queued turn → running.
+            from db.models import ChatTurn as _ChatTurn
+
+            latest = (
+                await _ChatTurn.find(_ChatTurn.chat_id == chat_id)
+                .sort(-_ChatTurn.started_at)  # type: ignore[arg-type]
+                .limit(1)
+                .to_list()
+            )
+            if latest and latest[0].status == "queued":
+                latest[0].status = "running"
+                await latest[0].save()
+
+        def _bridge_env_for(sandbox: Sandbox) -> dict[str, str]:
+            from orchestrator.services.sandbox_manager import mint_bridge_token
+
+            token = mint_bridge_token()
+            return bridge_config.env_for(
+                sandbox_id=str(sandbox.id), bridge_token=token
+            )
+
+        fleet = BridgeSessionFleet(
+            provider=provider,
+            listen_port=settings.bridge_listen_port,
+            on_event=_bridge_event,
+            bridge_env_for=_bridge_env_for,
+        )
+        await fleet.start()
+        bridge_owner = fleet
+        app.state.reconciler = Reconciler(
+            provider, bridge_config=bridge_config, bridge_session_fleet=fleet
+        )
+    else:
+        # Cross-instance bridge ownership singleton. Tolerates a missing
+        # Redis (single-instance dev path).
+        bridge_owner = BridgeOwner(redis=redis_handle)
+        await bridge_owner.start()
+        app.state.reconciler = Reconciler(provider, bridge_config=bridge_config)
     app.state.bridge_owner = bridge_owner
 
     # Slice 8 Phase 8b: BE user-agent loop subscribes to `chat:*:ua`
@@ -197,7 +276,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[settings.web_base_url],
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"],
+    allow_methods=["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS", "HEAD"],
     allow_headers=["*"],
 )
 
@@ -207,11 +286,15 @@ app.include_router(repos.router, prefix="/api/repos", tags=["repos"])
 app.include_router(sandbox.router, prefix="/api/sandboxes", tags=["sandboxes"])
 app.include_router(sandbox_fs.router, prefix="/api/sandboxes", tags=["sandbox-fs"])
 app.include_router(sandbox_git.router, prefix="/api/sandboxes", tags=["sandbox-git"])
+app.include_router(
+    sandbox_bridge.router, prefix="/api/sandboxes", tags=["sandbox-bridge"]
+)
 app.include_router(chats.router, prefix="/api/chats", tags=["chats"])
 app.include_router(ws_web.router, tags=["ws"])
 app.include_router(ws_pty.router, tags=["ws-pty"])
 app.include_router(ws_fs_watch.router, tags=["ws-fs-watch"])
 app.include_router(ws_bridge.router, tags=["ws-bridge"])
+app.include_router(ws_bridge_debug.router, tags=["ws-bridge-debug"])
 app.include_router(ws_chats.router, tags=["ws-chats"])
 
 # Slice 8 §4: Anthropic reverse proxy. Production-required (it's how the

@@ -36,35 +36,51 @@ class ClaudeCredentials(Protocol):
 
 
 class PlatformApiKeyCredentials:
-    """v1 default. Reads `ANTHROPIC_API_KEY` from the bridge's process
-    env and hands it to the `claude` CLI subprocess.
+    """v1 default. Forwards whichever Anthropic auth env var the bridge
+    process was launched with — `ANTHROPIC_AUTH_TOKEN` (Bearer mode)
+    OR `ANTHROPIC_API_KEY`.
 
-    **Security note (slice 7):** the bridge's `ANTHROPIC_API_KEY` is
-    NOT the platform's real Anthropic key. The orchestrator's bridge-
-    launch path pipes a per-sandbox synthetic token (the same
-    `BRIDGE_TOKEN` that authenticates the WSS handshake) plus
-    `ANTHROPIC_BASE_URL` pointing at the orchestrator's proxy route.
-    The real key only exists in the orchestrator's process memory and
-    is added to outbound Anthropic requests there. From this impl's
-    point of view the key is opaque — we just forward whatever env
-    var was set.
+    **Security note (slice 7):** the value is NOT the platform's real
+    Anthropic key. The orchestrator's bridge-launch path pipes a
+    per-sandbox synthetic token plus `ANTHROPIC_BASE_URL` pointing at
+    the orchestrator's proxy. The real key lives only in the
+    orchestrator's memory and is swapped in by the proxy on the
+    upstream call.
 
-    `__repr__` is overridden so accidental logging of the credential
-    object never prints the secret.
+    Bearer mode (`ANTHROPIC_AUTH_TOKEN` → `Authorization: Bearer ...`)
+    is the canonical shape per `BridgeRuntimeConfig.env_for(...)` —
+    that path deliberately omits `ANTHROPIC_API_KEY` because the CLI
+    treats `ANTHROPIC_AUTH_TOKEN` as higher-priority. We try Bearer
+    first, fall back to `ANTHROPIC_API_KEY` for legacy/test contexts.
+
+    `__repr__` is overridden so accidental logging never prints the
+    secret.
     """
 
     mode = "platform_api_key"
 
-    def __init__(self, *, env_var: str = "ANTHROPIC_API_KEY") -> None:
-        self._env_var = env_var
+    # Order matters: Bearer-mode is the production shape; api-key is
+    # the fallback for tests + legacy callers. The first env var that's
+    # set wins, and only that one is returned in env() so the CLI sees
+    # an unambiguous auth shape.
+    _DEFAULT_ENV_VARS: tuple[str, ...] = ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY")
+
+    def __init__(self, *, env_var: str | None = None) -> None:
+        # Backwards-compat: callers that pass an explicit `env_var`
+        # (e.g. tests pinning to ALT_KEY) still get single-var behavior.
+        if env_var is not None:
+            self._env_vars: tuple[str, ...] = (env_var,)
+        else:
+            self._env_vars = self._DEFAULT_ENV_VARS
 
     def env(self) -> dict[str, str]:
-        value = os.environ.get(self._env_var, "")
-        if not value:
-            raise CredentialsError(
-                f"{self._env_var} not set — bridge cannot authenticate to Anthropic"
-            )
-        return {self._env_var: value}
+        for name in self._env_vars:
+            value = os.environ.get(name, "")
+            if value:
+                return {name: value}
+        raise CredentialsError(
+            f"none of {self._env_vars} set — bridge cannot authenticate to Anthropic"
+        )
 
     def __repr__(self) -> str:
-        return f"PlatformApiKeyCredentials(env_var={self._env_var!r}, value=***)"
+        return f"PlatformApiKeyCredentials(env_vars={self._env_vars!r}, value=***)"
